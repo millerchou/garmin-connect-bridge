@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling==1.32.4"]
+build-backend = "hatchling.build"
+
+[project]
+name = "garmin-connect-bridge"
+version = "0.1.0"
+description = "Private, read-only Garmin cycling acquisition and offline CLI"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["garminconnect==0.3.17", "fitdecode==0.11.0"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+]
+
+[project.scripts]
+garmin-bridge = "garmin_bridge.cli:main"
+
+[dependency-groups]
+dev = ["pytest==9.1.1", "ruff==0.15.7", "hatchling==1.32.4"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/garmin_bridge"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src/garmin_bridge/*.py",
+  "/tests/*.py",
+  "/README.md",
+  "/AGENTS.md",
+  "/pyproject.toml",
+  "/requirements.lock",
+  "/uv.lock",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
