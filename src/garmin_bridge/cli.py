@@ -1,4 +1,4 @@
-"""JSON-only CLI. Queries are offline; only auth and sync acquire data."""
+"""JSON-only CLI. Only explicit auth and sync may contact Garmin."""
 
 import argparse
 from datetime import date
@@ -64,6 +64,18 @@ def build_parser():
         help="Explicitly verify/refresh the saved session without a password",
     )
     commands.add_parser("status", help="Offline authentication state, coverage and freshness")
+    importing = commands.add_parser(
+        "import-fit", help="Offline import of one private FIT or single-FIT ZIP; no authentication"
+    )
+    importing.add_argument(
+        "--file", type=Path, required=True, help="Private FIT or ZIP outside Git"
+    )
+    importing.add_argument(
+        "--activity-id",
+        type=positive_id,
+        required=True,
+        help="Explicit Garmin activity ID from the website",
+    )
     sync = commands.add_parser(
         "sync", help="Explicitly discover cycling activities and store private original FIT data"
     )
@@ -209,8 +221,12 @@ def execute(args):
         operation = export_bundle if args.backup_action == "export" else restore_bundle
         return operation(Store(args.data_dir), args.file)
     store = Store(args.data_dir)
-    write = args.command in {"auth", "sync"}
+    write = args.command in {"auth", "sync", "import-fit"}
     with store.lock(write=write):
+        if args.command == "import-fit":
+            from .import_fit import import_file
+
+            return import_file(store, args.file, args.activity_id)
         if args.command == "auth":
             verified = (
                 GarminSource(store).verified_at

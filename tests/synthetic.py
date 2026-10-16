@@ -38,7 +38,15 @@ def message(global_id, fields, rows, developer=False):
 
 
 def fit_bytes(
-    power=200, count=3, missing=True, developer=False, missing_time=False, start=START, balance=176
+    power=200,
+    count=3,
+    missing=True,
+    developer=False,
+    missing_time=False,
+    start=START,
+    balance=176,
+    sport=2,
+    missing_start=False,
 ):
     data = message(0, [(0, 0, "B"), (1, 0x84, "H"), (3, 0x8C, "I")], [(4, 1, 314159265)])
     if developer:
@@ -103,7 +111,20 @@ def fit_bytes(
             (45, 0x84, "H"),
             (24, 2, "B"),
         ],
-        [(start, 2, 60000, 48000, 145, power, 215, 123, 250, 27)],
+        [
+            (
+                0xFFFFFFFF if missing_start else start,
+                sport,
+                60000,
+                48000,
+                145,
+                power,
+                215,
+                123,
+                250,
+                27,
+            )
+        ],
     )
     header = struct.pack("<BBHI4s", 12, 0x20, 2200, len(data), b".FIT")
     return header + data + struct.pack("<H", crc16(header + data))

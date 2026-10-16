@@ -79,6 +79,35 @@ REPORTED_FIELDS = {
     "anaerobic_training_effect": ("total_anaerobic_training_effect", "anaerobicTrainingEffect"),
     "threshold_power": ("threshold_power", "functionalThresholdPower"),
 }
+LOCAL_FLAGS = frozenset({"local_file_import", "missing_api_metadata", "unverified_activity_id"})
+# Select by message BEFORE accessing any field value. In particular file_id,
+# device_info, developer descriptions and all unknown messages have no fields.
+MESSAGE_FIELDS = {
+    "record": frozenset(
+        {
+            "timestamp",
+            "heart_rate",
+            "power",
+            "cadence",
+            "fractional_cadence",
+            "enhanced_speed",
+            "speed",
+            "enhanced_altitude",
+            "altitude",
+            "distance",
+            "temperature",
+            "enhanced_respiration_rate",
+            "left_right_balance",
+        }
+    ),
+    "session": frozenset(
+        {"sport", "start_time", "avg_speed", "max_speed"}
+        | {names[0] for names in SUMMARY_FIELDS.values()}
+        | {names[0] for names in REPORTED_FIELDS.values()}
+    ),
+    "lap": frozenset({"start_time", "timestamp", "total_timer_time", "total_distance"}),
+    "event": frozenset({"timestamp", "event", "event_type"}),
+}
 
 
 def sha256(data: bytes):
@@ -151,6 +180,18 @@ def metadata(raw):
     }
 
 
+def local_metadata(source_id):
+    """No API metadata can be inferred from an offline file or the host."""
+    if not identifier(source_id):
+        raise BridgeError("usage")
+    return {
+        "source_activity_id": source_id,
+        "activity_time": dict.fromkeys(("utc", "local", "timezone", "utc_offset_seconds")),
+        "metrics": dict.fromkeys(METRIC_UNITS),
+        "garmin_reported": dict.fromkeys(REPORTED_UNITS),
+    }
+
+
 def extract_fit(original: bytes) -> bytes:
     """Never extract archive paths to disk; accept one unambiguous FIT only."""
     if type(original) is not bytes or not 0 < len(original) <= MAX_ARCHIVE:
@@ -201,9 +242,14 @@ def extract_fit(original: bytes) -> bytes:
 def _values(frame):
     # FIT developer field names are arbitrary free text and may spoof standard
     # names. Only fields from the standard profile (including components) pass.
+    allowed = MESSAGE_FIELDS.get(frame.name)
+    if allowed is None:
+        return {}
     values = {}
     for field in frame.fields:
         if field.field_def is not None and field.field_def.is_dev:
+            continue
+        if field.name not in allowed:
             continue
         if field.name == "enhanced_respiration_rate" and field.units != "Breaths/min":
             continue  # Don't relabel legacy components with ambiguous units.
@@ -216,12 +262,16 @@ def _prefer(values, first, second):
     return value if value is not None else values.get(second)
 
 
-def normalize(fit: bytes, meta: dict, acquired_at: str, source_digest: str):
+def normalize(fit: bytes, meta: dict, acquired_at: str, source_digest: str, *, local_import=False):
     flags = {
         "non_location_projection",
         "unreviewed_fields_omitted",
         "source_reported_not_independently_validated",
     }
+    if local_import:
+        if meta != local_metadata(meta["source_activity_id"]):
+            raise BridgeError("import_conflict")
+        flags.update(LOCAL_FLAGS)
     records, laps, events, sessions = [], [], [], []
     device_count = 0
 
@@ -372,14 +422,21 @@ def normalize(fit: bytes, meta: dict, acquired_at: str, source_digest: str):
         "lap_count": len(laps),
         "timer_event_count": len(events),
         "provenance": {
-            "input": "garmin_original_fit",
+            "input": "local_fit_file" if local_import else "garmin_original_fit",
             "parser": "fitdecode/0.11.0",
             "device_messages": device_count,
             "unique_identifiers_retained": "none",
         },
     }
+    if local_import:
+        summary["provenance"].update(activity_id_origin="cli_argument", garmin_api_verified=False)
     return summary, streams
 
 
-def input_digest(meta, fit_hash):
-    return sha256(canonical({"provider": "garmin", "metadata": meta, "fit_sha256": fit_hash}))
+def input_digest(meta, fit_hash, *, local_import=False):
+    value = {"provider": "garmin", "metadata": meta, "fit_sha256": fit_hash}
+    if local_import:
+        # Do not let a later API acquisition reuse an unverified local result,
+        # even when the API happens to supply no optional metadata either.
+        value["input"] = "local_fit_file"
+    return sha256(canonical(value))

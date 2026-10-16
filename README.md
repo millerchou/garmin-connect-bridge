@@ -2,8 +2,8 @@
 
 A small, read-only Garmin Connect adapter for deterministic data pipelines.
 
-**Status: installable CLI MVP with offline synthetic tests and portable backups.**
-The five bridge commands and offline `backup` commands below are implemented.
+**Status: installable CLI MVP with offline FIT import, synthetic tests and portable backups.**
+The bridge commands, `import-fit` and offline `backup` commands below are implemented.
 The first verified runtime is Linux x86_64, Python 3.12.14.
 The code also targets macOS and Python 3.12+; macOS has not been exercised on a
 real runner. Live Garmin authentication, renewal and synchronization remain
@@ -22,10 +22,14 @@ This is a **new, independent data store**, populated directly from the current
 Garmin international account. There is no import or migration from old local
 projects, CSV files, Strava IDs, metrics, Coach records or directory layouts.
 Activity identity is `(garmin, activity ID)`. Use one private store per account.
+The offline path accepts a single original exported from Garmin's normal website,
+with an explicitly supplied activity ID; it does not import an old local system.
 
 Acquisition (`upstream.py`), FIT projection (`normalize.py`), private storage
 (`storage.py`), resumable scans (`jobs.py`, `sync.py`) and offline queries
-(`cli.py`) are separate. Portable snapshots (`backup.py`, `persistence.py`) reuse
+(`cli.py`) are separate. The offline file adapter (`import_fit.py`) shares the
+same validation/publication function as API downloads in `sync.py`, and the same
+FIT parser and Store. Portable snapshots (`backup.py`, `persistence.py`) reuse
 the reviewed data contract and durable journal. The CLI writes local files and
 JSON. Polaris runs it in a private cloud environment and uses its existing Drive
 tools to transfer the reviewed package. Bridge has no Google OAuth, Drive SDK,
@@ -62,13 +66,39 @@ uv run --frozen python -m pytest
 ```
 
 The installed console entry point is `garmin-bridge`; `python -m garmin_bridge`
-is equivalent. For a pip-based runtime installation:
+is equivalent. For Polaris, **uv is optional**. From this repository's root,
+Python 3.12, pip and venv suffice. Install runtime dependencies from
+`requirements.lock` and extract the build backend's complete pinned dependency
+set from `uv.lock`; pip build isolation is disabled so it cannot resolve newer
+build dependencies. These commands use public package registries, not Garmin:
 
 ```sh
 python3.12 -m venv .venv
-.venv/bin/python -m pip install --require-hashes -r requirements.lock
-.venv/bin/python -m pip install --no-deps .
+.venv/bin/python - <<'PY'
+from pathlib import Path
+import tomllib
+
+names = {"hatchling", "packaging", "pathspec", "pluggy", "tomlkit", "trove-classifiers"}
+packages = tomllib.loads(Path("uv.lock").read_text())["package"]
+lines = []
+found = set()
+for package in packages:
+    if package["name"] in names:
+        found.add(package["name"])
+        artifacts = [package.get("sdist"), *package.get("wheels", [])]
+        hashes = sorted({item["hash"] for item in artifacts if item})
+        assert hashes
+        lines.append(package["name"] + "==" + package["version"] + " "
+                     + " ".join("--hash=" + value for value in hashes))
+assert found == names
+Path(".venv/bridge-build.lock").write_text("\n".join(sorted(lines)) + "\n")
+PY
+.venv/bin/python -m pip install --no-cache-dir --only-binary=:all: --require-hashes \
+  -r requirements.lock -r .venv/bridge-build.lock
+.venv/bin/python -m pip install --no-cache-dir --no-index --no-deps --no-build-isolation .
+.venv/bin/python -m pip check
 .venv/bin/garmin-bridge --help
+export PATH="$PWD/.venv/bin:$PATH"
 ```
 
 `uv sync --frozen` is the development setup, including pytest, Ruff and the
@@ -76,8 +106,8 @@ pinned build backend. Build with `uv build --no-build-isolation` from that
 environment. Dependency updates are intentional changes to the pins and lock
 files, not something a normal sync command performs.
 
-For a Polaris runtime, run the following **from this repository's root**, with
-Python 3.12 and uv available. This installs only the locked runtime dependencies:
+Alternatively, after installing uv separately, this runtime-only recipe is
+available; do not assume uv already exists in Polaris:
 
 ```sh
 uv sync --frozen --no-dev --python 3.12
@@ -95,12 +125,13 @@ is editable. This is an installation recipe, not a deployment or scheduled job.
 | `auth` | Explicit private sign-in, MFA continuation, and protected token persistence. |
 | `status` | Authentication state, synchronization watermarks, freshness, and actionable failures; never credentials. |
 | `sync` | Full historical import, resume, daily discovery/rechecks, and explicit historical rescans. |
+| `import-fit` | Import one private original FIT or single-FIT ZIP entirely offline, with an explicit Garmin activity ID. |
 | `list` | Read the local activity index without network access. |
 | `activity` | Read an existing bounded activity summary and references to approved local files. |
 | `backup export / verify / restore` | Create a non-location snapshot, validate it offline, or recover it into an empty store. |
 
-All command results are JSON. Exit codes: `0` for successful queries or a complete
-scan, `1` for an incomplete scan, `2` for safe command/auth/storage errors, and
+All command results are JSON. Exit codes: `0` for successful imports/queries or
+a complete scan, `1` for an incomplete scan, `2` for safe command/auth/storage errors, and
 `130` for interruption. Invalid command arguments are not echoed back.
 
 ## Private store and authentication
@@ -286,6 +317,98 @@ force historical rechecks, or `sync --full` for a full audit. Date-range bounds
 are inclusive Garmin local calendar dates; `--start` is required, and `--end`
 defaults to the host's current date. Explicit ranges do not reset older coverage.
 
+## Offline import of a website export
+
+`import-fit` needs no authentication and does not read/write authentication
+files, construct `GarminSource`, contact Garmin, or use Drive. Obtain the original
+FIT or single-FIT ZIP using Garmin's normal website in a separate private
+environment, then place it in an owner-only directory outside Git. The input
+file must be a regular file with `0600` permissions and its immediate parent
+must have `0700` permissions. Symlinks, hardlinks, paths containing `..`, files
+inside this store's `auth` directory, and non-`.fit`/`.zip` suffixes are rejected.
+ZIP member names never become filesystem paths. All existing archive, size,
+ambiguity, cycling-session and CRC checks still apply.
+
+After installing the current reviewed checkout, these are the Polaris acceptance
+commands. `BRIDGE_FIT` must refer to the privately downloaded file and `BRIDGE_ID`
+must be the activity ID from the Garmin activity page, not a device number or an
+inferred ID. The prompts below keep actual private paths and IDs out of examples:
+
+```sh
+umask 077
+export GARMIN_BRIDGE_DATA_DIR="$HOME/.local/share/garmin-connect-bridge-offline"
+install -d -m 700 "$GARMIN_BRIDGE_DATA_DIR" "$HOME/.local/share/garmin-bridge-transfer"
+read -r -p 'Private FIT or ZIP path: ' BRIDGE_FIT
+read -r -p 'Garmin activity ID: ' BRIDGE_ID
+
+garmin-bridge --data-dir "$GARMIN_BRIDGE_DATA_DIR" import-fit \
+  --file "$BRIDGE_FIT" --activity-id "$BRIDGE_ID"
+# Repeat unchanged input: status must be unchanged, with the same file references.
+garmin-bridge --data-dir "$GARMIN_BRIDGE_DATA_DIR" import-fit \
+  --file "$BRIDGE_FIT" --activity-id "$BRIDGE_ID"
+garmin-bridge list --limit 20
+garmin-bridge activity "$BRIDGE_ID"
+
+# Keep this filename new; choose a new path for each later backup.
+BRIDGE_BUNDLE="$HOME/.local/share/garmin-bridge-transfer/offline-import.zip"
+garmin-bridge backup export --file "$BRIDGE_BUNDLE"
+garmin-bridge backup verify --file "$BRIDGE_BUNDLE"
+# This destination must be empty/new. Authentication and original FITs are absent.
+BRIDGE_RESTORE="$HOME/.local/share/garmin-connect-bridge-offline-restored"
+garmin-bridge --data-dir "$BRIDGE_RESTORE" backup restore --file "$BRIDGE_BUNDLE"
+garmin-bridge --data-dir "$BRIDGE_RESTORE" list --limit 20
+garmin-bridge --data-dir "$BRIDGE_RESTORE" activity "$BRIDGE_ID"
+garmin-bridge --data-dir "$BRIDGE_RESTORE" import-fit \
+  --file "$BRIDGE_FIT" --activity-id "$BRIDGE_ID"
+```
+
+The per-file receipt has `status: created|updated|unchanged`, a bounded activity
+summary, approved file references, `api_state_changed: false`, and
+`input: {kind: local_file, activity_id_origin: cli_argument,
+garmin_api_verified: false}`. A newly saved offline summary records
+`provenance.input: local_fit_file`, the same ID origin and verification flag,
+and quality flags `local_file_import`, `missing_api_metadata`, and
+`unverified_activity_id`. No original filename/path, raw bytes or sample arrays
+are printed. The syntactically valid ID is accepted as supplied; offline import
+cannot prove its association with the file or an account. Check it privately.
+
+Missing API metadata stays missing. Only observed FIT session/record values are
+retained; session start may supply UTC, but local time, time zone and offset
+remain null. Missing start time is not guessed from records or the host. Garmin
+estimates/settings remain separately labeled. The input digest includes source,
+supplied ID, missing metadata, decompressed FIT SHA-256 and local provenance;
+the parse cache also checks schema/parser version and saved artifact hashes.
+Changing a ZIP name/comment/container does not trigger another parse or record.
+
+For an existing **offline** ID, changed FIT content creates a new immutable
+revision and atomically replaces its index entry. An existing **API-derived**
+ID is handled conservatively: identical FIT content with intact derived files
+returns `unchanged` and preserves its metadata, provenance, parser version and
+revision. A content difference or damaged API artifacts returns `import_conflict`;
+resolve it with an explicit API recheck when available, or inspect the ID privately.
+No force-overwrite option is provided. A successful later API acquisition verifies
+the source through its normal path and replaces the local provenance, even if
+optional API metadata is absent. Existing originals after backup may be absent;
+reimporting an unchanged offline record can replenish its raw file without parsing.
+
+Offline import changes only the activity map and its referenced files. It leaves
+`covered_ranges`, `pending_ranges`, the computed watermark, `history_initialized`,
+`full_completed_at`, `last_success_at`, `last_attempt_at`, `last_failure`, scan
+offsets, tasks and gaps unchanged. Importing a file for a pending API gap does
+**not** resolve that gap. Its receipt never claims account history is complete.
+An offline-only backup has `scan_status: none`; that also means no API scan was
+completed. Failed imports return a safe error and retain the previous result;
+they do not create or modify API gap reports. Retry the same command after fixing
+the file, permissions or lock contention. Keep originals private for later
+reparsing: portable backups intentionally omit them.
+
+This entry point handles one activity at a time, not whole-account export bundles
+or legacy migrations. When API access later works, an offline-only store still
+requires `auth` followed by `sync --full`; an existing unfinished API job still
+requires `sync --resume`. A previously initialized store may use normal `sync`.
+None of those API commands are implicit in import, queries or restore. This
+change neither diagnoses network restrictions nor integrates with Google Drive.
+
 ## Offline queries and persistence
 
 ```sh
@@ -309,7 +432,7 @@ auth/session.json                    protected upstream session
 index.json                           committed activity index and coverage
 sync-job.json                         current page/activity journal
 jobs/<job-id>.json                    superseded unfinished journal
-raw/<sha256>.bin                      exact downloaded ZIP or FIT bytes
+raw/<sha256>.bin                      exact downloaded/imported ZIP or FIT bytes
 objects/<activity-id>/<revision>/     summary.json and full-resolution streams.json
 reports/<job-id>/gaps.json            reviewed gap report
 .restore-pending.json                 interrupted restore gate, present only during restore
@@ -317,8 +440,8 @@ reports/<job-id>/gaps.json            reviewed gap report
 
 All of these files are private, including non-location streams and summaries.
 New files/directories have `0600`/`0700` permissions even under a permissive umask.
-One POSIX lock covers authentication, synchronization and publication; queries
-take a shared lock and report `busy` if a writer is active. Writes use sibling
+One POSIX lock covers authentication, synchronization, offline imports and
+publication; queries take a shared lock and report `busy` if a writer is active. Writes use sibling
 temporary files, fsync, atomic replacement and directory fsync. Original bytes
 and complete validated derived files are written before the index switches.
 Crashes may leave unreferenced private objects, but cannot expose a partially
@@ -444,12 +567,19 @@ Version the output schema. Include the provider, source activity ID, source
 digest, acquisition time, activity time and time zone, units, field coverage,
 quality flags, and normalizer version.
 
-Schema `1.0`, normalizer `1.0.0` retain full-resolution standard FIT record time,
+Schema `1.0`, normalizer `1.1.0` retain full-resolution standard FIT record time,
 heart rate, power, cadence, speed, altitude, distance, temperature, enhanced
 respiration with reviewed units, and balance percentage/side. Laps retain times,
 duration and distance; timer events retain reviewed types/times. Device provenance
 is deliberately limited to message count and input/parser attribution. Unique
 identifiers, arbitrary developer fields and unreviewed message types are omitted.
+The bridge selects a message-specific field allowlist **before reading field
+values into its intermediate projection**; it never collects all standard fields
+first. Final summaries, streams, receipts and portable packages still undergo
+recursive closed-schema validation. The FIT dependency decodes private input
+internally; its raw frames are not outputs. Version `1.1.0` adds a closed local
+provenance variant and quality flags. Existing API records from `1.0.0` remain
+queryable without recomputation; older clients cannot read the new local variant.
 No resampling is performed. Missing samples remain JSON null, actual zero remains
 zero, and timestamps retain their observed irregular spacing. Missing local zone
 names/offsets remain missing; no current configuration fills historical gaps.
@@ -464,8 +594,9 @@ accepts one FIT file per original; traversal, absolute/Windows paths, symlinks,
 encryption, ambiguous multiple FIT files, expansion ratios over 200, more than
 32 entries and inputs/inflated content over 64 MiB are rejected. FIT framing and
 CRC are checked strictly. Multi-session/non-cycling FIT, more than 500,000 record
-samples, 10,000 laps or 100,000 timer events are explicit gaps. Larger activities,
-non-FIT originals and additional reviewed field types need later support. The
+samples, 10,000 laps or 100,000 timer events are explicit API gaps or per-file
+import errors. Larger activities, non-FIT originals and additional reviewed
+field types need later support. The
 SDK materializes download bytes before the bridge applies its size limit.
 
 ## Privacy and credentials
@@ -524,6 +655,14 @@ resume, missing raw files without redundant parsing, hard process exit during
 restore, malformed/rehashed private-field injections, unsafe paths, damaged
 files, permission checks, locking and preservation of existing stores.
 
+Offline import tests additionally forbid authentication construction and auth
+file reads/writes, import FIT and ZIP without credentials, check repeat/wrapper
+idempotence and revision conflicts, and compare all API index fields plus scan
+and gap file bytes/mtime before and after import. They cover value-access traps
+for forbidden FIT fields, malformed files, interrupted publication, concurrent
+imports, local-only and incomplete-API backup recovery, and subsequent mocked
+API full/resume/incremental synchronization.
+
 ## Verification and remaining private validation
 
 Development checks:
@@ -536,22 +675,22 @@ uv run --frozen ruff format --check src tests
 uv build --no-build-isolation
 ```
 
-Actual verification on 2026-10-14, Linux x86_64, CPython 3.12.14:
+The baseline MVP previously passed 116 tests. Actual verification of the offline
+import change on 2026-10-15, Linux x86_64, CPython 3.12.14:
 
 | Check actually run | Result |
 | --- | --- |
-| `uv sync --frozen` | Development package and locked dependencies installed. |
-| `.venv/bin/python -m pytest --tb=short` | **116 passed**, entirely offline and synthetic. |
+| `.venv/bin/python -m pytest --tb=short` | **171 passed**, including 55 new import cases; entirely offline and synthetic. |
 | `.venv/bin/ruff check src tests` | Passed. |
-| `.venv/bin/ruff format --check src tests` | All 21 Python files formatted. |
+| `.venv/bin/ruff format --check src tests` | All 23 Python files formatted. |
+| `git diff --check` | Passed. |
 | `uv lock --check --offline` | Lock matches the project. |
-| `uv build --no-build-isolation --offline` | Source distribution and wheel built locally. |
-| Independent venv: hash-required runtime install, then wheel install with `--no-deps` | Installed version 0.1.0; `uv pip check` passed for all 12 runtime packages. |
-| `uv sync --frozen --no-dev --python 3.12` with an isolated `UV_PROJECT_ENVIRONMENT` and offline cache | Polaris runtime recipe installed all 12 packages on Linux x86_64. |
-| Installed CLI root, five bridge commands and backup/export/verify/restore help pages | Exit 0; full/resume/review/backup options present. |
+| `.venv/bin/python -m hatchling build -t wheel -t sdist -d /tmp/garmin-bridge-import-fit-dist` | Wheel and sdist built locally; explicit member allowlists checked, including the new module/test. |
+| Pip-only environment: lock-derived build requirements, `pip install --no-index --no-deps --no-build-isolation .`, wheel installation, `pip check` | Both installation paths passed with the existing hash-locked dependencies; build dependency closure verified. No uv or network was needed for these installs. |
+| Installed CLI root/import-fit/query/backup help pages | Exit 0; `--file` and required `--activity-id` present. |
 | Installed CLI, empty private store: `status`, `list`, `activity 1001` | Exit 0/0/2; absent/empty/not-found; queries create no state. |
-| Installed CLI: `sync --full` without saved authentication | Exit 1, incomplete with `auth_required`; no account access. |
-| Installed wheel: synthetic generation → CLI export/verify/restore → query comparison → mocked incremental sync | Query results identical; exactly one newly discovered activity downloaded/parsed; no Drive/Garmin access. |
+| Installed CLI: synthetic FIT/ZIP import with network and GarminSource construction forbidden | Created/unchanged results, wrapper idempotence, no auth files, no API progress changes. |
+| Installed package: import → export/verify/restore → identical queries → reimport → mocked full/incremental sync | Queries identical after restore; unchanged reimport; later API initialization succeeds and incremental sync adds exactly one new activity. No Drive/Garmin access. |
 
 Package contents were checked for private runtime artifacts; none were included.
 The source distribution has an explicit code/documentation/lockfile allowlist.
@@ -559,9 +698,12 @@ Dependency acquisition used public package-registry access. Test execution and
 the installed CLI smoke checks required no network or credentials. Local build
 artifacts are ignored, and no distribution was published.
 
-No real account, credentials, FIT record or request recording was used. A later,
-separately authorized private environment should use a persistent owner-only
-store outside any checkout and validate, in order:
+No real account, credentials, FIT record, browser state, Polaris file or request
+recording was used. Actual website-export compatibility and the supplied ID/file
+association still require private validation; offline import cannot verify that
+association itself. A later, separately authorized private environment should
+use a persistent owner-only store outside any checkout and validate the website
+export/import/restore commands above, then, when API access is available:
 
 1. First sign-in, MFA continuation/cancellation, saved session permissions,
    process restart, explicit refresh, expiry/revocation and safely reported failure.

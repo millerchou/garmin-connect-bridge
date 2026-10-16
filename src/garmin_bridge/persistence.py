@@ -106,6 +106,9 @@ def require(condition):
 
 
 def validate_state(value, portable=False):
+    from .normalize import LOCAL_FLAGS, input_digest, local_metadata, sha256
+    from .storage import canonical
+
     require(STATE(value))
     for interval in value["covered_ranges"] + value["pending_ranges"]:
         require(interval["start"] <= interval["end"])
@@ -113,6 +116,27 @@ def validate_state(value, portable=False):
     for source_id, entry in value["activities"].items():
         summary = c.project_activity(entry["summary"])
         require(summary["source_activity_id"] == source_id)
+        if summary["provenance"]["input"] == "local_fit_file":
+            meta = local_metadata(source_id)
+            require(entry["metadata_digest"] == sha256(canonical(meta)))
+            require(
+                summary["source_digest"]
+                == input_digest(meta, summary["fit_sha256"], local_import=True)
+            )
+            require(LOCAL_FLAGS <= set(summary["quality_flags"]))
+            require(
+                all(
+                    summary["activity_time"][k] is None
+                    for k in ("local", "timezone", "utc_offset_seconds")
+                )
+            )
+            require(
+                all(
+                    q["source"] != "garmin_activity"
+                    for group in ("metrics", "garmin_reported")
+                    for q in summary[group].values()
+                )
+            )
         if portable or entry["raw_ref"] is None:
             require(entry["raw_ref"] is None and entry["raw_sha256"] is None)
         else:
@@ -156,7 +180,15 @@ def validate_pair(state, job):
 
     validate_state(state, portable=True)
     if job is None:
-        require(not state["activities"] and not state["history_initialized"])
+        from .storage import empty_state
+
+        require(
+            all(
+                s["summary"]["provenance"]["input"] == "local_fit_file"
+                for s in state["activities"].values()
+            )
+        )
+        require({**state, "activities": {}} == empty_state())
         return
     validate_job(job)
     for source_id, item in job["items"].items():

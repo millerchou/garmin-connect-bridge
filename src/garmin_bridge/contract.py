@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .errors import BridgeError, MESSAGES
 
 SCHEMA_VERSION = "1.0"
-NORMALIZER_VERSION = "1.0.0"
+NORMALIZER_VERSION = "1.1.0"
 STREAM_UNITS = {
     "timestamp": "UTC",
     "heart_rate": "bpm",
@@ -53,6 +53,9 @@ FLAGS = {
     "invalid_values_omitted",
     "unreviewed_fields_omitted",
     "source_reported_not_independently_validated",
+    "local_file_import",
+    "missing_api_metadata",
+    "unverified_activity_id",
 }
 
 
@@ -163,6 +166,31 @@ FILES = obj(
     }
 )
 QUALITY = sequence(literal(*sorted(FLAGS)), len(FLAGS))
+PROVENANCE_FIELDS = {
+    "parser": literal("fitdecode/0.11.0"),
+    "device_messages": count,
+    "unique_identifiers_retained": literal("none"),
+}
+LOCAL_INPUT = obj(
+    {
+        "kind": literal("local_file"),
+        "activity_id_origin": literal("cli_argument"),
+        "garmin_api_verified": lambda x: x is False,
+    }
+)
+
+
+def provenance(value):
+    return obj({**PROVENANCE_FIELDS, "input": literal("garmin_original_fit")})(value) or obj(
+        {
+            **PROVENANCE_FIELDS,
+            "input": literal("local_fit_file"),
+            "activity_id_origin": literal("cli_argument"),
+            "garmin_api_verified": lambda x: x is False,
+        }
+    )(value)
+
+
 ACTIVITY_FIELDS = {
     "schema_version": literal(SCHEMA_VERSION),
     "provider": literal("garmin"),
@@ -182,14 +210,7 @@ ACTIVITY_FIELDS = {
     "sample_count": count,
     "lap_count": count,
     "timer_event_count": count,
-    "provenance": obj(
-        {
-            "input": literal("garmin_original_fit"),
-            "parser": literal("fitdecode/0.11.0"),
-            "device_messages": count,
-            "unique_identifiers_retained": literal("none"),
-        }
-    ),
+    "provenance": provenance,
     "files": FILES,
 }
 ACTIVITY = obj(ACTIVITY_FIELDS)
@@ -275,6 +296,15 @@ SYNC_REPORT = obj(
 )
 
 OUTPUTS = {
+    "import-fit": obj(
+        {
+            "schema_version": literal(SCHEMA_VERSION),
+            "status": literal("created", "updated", "unchanged"),
+            "input": LOCAL_INPUT,
+            "activity": ACTIVITY,
+            "api_state_changed": lambda x: x is False,
+        }
+    ),
     "backup": obj(
         {
             "schema_version": literal(SCHEMA_VERSION),

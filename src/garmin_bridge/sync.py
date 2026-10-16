@@ -100,13 +100,30 @@ def artifacts_intact(store, entry):
 
 
 def acquire(store, source, meta, state, cutoff_at=None):
+    return publish_original(
+        store, source.download(meta["source_activity_id"]), meta, state, cutoff_at
+    )
+
+
+def publish_original(store, original, meta, state, cutoff_at=None, *, local_import=False):
+    """Shared validation/publication; caller holds the exclusive store lock.
+
+    Only the activities map changes here. API scan progress belongs to jobs.py.
+    An offline input cannot replace an API-derived result with missing metadata.
+    """
     source_id = meta["source_activity_id"]
-    original = source.download(source_id)
     fit = parser.extract_fit(original)
-    digest = parser.input_digest(meta, parser.sha256(fit))
+    fit_hash = parser.sha256(fit)
+    digest = parser.input_digest(meta, fit_hash, local_import=local_import)
     previous = state["activities"].get(source_id)
     if previous:
         summary = project_activity(previous["summary"])
+        if local_import and summary["provenance"]["input"] == "garmin_original_fit":
+            if summary["fit_sha256"] != fit_hash or not artifacts_intact(store, previous):
+                raise BridgeError("import_conflict")
+            # Exact content already validated through the API path. Preserve its
+            # metadata, provenance and revision, including older parser versions.
+            return False
         if (
             summary["source_digest"] == digest
             and summary["normalizer_version"] == NORMALIZER_VERSION
@@ -132,7 +149,7 @@ def acquire(store, source, meta, state, cutoff_at=None):
                 store.write_json("index.json", committed)
                 state.update(committed)
             return False
-    summary, streams = parser.normalize(fit, meta, now(), digest)
+    summary, streams = parser.normalize(fit, meta, now(), digest, local_import=local_import)
     validate_streams(streams)
     if (
         cutoff_at

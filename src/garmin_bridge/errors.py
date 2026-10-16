@@ -11,6 +11,8 @@ MESSAGES = {
     "upstream_invalid": "Unexpected Garmin response. Sync remains incomplete.",
     "invalid_fit": "Original activity is not a supported, complete FIT input.",
     "unsafe_archive": "Original archive failed size, path, or format validation.",
+    "unsafe_input": "Use one private regular FIT or ZIP file outside Git and authentication directories.",
+    "import_conflict": "Local input conflicts with saved API data or scan evidence. Existing results were preserved.",
     "unsafe_store": "Use an owner-only private directory outside any Git checkout.",
     "storage_failed": "Private storage could not be read or written safely.",
     "busy": "Private store is in use by another command. Retry later.",

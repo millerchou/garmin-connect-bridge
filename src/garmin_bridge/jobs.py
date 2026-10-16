@@ -289,6 +289,7 @@ class Runner:
         )
         return bool(
             previous
+            and previous["summary"]["provenance"]["input"] == "garmin_original_fit"
             and stamp
             and date.fromisoformat(stamp[:10]) < recent
             and previous.get("metadata_digest") == parser.sha256(canonical(meta))
