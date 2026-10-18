@@ -10,6 +10,9 @@ MESSAGES = {
     "rate_limited": "Garmin rate limit reached. Wait before retrying.",
     "upstream_invalid": "Unexpected Garmin response. Sync remains incomplete.",
     "invalid_fit": "Original activity is not a supported, complete FIT input.",
+    "sanitize_context": "Sanitization requires one cycling session and an activity FIT with records.",
+    "sanitize_verification": "Derived FIT archive failed policy, preservation, parser, or integrity checks.",
+    "sanitize_publish": "Atomic publication is unavailable; no archive was published.",
     "unsafe_archive": "Original archive failed size, path, or format validation.",
     "unsafe_input": "Use one private regular FIT or ZIP file outside Git and authentication directories.",
     "import_conflict": "Local input conflicts with saved API data or scan evidence. Existing results were preserved.",
@@ -28,7 +31,7 @@ MESSAGES = {
     "no_pending_sync": "There is no unfinished scan to resume.",
     "enumeration_limit": "The page limit was reached. Import is incomplete; resume with a larger --max-pages.",
     "catalog_unstable": "The visible activity catalog did not stabilize. Resume to reconcile it.",
-    "interrupted": "Operation interrupted. Retry sync to complete its pending range.",
+    "interrupted": "Operation interrupted. Previously saved results remain available.",
     "internal_error": "Operation failed. Previous committed results remain available.",
 }
 

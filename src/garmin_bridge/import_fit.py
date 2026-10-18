@@ -16,7 +16,7 @@ def read_input(store, filename):
         raise BridgeError("unsafe_input")
     source = Store(path.parent)
     candidate = source.path(path.name)
-    if candidate.is_relative_to(store.root / "auth"):
+    if store is not None and candidate.is_relative_to(store.root / "auth"):
         raise BridgeError("unsafe_input")
     original = source.read_bytes(path.name, limit=normalize.MAX_ARCHIVE)
     if original is None:

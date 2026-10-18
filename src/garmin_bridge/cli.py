@@ -76,6 +76,35 @@ def build_parser():
         required=True,
         help="Explicit Garmin activity ID from the website",
     )
+    cleaning = commands.add_parser(
+        "sanitize-fit",
+        help="Offline derived training FIT archive; explicit location/identity removal",
+    )
+    cleaning.add_argument(
+        "--file", type=Path, required=True, help="Private original FIT or single-FIT ZIP"
+    )
+    cleaning.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+        help="New private archive outside the activity store",
+    )
+    verifying = commands.add_parser(
+        "verify-fit",
+        help="Offline archive checks, optionally including comparison with its original source",
+    )
+    verification_mode = verifying.add_mutually_exclusive_group(required=True)
+    verification_mode.add_argument(
+        "--source", type=Path, help="Unchanged private original FIT or ZIP; required for fidelity"
+    )
+    verification_mode.add_argument(
+        "--archive-only",
+        action="store_true",
+        help="Check the three archive files only; source fidelity is not checked",
+    )
+    verifying.add_argument(
+        "--directory", type=Path, required=True, help="Derived FIT archive to verify"
+    )
     sync = commands.add_parser(
         "sync", help="Explicitly discover cycling activities and store private original FIT data"
     )
@@ -213,6 +242,14 @@ def query(store, args):
 
 
 def execute(args):
+    if args.command in {"sanitize-fit", "verify-fit"}:
+        from .sanitize_fit import sanitize_file, verify_archive, verify_archive_only
+
+        if args.command == "sanitize-fit":
+            return sanitize_file(args.file, args.output_dir, args.data_dir)
+        if args.archive_only:
+            return verify_archive_only(args.directory, args.data_dir)
+        return verify_archive(args.source, args.directory, args.data_dir)
     if args.command == "backup":
         from .backup import export_bundle, restore_bundle, verify_bundle
 

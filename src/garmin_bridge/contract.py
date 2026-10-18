@@ -369,6 +369,80 @@ OUTPUTS = {
     "sync": SYNC_REPORT,
 }
 
+FIT_ARCHIVE_FIELDS = {
+    "schema_version": literal(SCHEMA_VERSION),
+    "action": literal("sanitize", "verify"),
+    "format": literal("garmin-bridge-derived-training-fit"),
+    "format_version": literal(1),
+    "rules_version": literal("1.0.0"),
+    "description": literal("去除显式位置的派生训练FIT"),
+    "status": literal("verified"),
+    "summary": obj(
+        {
+            name: count
+            for name in (
+                "input_messages",
+                "output_messages",
+                "removed_messages",
+                "retained_fields",
+                "removed_fields",
+                "pending_review_fields",
+                "compressed_timestamps_expanded",
+            )
+        }
+    ),
+    "files": lambda x: x == ["derived.fit", "manifest.json", "report.json"],
+    "activity_store_changed": lambda x: x is False,
+}
+FIT_ARCHIVE_CHECK_NAMES = (
+    "file_set",
+    "document_structure_and_versions",
+    "document_consistency",
+    "output_sha256",
+    "report_sha256",
+    "strict_crc",
+    "complete_byte_consumption",
+    "all_definitions_approved",
+    "all_data_fields_approved",
+    "context_and_array_constraints",
+    "references_valid",
+    "canonical_framing",
+    "fitdecode_reread",
+    "garmin_sdk_reread",
+    "no_extra_payload",
+)
+FIT_ARCHIVE_RECEIPT = obj(FIT_ARCHIVE_FIELDS)
+FIT_VERIFY_FIELDS = {
+    **FIT_ARCHIVE_FIELDS,
+    "action": literal("verify"),
+    "checks": obj({name: literal("passed") for name in FIT_ARCHIVE_CHECK_NAMES}),
+}
+FIT_VERIFY_SOURCE_RECEIPT = obj(
+    {
+        **FIT_VERIFY_FIELDS,
+        "mode": literal("with_source"),
+        "source_comparison": obj({"status": literal("passed")}),
+    }
+)
+FIT_VERIFY_ONLY_RECEIPT = obj(
+    {
+        **FIT_VERIFY_FIELDS,
+        # Counts observed now; do not return historical removal/retention claims.
+        "summary": obj({"output_messages": count, "retained_fields": count}),
+        "mode": literal("archive_only"),
+        "source_comparison": obj(
+            {"status": literal("not_checked"), "reason": literal("source_not_provided")}
+        ),
+    }
+)
+
+
+def fit_verify_receipt(value):
+    return FIT_VERIFY_SOURCE_RECEIPT(value) or FIT_VERIFY_ONLY_RECEIPT(value)
+
+
+OUTPUTS.update({"sanitize-fit": FIT_ARCHIVE_RECEIPT, "verify-fit": fit_verify_receipt})
+
 
 def validate_output(kind, payload):
     try:

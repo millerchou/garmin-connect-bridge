@@ -2,8 +2,10 @@
 
 A small, read-only Garmin Connect adapter for deterministic data pipelines.
 
-**Status: installable CLI MVP with offline FIT import, synthetic tests and portable backups.**
-The bridge commands, `import-fit` and offline `backup` commands below are implemented.
+**Status: installable CLI MVP with offline FIT import, derived FIT archives,
+synthetic tests and portable backups.**
+The bridge commands, `import-fit`, `sanitize-fit`, `verify-fit` and offline
+`backup` commands below are implemented.
 The first verified runtime is Linux x86_64, Python 3.12.14.
 The code also targets macOS and Python 3.12+; macOS has not been exercised on a
 real runner. Live Garmin authentication, renewal and synchronization remain
@@ -35,7 +37,7 @@ JSON. Polaris runs it in a private cloud environment and uses its existing Drive
 tools to transfer the reviewed package. Bridge has no Google OAuth, Drive SDK,
 Space integration, hosted service or deployment configuration.
 
-Dependencies are `garminconnect==0.3.17` and `fitdecode==0.11.0`; the former is the
+The API/import dependencies remain `garminconnect==0.3.17` and `fitdecode==0.11.0`; the former is the
 PyPI distribution of python-garminconnect. On 2026-10-14, their non-yanked PyPI
 metadata, wheel hashes, installed versions and relevant source/API signatures
 were checked. Authentication uses the upstream `login`, `resume_login` and
@@ -43,11 +45,29 @@ were checked. Authentication uses the upstream `login`, `resume_login` and
 Catalog GET requests use the upstream activity-search endpoint and original
 downloads use `ActivityDownloadFormat.ORIGINAL`.
 
+Derived FIT verification additionally pins **`garmin-fit-sdk==21.218.0`** (official
+Garmin Python SDK, Profile **21.218.0Release**), checked against non-yanked PyPI
+metadata and the wheel on 2026-10-18. Its license is
+**`LicenseRef-FIT-Protocol-License-Agreement`**, a custom FIT Protocol License,
+not MIT. See the dependency's `licenses/LICENSE.txt` and
+[official SDK repository](https://github.com/garmin/fit-python-sdk). It is installed
+as a dependency; its code, whole Profile and upstream test data are not vendored.
+The existing parser and authentication dependency versions were not upgraded.
+
+The SDK's general encoder drops `None` fields and can reverse-scale/round values;
+its decoder does not support compressed timestamp messages. Therefore it is used
+as the **second independent output reader**, alongside fitdecode. A small bounded
+physical-field transcriber preserves approved source bytes and expands supported
+compressed timestamp headers before either reader sees the output. Using only
+fitdecode would not provide independent re-reading; re-encoding normalized JSON
+or SDK dictionaries would lose physical presence/precision information.
+
 Verified wheel SHA-256 values:
 
 ```text
 garminconnect 0.3.17: 624d8c2468d865d286c9fb7ae8133633bb1d52a2b019c8beb5ff9ae10dd43264
 fitdecode 0.11.0:    a1bdb9b4d1e9ebac0001fc58c22fe07a3f9967ca4e13258c6ef99cdb8d697a78
+garmin-fit-sdk 21.218.0: 7b912cde3b0b8f4acd7b543c202d15ac94f6b37b58eab5bad2186ca787b9ab37
 ```
 
 This verification establishes package identity and the inspected adapter
@@ -126,6 +146,8 @@ is editable. This is an installation recipe, not a deployment or scheduled job.
 | `status` | Authentication state, synchronization watermarks, freshness, and actionable failures; never credentials. |
 | `sync` | Full historical import, resume, daily discovery/rechecks, and explicit historical rescans. |
 | `import-fit` | Import one private original FIT or single-FIT ZIP entirely offline, with an explicit Garmin activity ID. |
+| `sanitize-fit` | Create a new private derived training FIT archive directly from physical FIT fields, without changing the activity store. |
+| `verify-fit` | Recheck all physical fields and both parsers; choose full comparison with `--source` or archive integrity only with `--archive-only`. |
 | `list` | Read the local activity index without network access. |
 | `activity` | Read an existing bounded activity summary and references to approved local files. |
 | `backup export / verify / restore` | Create a non-location snapshot, validate it offline, or recover it into an empty store. |
@@ -409,6 +431,204 @@ requires `sync --resume`. A previously initialized store may use normal `sync`.
 None of those API commands are implicit in import, queries or restore. This
 change neither diagnoses network restrictions nor integrates with Google Drive.
 
+## Offline derived FIT archives
+
+`sanitize-fit` produces a **“去除显式位置的派生训练FIT”**: a derived training FIT with
+explicit location and identity fields removed. It is **not anonymous**. Original
+timestamps, physiological/training measurements, altitude and historical thresholds
+can still identify or characterize a person. Keep the complete archive private.
+Removed fields cannot be recovered from it; this is not a lossless copy of the
+whole input or a promise that every future training metric can be reconstructed.
+
+These two commands work entirely offline. They do not construct a GarminSource,
+read/write authentication files, open the activity index, change API coverage,
+watermarks, scan/gap state, or change the `backup` format. `--data-dir` (or its
+normal default) is used only to reject an archive destination inside that store
+and an input under its authentication directory. Do not place archives in any
+other account's store or authentication directory either.
+
+Use the installed executable from the intended Python 3.12 environment. For
+example, from the checkout containing that environment:
+
+```sh
+BRIDGE="$PWD/.venv/bin/garmin-bridge"
+umask 077
+FIT_PRIVATE="$HOME/.local/share/garmin-bridge-fit-archives"
+mkdir -p "$FIT_PRIVATE/inbox" "$FIT_PRIVATE/archives"
+chmod 700 "$FIT_PRIVATE" "$FIT_PRIVATE/inbox" "$FIT_PRIVATE/archives"
+
+# Put a copy of the website export in this private inbox separately.
+# Use its actual private path locally; do not paste it or the FIT into a model.
+FIT_INPUT="$FIT_PRIVATE/inbox/input.fit"  # A single-FIT .zip is also accepted.
+chmod 600 "$FIT_INPUT"
+FIT_ARCHIVE="$FIT_PRIVATE/archives/derived-001"  # Must not already exist.
+
+"$BRIDGE" sanitize-fit --file "$FIT_INPUT" --output-dir "$FIT_ARCHIVE"
+"$BRIDGE" verify-fit --source "$FIT_INPUT" --directory "$FIT_ARCHIVE"
+```
+
+Successful commands exit 0 and return only a fixed description, counts, validation
+status and the relative names `derived.fit`, `manifest.json`, `report.json`.
+Errors are fixed codes/messages, exit 2; an interrupt exits 130. No original
+filename/path, input/output hash, decoded value, raw frame or upstream exception
+is printed. The private manifest contains the required SHA-256 values; do not
+paste it into a public issue or model context.
+
+`verify-fit --source` requires the **same original bytes**, including the ZIP wrapper when
+one was supplied. It reads the original and archive without changing either,
+recomputes the projection and manifest, traverses all output definitions/data,
+and re-reads the actual output using both pinned parsers. A stored `verified`
+flag or a matching checksum alone is insufficient. A missing/unreadable `--source`
+fails; it never falls back to another mode. Its receipt has `mode: "with_source"`
+and `source_comparison: {"status":"passed"}`.
+
+If the original is no longer available, explicitly request an archive-only check:
+
+```sh
+"$BRIDGE" verify-fit --archive-only --directory "$FIT_ARCHIVE"
+```
+
+`--archive-only` and `--source` are mutually exclusive; one is required. The
+archive-only mode reads **only** `derived.fit`, `manifest.json`, and `report.json`.
+It rechecks the exact member set, private regular files, canonical closed JSON
+structures and supported versions, output/report SHA-256, document/inventory
+consistency, strict FIT CRC and complete byte consumption. Every physical definition
+and data field is checked against the unchanged policy, including base types,
+array bounds, context and cross-message references. Canonical framing excludes
+unused/redundant definitions and extra payload. Both pinned parsers reread the
+actual approved FIT. Reads are bounded to 64 MiB for FIT, 4 MiB for the manifest,
+and 64 KiB for the report. Historical `validations` flags are required format
+metadata, **not** evidence that the checks passed this time.
+
+Both verification modes return current checks in `checks`. Archive-only success
+returns `mode: "archive_only"`, only observed `output_messages`/`retained_fields`
+counts, and exactly:
+
+```json
+{"source_comparison":{"status":"not_checked","reason":"source_not_provided"}}
+```
+
+Here `status: "verified"` means the selected checks passed. It does **not** claim
+that original values, missing/invalid patterns, message order or retention
+completeness were compared again. Source hashes, source definition/removal counts
+and preservation flags in the historical documents cannot be independently
+confirmed without the original. They are neither reissued as current results nor
+rewritten. Matching unkeyed hashes cannot establish source authenticity: a change
+to approved training values accompanied by consistent CRC/hash updates can pass
+archive-only checks; a full comparison against the original rejects it. Preserve
+the original privately if later preservation comparison is needed. No file is
+automatically deleted or uploaded.
+
+The archive has three fixed members:
+
+| File | Private contents |
+| --- | --- |
+| `derived.fit` | Approved physical fields in original message/field order and byte order, including invalid sentinels. |
+| `manifest.json` | Format/rule/SDK/Profile versions; original-container, extracted-FIT, output and report SHA-256; field-number inventory, counts, fixed reason codes and verification results. |
+| `report.json` | Bounded aggregate counts, verification results and fixed limitations; no sample values. |
+
+The manifest inventories every definition, including unused ones, and every
+data-field occurrence. A definition marked `retained` means its shape is eligible;
+only occurrences passing context/reference checks are actually retained. Summary
+counts refer to data occurrences. Pending-review counts are a subset of removals,
+not additional missing fields. Compressed timestamps supplied by a record header
+are counted as retained logical timestamp occurrences, with the representation
+change reported separately. Rebuilt definition records need not retain the original
+local slot assignments or byte positions.
+Preservation validation flags refer to the approved retained fields, not equality
+of the complete original and derived files.
+
+The complete closed policy, all 152 candidate decisions, physical base types,
+array bounds, scale/offset facts and contextual rules are in
+[FIT_SANITIZE_RULES.md](FIT_SANITIZE_RULES.md). Key limits:
+
+- One activity FIT, one cycling session and at least one retained record are
+  required. Multi-session/multisport files and whole-account exports are unsupported.
+  The same original input ZIP path, member, CRC, size and ambiguity checks apply.
+- 151 core candidates are eligible. `lap 19:40` is deferred because swimming-length
+  context is unsupported. Unknown messages/fields and all developer fields are
+  removed; future SDK recognition grants no new permission. Wrong base types or
+  unsupported array lengths are removed and reported, never coerced.
+- Additional individually reviewed fields retain file type, sport, session/lap
+  indices and counts, activity timing, historical HR/power zone configurations,
+  legacy speed/altitude and power-phase pairs. No current settings, timezone, FTP,
+  interpolated data or independently recomputed metrics are added. Garmin estimates
+  and configuration remain source-reported historical fields, not validated metrics.
+- Timer, rider-position and gear-change event payloads have explicit conditions.
+  Other opaque `event.data`/`data16` payloads are removed and reported. Zone records
+  require unique surviving session/lap targets. Dangling indices/counts and ambiguous
+  global zone configurations are removed and reported, without synthesizing replacements.
+- Integers, bitfields, fractional cadence, left/right balance, array order, invalid
+  patterns, signed zero, float bytes, original scale/offset encoding and timestamps
+  are copied exactly. Parser-expanded components are never written as new fields.
+  With `--source`, the verifier compares exact retained bytes, distinguishing absent fields
+  from all-invalid fields even when a parser omits them from its dictionaries.
+- Supported compressed timestamp records omit field 253 from their local definition
+  and have a preceding valid timestamp anchor from an explicitly approved message
+  and field. Unknown-message or mistyped timestamp fields invalidate the anchor;
+  they cannot inject private bytes indirectly into later retained timestamps.
+  The 5-bit offsets/rollovers become
+  explicit timestamps. Missing anchors or definitions also containing timestamp 253
+  are rejected as unsupported/ambiguous. No timestamp is guessed.
+- FIT headers must be 12 or 14 bytes, protocol 1.0/2.0, with an exact data length and
+  strict CRCs (a 14-byte header must have a valid header CRC). Chained FIT files,
+  trailing bytes, malformed/reserved record headers and duplicate fields fail.
+  Input/output FIT and original ZIP limits remain 64 MiB; framing is additionally
+  bounded to 500,000 definition/data messages, 2,000,000 field occurrences including
+  definitions, and 8,192 inventory rows. Oversized input fails without publication.
+
+Inputs are read-only; symlinks, hardlinks, Git paths, input/output aliases, and
+existing destinations are rejected. Archives are `0700`, files `0600`. Publication
+uses private temporary files, fsync and an atomic **no-replace** directory rename
+(`renameat2(RENAME_NOREPLACE)` on Linux; `renamex_np(RENAME_EXCL)` on macOS).
+Concurrent creators cannot replace each other or an empty existing destination.
+An unsupported filesystem fails safely; there is no replace-in-place fallback.
+An ordinary failure cleans the staging directory. A hard process exit can leave
+a private `.fit-pending-*` directory, which `verify-fit` explicitly rejects; it
+may be removed privately after confirming no writer remains. Retry with a new
+archive path. Once publication succeeds, the complete archive is immutable by
+Bridge; verification never repairs or rewrites it.
+
+This archive is separate from Bridge's non-location JSON backup. `backup export`
+does not include original FIT/ZIP **or these derived archives**; `backup restore`
+does not restore them. This task adds no Drive transport or integration.
+
+### Polaris private acceptance (not performed during development)
+
+First install this checkout using the locked Python 3.12 instructions above.
+When offline, provide a private local wheelhouse containing the exact runtime
+and build wheels from the current locks (including the new SDK). After generating
+`.venv/bridge-build.lock` with the installation snippet above:
+
+```sh
+# Set this to a directory already populated with the locked wheels.
+BRIDGE_WHEELHOUSE="$HOME/bridge-wheelhouse"
+.venv/bin/python -m pip install --no-cache-dir --no-index --find-links "$BRIDGE_WHEELHOUSE" \
+  --only-binary=:all: --require-hashes -r requirements.lock -r .venv/bridge-build.lock
+.venv/bin/python -m pip install --no-index --no-deps --no-build-isolation --force-reinstall .
+.venv/bin/python -m pip check
+.venv/bin/garmin-bridge sanitize-fit --help
+.venv/bin/garmin-bridge verify-fit --help
+```
+
+No uv is required for this pip path. A wheelhouse from the prior import-only
+version lacks `garmin-fit-sdk==21.218.0`; offline installation cannot download it.
+Obtain that hash-locked wheel through an approved code/dependency transfer first.
+Always invoke `.venv/bin/garmin-bridge` explicitly to avoid an older CLI on PATH.
+
+In a separate private environment, copy one real website FIT/ZIP into a `0700`
+inbox, keep the source `0600` and run the two commands above with no credentials.
+Locally check source hashes before/after, both exit codes, archive permissions,
+and the manifest's per-field removal/review reasons. Repeat to a second new
+directory and compare derived bytes privately; the same input/rules are
+deterministic. Trying the first destination again must fail and preserve it.
+Validate representative invalid arrays, event contexts and historical zone
+references against the private source. Compare any existing activity index,
+scan/gap files and authentication directory before/after; they must be unchanged.
+Do not publish the real files, manifests, hashes, counts or reports. These real-file
+checks, macOS atomic publication and future downstream-reader compatibility remain
+unverified; this development task uses synthetic inputs only and performs no upload.
+
 ## Offline queries and persistence
 
 ```sh
@@ -674,6 +894,29 @@ uv run --frozen ruff check src tests
 uv run --frozen ruff format --check src tests
 uv build --no-build-isolation
 ```
+
+Actual derived-FIT verification on 2026-10-18, Linux x86_64, CPython 3.12.14:
+
+| Check actually run | Result |
+| --- | --- |
+| `.venv/bin/python -m pytest --tb=short` | **594 passed**: 365 derived-FIT cases, 58 archive-only cases and all 171 existing API/auth/import/privacy/backup cases; offline and synthetic. |
+| `.venv/bin/ruff check src tests`; `.venv/bin/ruff format --check src tests`; `git diff --check` | Passed; all 31 Python files formatted. |
+| `uv lock --check --offline`; before/after lock comparison | Consistent; only `garmin-fit-sdk==21.218.0` added, all existing versions unchanged. |
+| `.venv/bin/python -m hatchling build -t wheel -t sdist -d /tmp/garmin-bridge-archive-only-dist` | Built locally; 22 wheel members and 39 source-package members checked against explicit allowlists. No FIT, runtime data, credentials or vendored SDK fixtures. |
+| Python 3.12 fresh pip venv; hash-locked local wheelhouse; `pip install --no-index --no-deps --no-build-isolation --force-reinstall .`; built-wheel installation; `pip check` | Source and wheel paths passed; installs used local locked wheels without uv/network. Public PyPI was used separately to obtain dependencies. |
+| Installed `sanitize-fit`/`verify-fit` help and synthetic FIT/ZIP execution | Passed with network, authentication construction and activity-state access forbidden; source bytes unchanged. Reinstalled the archive-only wheel without network; both input forms passed full verification, then archive-only verification after deletion of the synthetic source. Missing `--source` failed; historical files stayed unchanged. |
+| Installed root help and empty-store `status`/`list`/`activity` | Exit 0/0/2 for queries; no store created. |
+| Physical policy, private output and recovery tests | All 152 candidates checked against the fixed Profile and in both byte orders; exact bytes/invalid arrays/zero/bitfields, conditional events, unknown-anchor rejection, references, unused definitions, CRC/trailing content, recursive JSON boundaries, concurrent no-replace publication and hard exit covered. |
+| `.venv/bin/python -m pytest tests/test_verify_fit_archive.py --tb=short` | **58 passed**: original deleted; explicit modes/no fallback; strict files/JSON/versions/hashes; policy, arrays, context/references and extra definitions rejected despite recomputed CRC/hashes; both parsers reexecuted; historical files unchanged; safe errors. |
+| Existing mocked API stores before/after sanitize and both verify modes | Index, watermarks, pagination/activity jobs, gaps and synthetic auth-marker bytes/mtime/modes unchanged for interrupted pagination, partial activity processing and completed history. |
+
+Full verification uses one source byte snapshot and bounds archive reads to the
+expected sizes; archive-only verification has independent fixed read limits.
+Review also prevents unknown fields from seeding compressed
+timestamps, and retains a real zero lap count without creating a dangling first-lap
+reference. Source files and derived artifacts stay outside Git. AGENTS.md and the
+existing activity/backup formats are unchanged. No real-file acceptance, upload,
+account access, commit, push, PR, deployment or release is part of this work.
 
 The baseline MVP previously passed 116 tests. Actual verification of the offline
 import change on 2026-10-15, Linux x86_64, CPython 3.12.14:

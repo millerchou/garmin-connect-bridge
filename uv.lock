@@ -284,6 +284,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "fitdecode" },
+    { name = "garmin-fit-sdk" },
     { name = "garminconnect" },
 ]
 
@@ -297,6 +298,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fitdecode", specifier = "==0.11.0" },
+    { name = "garmin-fit-sdk", specifier = "==21.218.0" },
     { name = "garminconnect", specifier = "==0.3.17" },
 ]
 
@@ -305,6 +307,15 @@ dev = [
     { name = "hatchling", specifier = "==1.32.4" },
     { name = "pytest", specifier = "==9.1.1" },
     { name = "ruff", specifier = "==0.15.7" },
+]
+
+[[package]]
+name = "garmin-fit-sdk"
+version = "21.218.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f8/b2/c7e1984d828332e7d36d75044f91f2113de246c206931d185e5ed224fc62/garmin_fit_sdk-21.218.0.tar.gz", hash = "sha256:70dc8c39cec3483871f966415ee786a12e121af2a1729b5719f430078d2de495", size = 216076, upload-time = "2026-10-06T17:30:49.952Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d6/82/2d2c84c316186bb0cd055d96068395705e8d4d70eeb0085943b5cffd8895/garmin_fit_sdk-21.218.0-py3-none-any.whl", hash = "sha256:7b912cde3b0b8f4acd7b543c202d15ac94f6b37b58eab5bad2186ca787b9ab37", size = 238238, upload-time = "2026-10-06T17:30:48.026Z" },
 ]
 
 [[package]]
