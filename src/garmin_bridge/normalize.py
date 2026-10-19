@@ -455,13 +455,19 @@ def _cadence_quality(metrics, session, records, integers):
     # API maxima may describe a different range and cannot substitute here.
     start = timestamp(session.get("start_time"), utc=True)
     end = timestamp(session.get("timestamp"), utc=True)
-    if not start or not end or maximum["source"] != "fit_session":
+    if (
+        not start
+        or not end
+        or maximum["source"] != "fit_session"
+        or maximum["value"] is None
+        or maximum["value"] < 0
+    ):
         return flags
     start, end = datetime.fromisoformat(start), datetime.fromisoformat(end)
     if end <= start:
         return flags
     for row, integer in zip(records, integers):
-        if integer is None or row["timestamp"] is None:
+        if integer is None or integer < 0 or row["timestamp"] is None:
             continue
         observed = datetime.fromisoformat(row["timestamp"])
         # Compare like precision: the current session extraction is integer-only.

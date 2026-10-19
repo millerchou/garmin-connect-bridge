@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .errors import BridgeError, MESSAGES
 
 SCHEMA_VERSION = "1.0"
-NORMALIZER_VERSION = "1.2.0"
+NORMALIZER_VERSION = "1.2.1"
 STREAM_UNITS = {
     "timestamp": "UTC",
     "heart_rate": "bpm",

@@ -127,7 +127,7 @@ def test_mixed_sources_and_api_scope(avg, maximum, expected):
     assert set(summary["quality_flags"]) & {SUMMARY, RECORD} == expected
 
 
-@pytest.mark.parametrize("old_version", ["1.0.0", "1.1.0"])
+@pytest.mark.parametrize("old_version", ["1.0.0", "1.1.0", "1.2.0"])
 def test_old_backup_cache_reparse_and_immutable_revision(
     store, tmp_path, capsys, monkeypatch, old_version
 ):
@@ -149,7 +149,7 @@ def test_old_backup_cache_reparse_and_immutable_revision(
         result = importing(target, capsys, path)[1]
         assert result["status"] == "updated"
         new = result["activity"]
-        assert new["normalizer_version"] == "1.2.0"
+        assert new["normalizer_version"] == "1.2.1"
         assert {SUMMARY, RECORD} <= set(new["quality_flags"])
         assert new["files"] != old["files"]
         assert importing(target, capsys, path)[1]["status"] == "unchanged"
@@ -184,3 +184,53 @@ def test_sanitize_import_backup_restore_preserves_values_and_flags(store, tmp_pa
     bad["quality_flags"].append("cadence_unreviewed_guess")
     with pytest.raises(BridgeError):
         contract.project_activity(bad)
+
+
+@pytest.mark.parametrize(
+    "avg,maximum,records,expected",
+    [
+        (None, -1, (0,), set()),
+        (None, -2, (-1,), set()),
+        (None, 80, (81,), {RECORD}),
+        (None, 80, (-1, 81, -2), {RECORD}),
+        (None, 80, (81, -1), {RECORD}),
+        (None, 80, (-1, 80), set()),
+        (-1, -2, (-1,), set()),
+        (80, -1, (0,), set()),
+        (-1, 80, (80,), set()),
+        (81, 80, (80,), {SUMMARY}),
+        (0, 0, (-1, 0), set()),
+    ],
+)
+def test_signed_fit_cadence_comparison_eligibility(avg, maximum, records, expected, monkeypatch):
+    # Intentionally use FIT sint8 definitions: fitdecode retains these negatives.
+    data = message(
+        20,
+        [(253, 0x86, "I"), (4, 1, "b")],
+        [(START + i, value) for i, value in enumerate(records)],
+    )
+    fields = [(5, 0, "B"), (2, 0x86, "I"), (253, 0x86, "I"), (19, 1, "b")]
+    values = [2, START, START + 60, maximum]
+    if avg is not None:
+        fields.append((18, 1, "b"))
+        values.append(avg)
+    data += message(18, fields, [values])
+    header = struct.pack("<BBHI4s", 12, 0x20, 2200, len(data), b".FIT")
+    fit = header + data + struct.pack("<H", crc16(header + data))
+    args = (fit, normalize.local_metadata("1001"), "2025-01-03T00:00:00Z", "a" * 64)
+    summary, streams = normalize.normalize(*args)
+    assert set(summary["quality_flags"]) & {SUMMARY, RECORD} == expected
+    assert summary["metrics"]["avg_cadence"]["value"] == avg
+    assert summary["metrics"]["max_cadence"]["value"] == maximum
+    assert [r["cadence"] for r in streams["records"]] == list(records)
+    assert summary["coverage"]["cadence"] == {
+        "present": len(records),
+        "missing": 0,
+        "total": len(records),
+    }
+    # Removing only semantic hints leaves every other value and flag identical.
+    monkeypatch.setattr(normalize, "_cadence_quality", lambda *args: set())
+    baseline_summary, baseline_streams = normalize.normalize(*args)
+    summary["quality_flags"] = sorted(set(summary["quality_flags"]) - expected)
+    assert summary == baseline_summary
+    assert streams == baseline_streams

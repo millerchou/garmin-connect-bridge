@@ -787,7 +787,7 @@ Version the output schema. Include the provider, source activity ID, source
 digest, acquisition time, activity time and time zone, units, field coverage,
 quality flags, and normalizer version.
 
-Schema `1.0`, normalizer `1.2.0` retain full-resolution standard FIT record time,
+Schema `1.0`, normalizer `1.2.1` retain full-resolution standard FIT record time,
 heart rate, power, cadence, speed, altitude, distance, temperature, enhanced
 respiration with reviewed units, and balance percentage/side. Laps retain times,
 duration and distance; timer events retain reviewed types/times. Device provenance
@@ -828,9 +828,14 @@ units, sources, nulls, zeros, coverage and other flags remain unchanged. Isolate
 and consecutive high points are preserved without clamping, filtering, filling,
 overflow guesses or adding 256.
 
+Normalizer `1.2.1` excludes negative session maxima and negative record integer
+components from comparison evidence, while retaining those source values and
+coverage unchanged. Mixed negative/valid records still retain valid evidence.
+This patch version also invalidates `1.2.0` offline parse caches.
+
 The closed quality vocabulary accepts these two names, not arbitrary flags or
-fields. Existing `1.0.0`/`1.1.0` summaries and backups remain readable. Reimporting
-an old offline cache with original FIT bytes creates a new immutable `1.2.0`
+fields. Existing `1.0.0`/`1.1.0`/`1.2.0` summaries and backups remain readable. Reimporting
+an old offline cache with original FIT bytes creates a new immutable `1.2.1`
 revision; the next identical import is unchanged. API-source protection still
 applies: offline import cannot upgrade or overwrite an existing API record.
 
@@ -924,6 +929,16 @@ uv run --frozen ruff check src tests
 uv run --frozen ruff format --check src tests
 uv build --no-build-isolation
 ```
+
+Cadence eligibility follow-up (`1.2.1`), 2026-10-19, CPython 3.12.14:
+**640 passed** in the full offline suite. Eleven new signed-field synthetic FIT
+cases cover negative maxima/records, mixed records, valid exceedances, zeros and
+summary eligibility; one additional historical-cache case covers `1.2.0`.
+Before the fix, four signed-field cases reproduced the false flag. Source values,
+coverage, other flags and streams are compared unchanged. Frozen Python 3.12
+installation, Ruff, formatting (32 files), wheel/sdist build and diff checks all
+passed again using command-local `UV_CACHE_DIR=/tmp/cadence-uv-cache`; builds
+went to `/tmp/cadence-fix-dist`. No original tests were removed or skipped.
 
 Actual cadence-quality verification on 2026-10-19, Linux x86_64, CPython 3.12.14:
 
