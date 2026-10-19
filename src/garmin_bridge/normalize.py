@@ -101,7 +101,7 @@ MESSAGE_FIELDS = {
         }
     ),
     "session": frozenset(
-        {"sport", "start_time", "avg_speed", "max_speed"}
+        {"sport", "start_time", "timestamp", "avg_speed", "max_speed"}
         | {names[0] for names in SUMMARY_FIELDS.values()}
         | {names[0] for names in REPORTED_FIELDS.values()}
     ),
@@ -274,6 +274,7 @@ def normalize(fit: bytes, meta: dict, acquired_at: str, source_digest: str, *, l
         flags.update(LOCAL_FLAGS)
     records, laps, events, sessions = [], [], [], []
     device_count = 0
+    cadence_integers = []
 
     def clean(value):
         if value is not None and not numeric(value):
@@ -297,6 +298,7 @@ def normalize(fit: bytes, meta: dict, acquired_at: str, source_digest: str, *, l
                         balance_value = None
                         flags.add("invalid_values_omitted")
                     cadence = clean(values.get("cadence"))
+                    cadence_integers.append(cadence)
                     fractional = clean(values.get("fractional_cadence"))
                     if cadence is not None and fractional is not None:
                         cadence += fractional
@@ -428,9 +430,46 @@ def normalize(fit: bytes, meta: dict, acquired_at: str, source_digest: str, *, l
             "unique_identifiers_retained": "none",
         },
     }
+    summary["quality_flags"] = sorted(
+        flags | _cadence_quality(summary["metrics"], session, records, cadence_integers)
+    )
     if local_import:
         summary["provenance"].update(activity_id_origin="cli_argument", garmin_api_verified=False)
     return summary, streams
+
+
+def _cadence_quality(metrics, session, records, integers):
+    """Non-fatal consistency evidence, never a sensor diagnosis or value repair."""
+    flags = set()
+    avg, maximum = (metrics[key] for key in ("avg_cadence", "max_cadence"))
+    if (
+        avg["value"] is not None
+        and maximum["value"] is not None
+        and avg["source"] == maximum["source"]
+        and avg["unit"] == maximum["unit"] == "rpm"
+        and 0 <= maximum["value"] < avg["value"]
+    ):
+        flags.add("cadence_summary_max_below_avg")
+
+    # FIT session timestamp is its explicit end, not start + active timer time.
+    # API maxima may describe a different range and cannot substitute here.
+    start = timestamp(session.get("start_time"), utc=True)
+    end = timestamp(session.get("timestamp"), utc=True)
+    if not start or not end or maximum["source"] != "fit_session":
+        return flags
+    start, end = datetime.fromisoformat(start), datetime.fromisoformat(end)
+    if end <= start:
+        return flags
+    for row, integer in zip(records, integers):
+        if integer is None or row["timestamp"] is None:
+            continue
+        observed = datetime.fromisoformat(row["timestamp"])
+        # Compare like precision: the current session extraction is integer-only.
+        # Missing samples cannot refute a maximum; one in-range exceedance can.
+        if start <= observed <= end and integer > maximum["value"]:
+            flags.add("cadence_record_max_exceeds_session")
+            break
+    return flags
 
 
 def input_digest(meta, fit_hash, *, local_import=False):

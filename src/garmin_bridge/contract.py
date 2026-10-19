@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .errors import BridgeError, MESSAGES
 
 SCHEMA_VERSION = "1.0"
-NORMALIZER_VERSION = "1.1.0"
+NORMALIZER_VERSION = "1.2.0"
 STREAM_UNITS = {
     "timestamp": "UTC",
     "heart_rate": "bpm",
@@ -44,6 +44,8 @@ REPORTED_UNITS = {
     "threshold_power": "W",
 }
 FLAGS = {
+    "cadence_summary_max_below_avg",
+    "cadence_record_max_exceeds_session",
     "non_location_projection",
     "missing_timezone",
     "missing_start_time",

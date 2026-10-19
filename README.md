@@ -787,7 +787,7 @@ Version the output schema. Include the provider, source activity ID, source
 digest, acquisition time, activity time and time zone, units, field coverage,
 quality flags, and normalizer version.
 
-Schema `1.0`, normalizer `1.1.0` retain full-resolution standard FIT record time,
+Schema `1.0`, normalizer `1.2.0` retain full-resolution standard FIT record time,
 heart rate, power, cadence, speed, altitude, distance, temperature, enhanced
 respiration with reviewed units, and balance percentage/side. Laps retain times,
 duration and distance; timer events retain reviewed types/times. Device provenance
@@ -803,6 +803,36 @@ queryable without recomputation; older clients cannot read the new local variant
 No resampling is performed. Missing samples remain JSON null, actual zero remains
 zero, and timestamps retain their observed irregular spacing. Missing local zone
 names/offsets remain missing; no current configuration fills historical gaps.
+
+Normalizer `1.2.0` adds exactly two non-fatal cadence quality flags:
+
+| Flag | Evidence required |
+| --- | --- |
+| `cadence_summary_max_below_avg` | Valid nonnegative average and maximum in rpm from the same FIT session or the same API activity summary, with maximum below average. Mixed FIT/API sources are not compared. |
+| `cadence_record_max_exceeds_session` | A valid record inside the inclusive explicit FIT session `start_time`/`timestamp` interval has an integer cadence component above the FIT session maximum. The end must be later than the start. API maxima are not substituted. |
+
+The record comparison uses the original integer component internally because the
+existing session extraction retains integer precision. Thus record `80.5` versus
+session `80` does not trigger a flag. Session fractional fields remain unextracted;
+record fractions remain merged exactly as before. The session end timestamp is a
+non-location internal comparison boundary, not a new output metric. Active
+`total_timer_time` is never used to reconstruct elapsed end time.
+
+Missing/invalid bounds, missing timestamps or cadence, out-of-range records, and
+API-only maxima provide no deterministic record/session judgment. A missing or
+partial stream cannot establish that a larger session maximum is wrong. Even
+with partial coverage, one valid in-range integer exceedance supplies positive
+evidence; no minimum sample count or fixed rpm threshold diagnoses sensor error.
+A flag is a consistency hint, not a rejection or correction: all original values,
+units, sources, nulls, zeros, coverage and other flags remain unchanged. Isolated
+and consecutive high points are preserved without clamping, filtering, filling,
+overflow guesses or adding 256.
+
+The closed quality vocabulary accepts these two names, not arbitrary flags or
+fields. Existing `1.0.0`/`1.1.0` summaries and backups remain readable. Reimporting
+an old offline cache with original FIT bytes creates a new immutable `1.2.0`
+revision; the next identical import is unchanged. API-source protection still
+applies: offline import cannot upgrade or overwrite an existing API record.
 
 Keep Garmin-reported estimates and settings in a separate namespace. Values
 such as normalized power, training stress score, training effect, and threshold
@@ -894,6 +924,25 @@ uv run --frozen ruff check src tests
 uv run --frozen ruff format --check src tests
 uv build --no-build-isolation
 ```
+
+Actual cadence-quality verification on 2026-10-19, Linux x86_64, CPython 3.12.14:
+
+- `UV_CACHE_DIR=/tmp/cadence-uv-cache uv sync --frozen --python 3.12`: passed.
+- `uv run --frozen python -m pytest --tb=short`: **628 passed**, including 34
+  new synthetic cadence cases and all 594 pre-existing tests; none skipped.
+- `uv run --frozen ruff check src tests`, `uv run --frozen ruff format --check
+  src tests`, and `git diff --check`: passed (32 Python files formatted).
+- `uv build --no-build-isolation --out-dir /tmp/cadence-dist`: wheel and sdist
+  built. All uv checks used a command-local temporary cache, no persistent change.
+- Tests cover precision, absent/invalid fractions and integer components, zeros,
+  mixed sources, missing/reversed/empty bounds, out-of-range records, partial
+  coverage, high points, sanitization/import/backup recovery, historical versions,
+  immutable cache replacement, API-source protection and privacy rejection.
+
+Comparisons are intentionally skipped where no reliable temporal or source
+comparison exists, as specified above; missing samples do not establish a full
+observed maximum. This is synthetic validation, with no real activity or Garmin
+account access. Existing sanitizer policy, dependencies and AGENTS.md are unchanged.
 
 Actual derived-FIT verification on 2026-10-18, Linux x86_64, CPython 3.12.14:
 
