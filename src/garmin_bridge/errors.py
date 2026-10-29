@@ -25,6 +25,8 @@ MESSAGES = {
     "activity_unavailable": "Garmin cannot provide this original activity. The gap remains recorded.",
     "unsupported_activity_type": "An unreviewed activity type was returned by the cycling catalog; the gap remains recorded.",
     "initial_import_required": "Initialize this new store with sync --full before daily sync.",
+    "no_watermark": "No contiguous successful watermark. Complete an explicit date-range or full sync before --since-last.",
+    "analysis_identity": "Analysis export requires identity-disabled current revisions. Reimport or recheck with identity retention off.",
     "resume_required": "An unfinished scan exists. Use sync --resume, or --full --new-scan to retain gaps and scan again.",
     "no_pending_sync": "There is no unfinished scan to resume.",
     "enumeration_limit": "The page limit was reached. Import is incomplete; resume with a larger --max-pages.",

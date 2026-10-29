@@ -11,7 +11,7 @@ import warnings
 
 from .contract import SCHEMA_VERSION, day, identifier, project_activity, validate_output
 from .errors import BridgeError, MESSAGES
-from .sync import choose_range, files_available, freshness, synchronize
+from .sync import choose_range, files_available, freshness, since_last_range, synchronize
 from .upstream import GarminSource, authenticate, auth_status
 
 
@@ -104,6 +104,11 @@ def build_parser():
     modes.add_argument(
         "--resume", action="store_true", help="Resume the durable scan with its original cutoff"
     )
+    modes.add_argument(
+        "--since-last",
+        action="store_true",
+        help="Sync from the contiguous successful watermark end minus one day through today",
+    )
     sync.add_argument(
         "--new-scan",
         action="store_true",
@@ -124,6 +129,12 @@ def build_parser():
         "activity", help="Offline summary, coverage and approved file references"
     )
     activity.add_argument("activity_id", type=positive_id)
+    exporting = commands.add_parser("export", help="Offline analysis exports")
+    actions = exporting.add_subparsers(dest="export_action", required=True)
+    analysis = actions.add_parser("analysis", help="Current revisions as typed SQLite tables")
+    analysis.add_argument(
+        "--file", type=Path, required=True, help="Private SQLite file outside Git"
+    )
     backup = commands.add_parser(
         "backup", help="Offline non-location backup, validation and restore"
     )
@@ -271,6 +282,10 @@ def execute(args):
         if action == "restore":
             return transfer.restore_snapshot(directory, args.data_dir or default_root())
         return transfer.export_snapshot(SQLiteStore(args.data_dir), directory)
+    if args.command == "export":
+        from .analysis_export import export_analysis
+
+        return export_analysis(SQLiteStore(args.data_dir), args.file)
     store = SQLiteStore(args.data_dir)
     write = args.command in {"auth", "sync", "import-fit"}
     write = write or (args.command == "segment" and args.segment_action != "history")
@@ -305,14 +320,18 @@ def execute(args):
             )
             return {"schema_version": SCHEMA_VERSION, "state": "saved", "verified_at": verified}
         if args.command == "sync":
-            if ((args.full or args.resume) and (args.start or args.end)) or (
+            if ((args.full or args.resume or args.since_last) and (args.start or args.end)) or (
                 args.new_scan and not args.full
             ):
                 raise BridgeError("usage")
             if args.end and not args.start:
                 raise BridgeError("usage")
             interval = (
-                choose_range(store.state(), args.start, args.end, args.lookback_days, date.today())
+                since_last_range(store.state(), date.today())
+                if args.since_last
+                else choose_range(
+                    store.state(), args.start, args.end, args.lookback_days, date.today()
+                )
                 if args.start
                 else None
             )
@@ -322,7 +341,7 @@ def execute(args):
                 else "resume"
                 if args.resume
                 else "range"
-                if args.start
+                if args.start or args.since_last
                 else "incremental"
             )
             return synchronize(

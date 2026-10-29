@@ -47,6 +47,7 @@ present validity. Sync may refresh and save rotated tokens.
 ```sh
 garmin-bridge sync --resume
 garmin-bridge sync
+garmin-bridge sync --since-last
 garmin-bridge sync --lookback-days 30
 garmin-bridge sync --start 2025-01-01 --end 2025-01-31
 garmin-bridge sync --full --new-scan
@@ -78,6 +79,15 @@ FIT content and reviewed metadata avoid redundant parsing. A changed ZIP wrapper
 alone does not create a revision. Content corrections outside the recent window
 with unchanged catalog metadata require an explicit date-range or full recheck.
 Date ranges are inclusive activity-local calendar dates.
+
+`sync --since-last` is a date-range shortcut: start at the end of the local
+contiguous successful watermark minus **one day**, and end today (the host's
+calendar date). It overlaps prior coverage to recheck recent uploads. Disconnected
+later coverage does not move its start forward. Without a watermark it returns
+`no_watermark`; it never starts a full import automatically. It cannot be combined
+with `--start`, `--end`, `--full`, `--resume`, or `--new-scan`. The normal two-pass
+enumeration and failure rules apply; an unfinished job may require `--resume`.
+Use ordinary daily sync to discover delayed uploads outside this date range.
 
 ### Offline FIT import
 
@@ -133,6 +143,53 @@ with the same values is idempotent. Older algorithm caches require explicit refr
 Commands return bounded, closed-schema JSON. Exit codes are `0` for success, `1`
 for an incomplete scan, `2` for safe errors, and `130` for interruption. Errors do
 not echo arguments, credentials, upstream bodies, or raw input.
+
+### SQLite analysis export
+
+```sh
+garmin-bridge export analysis --file "$PRIVATE_ANALYSIS_SQLITE"
+```
+
+This offline handoff for SQL analysis contains only each activity's **current**
+revision. It needs no authentication or originals. The destination must be a
+private file with an owner-only parent outside Git and outside the source store.
+Close other writers first; destinations with SQLite journal/WAL sidecars are refused.
+An existing destination is replaced atomically only after validation. Success
+returns JSON with `sha256`, byte `size`, activity count, and `verified: true`.
+This is a query artifact, not a restorable store or snapshot.
+
+| Table | Contents |
+| --- | --- |
+| `activities` | One row per activity, flattened summary metrics and `garmin_reported_*` estimates, metric `*_source` columns, normalizer/schema/FIT-field versions, UTC/local activity time, timezone and UTC offset, provenance, counts, coverage and quality JSON. |
+| `records` | `activity_id`, zero-based `ordinal`, `timestamp`, and one numeric/text column per existing record whitelist field. Duplicates and input order are preserved. |
+| `laps` | Base `start`, `end`, `duration`, `distance`; detailed `fit_*` and `garmin_reported_*` columns. Two-element FIT arrays use `_0` and `_1` in original order. |
+| `events` | Detailed `fit_*` columns, including `fit_timestamp`. Historical streams without detailed events retain their timer rows in `timer_type`; unavailable numeric event codes remain NULL. |
+| `messages` | The detailed session at ordinal zero, followed by auxiliary messages in source order; `message` and validated `detail_json` retain field units and `garmin_reported` labels. Historical streams without details have no message rows. |
+| `meta` | One row: export format version, generated UTC time, CLI version, current activity UTC range, contiguous successful coverage dates, all covered/pending ranges, gap count, per-table counts, and `units_json`. No content hashes determine these counts. |
+
+Column units follow the existing normalized contract and are recorded explicitly
+as `meta.units_json[table][column]`; JSON detail quantities carry their own units.
+Numeric measurements use SQLite REAL, counts and ordinals INTEGER, and identifiers
+and ISO timestamps TEXT. Tables use SQLite STRICT typing (SQLite 3.37+).
+IDs remain text to avoid integer overflow. SQL NULL means
+missing or invalid; no values are interpolated. `garmin_reported_*` values remain
+Garmin estimates. The existing approved rider-posture fields such as
+`avg_power_position` describe riding posture, not geographic position.
+
+Identity-enabled **current** revisions are refused with `analysis_identity`, even
+if no serial/profile value was present. Reimport/recheck with identity retention
+off before exporting. Older identity-enabled revisions stay private in the source
+store and are not exported. No location fields, identity fields, raw references,
+revision hashes, journals, or segment caches are copied. Measurements and timestamps
+remain personal data; keep the analysis file private.
+
+Export builds a fresh temporary SQLite file in the destination directory, validates
+the full current source contracts, then checks `PRAGMA integrity_check`, foreign
+keys, the exact table/column whitelist, JSON contracts with identity disabled, and
+per-activity row counts and ordinals before atomic rename. Failed construction or
+validation preserves the old destination and removes staging files. A hard kill
+can leave a private `.analysis-*` staging file; it never publishes a partial target.
+Readers with the previous file open can finish reading that version.
 
 ### Private SQLite snapshots
 
@@ -209,6 +266,12 @@ archives, unsafe paths, bad FIT framing/CRC, multi-session/non-cycling inputs,
 inputs above 64 MiB, and excessive expansion are rejected. Parser limits are
 500,000 records, 10,000 laps, 100,000 events, and 100,000 auxiliary messages.
 
+New `raw/` objects store decompressed FIT bytes addressed by their SHA-256, so
+different ZIP wrappers and activities with identical FIT content share one object.
+Existing raw references still verify against their stored byte hash and accept
+either FIT or ZIP content. There is no migration or deletion of old objects;
+unchanged existing references and all immutable revisions remain readable.
+
 This public repository contains only code, documentation, and fixtures generated
 from invented constants. Never add real activity/health data, original exports,
 credentials, account/browser state, or live request recordings. Partial redaction
@@ -235,6 +298,10 @@ Default tests are offline and generate FIT/SQLite inputs in code. They must cove
   offline queries, and continued use of storage version 1 with normalizer 1.3.0.
 - Snapshot checksum/integrity/schema checks, contract spot checks, full validation
   on export/restore, revision/progress preservation, and incremental sync after restore.
+- Current-only typed analysis export, identity/location exclusion, atomic overwrite
+  and failure preservation, SQL units/provenance, and legacy stream support.
+- `--since-last` overlap and no-watermark errors, successful watermark preservation
+  on failure, decompressed raw deduplication, and existing ZIP reference readability.
 - Anonymous segment matching, insufficient/unavailable evidence, cached-result
   invalidation, and exclusion of locations from persisted/output results.
 

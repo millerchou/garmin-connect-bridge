@@ -86,6 +86,17 @@ def choose_range(state, start=None, end=None, lookback=14, today=None):
     return {"start": start.isoformat(), "end": end.isoformat()}
 
 
+def since_last_range(state, today=None):
+    mark = watermark(state)
+    if mark is None:
+        raise BridgeError("no_watermark")
+    try:
+        start = date.fromisoformat(mark["end"]) - timedelta(days=1)
+    except OverflowError:
+        raise BridgeError("usage") from None
+    return choose_range(state, start=start.isoformat(), today=today)
+
+
 def files_available(store, summary):
     return store.has_artifacts(summary)
 
@@ -153,9 +164,10 @@ def publish_original(
             # replenish one without parsing or changing the reviewed result.
             raw = store.read_bytes(previous["raw_ref"]) if previous["raw_ref"] else None
             if raw is None or parser.sha256(raw) != previous["raw_sha256"]:
-                raw_hash = parser.sha256(original)
+                raw_hash = fit_hash
                 raw_ref = f"raw/{raw_hash}.bin"
-                store.write_bytes(raw_ref, original)
+                if store.read_bytes(raw_ref) != fit:
+                    store.write_bytes(raw_ref, fit)
                 entry = {**previous, "raw_ref": raw_ref, "raw_sha256": raw_hash}
                 committed = {**state, "activities": {**state["activities"], source_id: entry}}
                 store.write_json("index.json", committed)
@@ -177,10 +189,13 @@ def publish_original(
     prefix = f"objects/{source_id}/{revision}"
     summary["files"] = {kind: f"{prefix}/{kind}.json" for kind in ("summary", "streams")}
     summary = project_activity(summary)
-    raw_hash = parser.sha256(original)
+    raw_hash = fit_hash
     raw_ref = f"raw/{raw_hash}.bin"
     # Immutable content first, index last. Any crash leaves the prior index usable.
-    store.write_bytes(raw_ref, original)
+    # New raw objects contain the decompressed FIT. Older ZIP-backed references
+    # keep their original byte hash and remain readable without migration.
+    if store.read_bytes(raw_ref) != fit:
+        store.write_bytes(raw_ref, fit)
     file_hashes = {}
     for name, value in (("streams", streams), ("summary", summary)):
         content = canonical(value)

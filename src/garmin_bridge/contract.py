@@ -309,6 +309,16 @@ SYNC_REPORT = obj(
 )
 
 OUTPUTS = {
+    "export": obj(
+        {
+            "schema_version": literal(SCHEMA_VERSION),
+            "format": literal("analysis_sqlite"),
+            "sha256": digest,
+            "size": lambda x: type(x) is int and x > 0,
+            "activity_count": count,
+            "verified": lambda x: x is True,
+        }
+    ),
     "import-fit": obj(
         {
             "schema_version": literal(SCHEMA_VERSION),

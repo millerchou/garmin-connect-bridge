@@ -137,7 +137,8 @@ def test_import_is_offline_without_touching_auth(
     assert len(streams["records"]) == 500 and streams["records"][1]["power"] is None
     assert_private_output(json.dumps(streams))
     entry = store.state()["activities"]["1001"]
-    assert store.read_bytes(entry["raw_ref"]) == original
+    assert store.read_bytes(entry["raw_ref"]) == fit
+    assert entry["raw_sha256"] == normalize.sha256(fit)
     assert command(store, capsys, "list")[1]["activities"][0]["source_activity_id"] == "1001"
     assert command(store, capsys, "activity", "1001")[1]["activity"] == summary
     assert {**store.state(), "activities": {}} == empty_state()
