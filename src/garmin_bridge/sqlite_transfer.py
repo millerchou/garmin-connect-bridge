@@ -7,7 +7,14 @@ import sqlite3
 import tempfile
 
 from . import contract as c
-from .persistence import artifact_files, control_files, require, snapshot, validate_state
+from .persistence import (
+    artifact_files,
+    control_files,
+    require,
+    snapshot,
+    validate_artifact_relation,
+    validate_state,
+)
 from .errors import BridgeError
 from .jobs import gaps
 from .normalize import sha256
@@ -76,6 +83,8 @@ def inspect_store(store, *, full_validation=True):
                 }
                 if full_validation:
                     artifact_files(entry, store.read_bytes)
+                else:
+                    validate_artifact_relation(summary, decode(stream_content))
                 counts["revisions"] += 1
             if name.endswith("/streams.json"):
                 value = decode(content)
@@ -102,9 +111,14 @@ def inspect_store(store, *, full_validation=True):
         from .segments import validate_segments
 
         validate_segments(db, store)
-    if full_validation:
-        for entry in state["activities"].values():
+    for entry in state["activities"].values():
+        if full_validation:
             artifact_files(entry, store.read_bytes)
+        else:
+            summary_content = store.read_bytes(entry["summary"]["files"]["summary"])
+            require(summary_content is not None)
+            require(decode(summary_content) == entry["summary"])
+            require(sha256(summary_content) == entry["file_hashes"]["summary"])
     times = [
         e["summary"]["activity_time"]["utc"]
         for e in state["activities"].values()

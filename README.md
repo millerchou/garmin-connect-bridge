@@ -186,10 +186,13 @@ remain personal data; keep the analysis file private.
 Export builds a fresh temporary SQLite file in the destination directory, validates
 the full current source contracts, then checks `PRAGMA integrity_check`, foreign
 keys, the exact table/column whitelist, JSON contracts with identity disabled, and
-per-activity row counts and ordinals before atomic rename. Failed construction or
-validation preserves the old destination and removes staging files. A hard kill
-can leave a private `.analysis-*` staging file; it never publishes a partial target.
-Readers with the previous file open can finish reading that version.
+per-activity row counts and ordinals before atomic rename. The file and destination
+directory are flushed before success; a directory-flush failure restores the prior
+destination. Failed construction or validation preserves the old destination and
+removes staging files. A hard kill can leave private `.analysis-*` staging or
+recovery links; remove those only after all exporters have exited. It never
+publishes a partial target. Readers with the previous file open can finish reading
+that version.
 
 ### Private SQLite snapshots
 
@@ -209,8 +212,9 @@ Destinations must be new and outside the source directory.
 Export validates every document, stream row, and relation, builds one clean logical
 copy, and uses SQLite's backup API to produce an independent file. Verification
 checks SHA-256, size, `PRAGMA integrity_check`, the exact schema whitelist, manifest
-counts/versions, control documents, summaries, and contract spot checks. It checks
-first/middle/last record and event rows per stream, with lap/message context retained.
+counts/versions, control documents, summaries, revision links/counts, and contract
+spot checks. It checks first/middle/last record and event rows per stream, with
+lap/message context retained.
 It does not rebuild the database or require a canonical physical byte layout.
 Checksums detect corruption; these checks do not authenticate an untrusted sender
 or certify unused pages/trailing bytes as free of private content. Keep backups private.

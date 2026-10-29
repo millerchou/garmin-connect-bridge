@@ -504,3 +504,35 @@ def test_snapshot_rejects_raw_references_even_with_updated_checksum(database, tm
     (path / "manifest.json").write_bytes(canonical(manifest))
     with pytest.raises(BridgeError):
         transfer.verify_snapshot(path)
+
+
+@pytest.mark.parametrize("damage", ["current_summary", "stream_revision", "stream_count"])
+def test_snapshot_spot_checks_retain_revision_relations(database, tmp_path, damage):
+    put(database, tmp_path)
+    path = tmp_path / "snapshot"
+    transfer.export_snapshot(database, path)
+    with sqlite3.connect(path / DATABASE) as db:
+        if damage == "current_summary":
+            name = "index.json"
+        else:
+            name = db.execute(
+                "SELECT name FROM documents WHERE name LIKE '%/streams.json'"
+            ).fetchone()[0]
+        value = json.loads(
+            db.execute("SELECT payload FROM documents WHERE name=?", (name,)).fetchone()[0]
+        )
+        if damage == "current_summary":
+            value["activities"]["1001"]["summary"]["metrics"]["avg_power"]["value"] += 1
+        elif damage == "stream_revision":
+            value["source_digest"] = "0" * 64
+        else:
+            db.execute("DELETE FROM samples WHERE kind='records' AND ordinal=2")
+        db.execute("UPDATE documents SET payload=? WHERE name=?", (canonical(value), name))
+    manifest = json.loads((path / "manifest.json").read_bytes())
+    if damage == "stream_count":
+        manifest["counts"]["records"] -= 1
+    manifest["sha256"] = transfer.digest_file(path / DATABASE)
+    manifest["size"] = (path / DATABASE).stat().st_size
+    (path / "manifest.json").write_bytes(canonical(manifest))
+    with pytest.raises(BridgeError):
+        transfer.verify_snapshot(path)

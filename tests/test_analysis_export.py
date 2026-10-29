@@ -5,13 +5,15 @@ import copy
 import json
 import os
 import sqlite3
+import stat
 
 import pytest
 
 from garmin_bridge import analysis_export as export, cli, contract as c, normalize, sync
 from garmin_bridge.errors import BridgeError
 from garmin_bridge.storage import canonical
-from .synthetic import SECRET, Source, activity, archive, fit_bytes
+from .fit_synthetic import frame, minimal, raw
+from .synthetic import SECRET, START, Source, activity, archive, fit_bytes
 from .test_cli_storage import command
 from .test_fit_fields import parse, rich_fit
 from .test_sync import INTERVAL, run
@@ -380,3 +382,102 @@ def test_analysis_refuses_destination_with_sqlite_sidecars(store, tmp_path, suff
     assert target.read_bytes() == before
     assert sidecar.read_bytes() == b"synthetic unfinished writer"
     assert not list(tmp_path.glob(".analysis-*"))
+
+
+def test_analysis_range_orders_instants_with_fractional_seconds(store, tmp_path):
+    run(
+        store,
+        Source([activity(1001), activity(1002, startTimeGMT="2025-01-02 00:00:00.5")]),
+    )
+    target = tmp_path / "analysis.sqlite"
+    export.export_analysis(store, target)
+    metadata = read_table(target, "meta")[0]
+    assert metadata["activity_start_utc"] == "2025-01-02T00:00:00Z"
+    assert metadata["activity_end_utc"] == "2025-01-02T00:00:00.500000Z"
+
+
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("fail_flush", [False, True])
+def test_analysis_flushes_published_directory_and_rolls_back_on_failure(
+    store, tmp_path, monkeypatch, existing, fail_flush
+):
+    publish(store)
+    target = tmp_path / "analysis.sqlite"
+    before = None
+    if existing:
+        export.export_analysis(store, target)
+        before = target.read_bytes()
+    publish(store, fit_bytes(power=230))
+    fsync = os.fsync
+    published_flushes = []
+
+    def flush(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode) and target.exists():
+            if target.read_bytes() != before:
+                published_flushes.append(fd)
+                if fail_flush:
+                    raise OSError("synthetic directory flush failure")
+        return fsync(fd)
+
+    monkeypatch.setattr(export.os, "fsync", flush)
+    if fail_flush:
+        with pytest.raises(OSError):
+            export.export_analysis(store, target)
+        assert (target.read_bytes() if target.exists() else None) == before
+    else:
+        export.export_analysis(store, target)
+        assert read_table(target, "activities")[0]["avg_power"] == 230
+    assert published_flushes
+    assert not list(tmp_path.glob(".analysis-*"))
+
+
+@pytest.mark.parametrize("kind", ["records", "laps", "events", "messages"])
+def test_analysis_validates_rehashed_source_rows_before_publication(store, tmp_path, kind):
+    publish(store, rich_fit())
+    target = tmp_path / "analysis.sqlite"
+    export.export_analysis(store, target)
+    before = target.read_bytes()
+    state = store.state()
+    entry = state["activities"]["1001"]
+    reference = entry["summary"]["files"]["streams"]
+    with store.database(write=True) as db:
+        row = json.loads(
+            db.execute(
+                "SELECT payload FROM samples WHERE name=? AND kind=? AND ordinal=0",
+                (reference, kind),
+            ).fetchone()[0]
+        )
+        if kind == "records":
+            row["position_lat"] = 123
+        else:
+            detail = row["fit"] if kind == "laps" else row
+            detail["fields"]["serial_number"] = {"value": 123, "unit": "count"}
+        db.execute(
+            "UPDATE samples SET payload=? WHERE name=? AND kind=? AND ordinal=0",
+            (canonical(row), reference, kind),
+        )
+    # Recompute hashes to prove the export checks contracts, not just digests.
+    entry["file_hashes"]["streams"] = normalize.sha256(store.read_bytes(reference))
+    with store.database(write=True) as db:
+        db.execute("UPDATE documents SET payload=? WHERE name='index.json'", (canonical(state),))
+    with pytest.raises(BridgeError):
+        export.export_analysis(store, target)
+    assert target.read_bytes() == before
+    assert not list(tmp_path.glob(".analysis-*"))
+
+
+def test_analysis_preserves_duplicate_unordered_and_untimed_records(store, tmp_path):
+    observations = [(START + 1, 0), (START, 17), (START, 17), (0xFFFFFFFF, 0xFFFF)]
+    records = b"".join(
+        frame(20, [raw(253, 0x86, stamp), raw(7, 0x84, power)]) for stamp, power in observations
+    )
+    publish(store, minimal(records=records))
+    target = tmp_path / "analysis.sqlite"
+    export.export_analysis(store, target)
+    rows = sorted(read_table(target, "records"), key=lambda row: row["ordinal"])
+    assert [(r["ordinal"], r["timestamp"], r["power"]) for r in rows] == [
+        (0, "2025-01-02T00:00:01Z", 0),
+        (1, "2025-01-02T00:00:00Z", 17),
+        (2, "2025-01-02T00:00:00Z", 17),
+        (3, None, None),
+    ]

@@ -269,11 +269,10 @@ def control_files(state, job):
     return values
 
 
-def artifact_files(entry, read):
+def validate_artifact_paths(summary):
     from .normalize import sha256
-    from .storage import canonical, decode
+    from .storage import canonical
 
-    summary = entry["summary"]
     revision = sha256(
         canonical(
             [summary["source_digest"], summary["normalizer_version"], summary["schema_version"]]
@@ -286,14 +285,11 @@ def artifact_files(entry, read):
             for kind in ("summary", "streams")
         }
     )
-    contents = {}
-    for kind, path in summary["files"].items():
-        data = read(path)
-        require(data is not None and sha256(data) == entry["file_hashes"][kind])
-        contents[kind] = (path, data, decode(data))
-    require(contents["summary"][2] == summary)
-    c.project_activity(summary)
-    streams = c.validate_streams(contents["streams"][2])
+
+
+def validate_artifact_relation(summary, streams):
+    """Cheap revision/metadata/count checks, independent of per-sample validation."""
+    validate_artifact_paths(summary)
     from .fit_details import fill_local_time
 
     require(identity_enabled(summary) == streams.get("include_identity", False))
@@ -316,6 +312,23 @@ def artifact_files(entry, read):
         ("timer_events", "timer_event_count"),
     ):
         require(len(streams[array]) == summary[field])
+
+
+def artifact_files(entry, read):
+    from .normalize import sha256
+    from .storage import decode
+
+    summary = entry["summary"]
+    validate_artifact_paths(summary)
+    contents = {}
+    for kind, path in summary["files"].items():
+        data = read(path)
+        require(data is not None and sha256(data) == entry["file_hashes"][kind])
+        contents[kind] = (path, data, decode(data))
+    require(contents["summary"][2] == summary)
+    c.project_activity(summary)
+    streams = c.validate_streams(contents["streams"][2])
+    validate_artifact_relation(summary, streams)
     for key, coverage in summary["coverage"].items():
         present = sum(row[key] is not None for row in streams["records"])
         require(

@@ -1,6 +1,8 @@
 """Current, identity-disabled revisions as a standalone SQL analysis artifact."""
 
 from contextlib import closing
+from datetime import datetime
+import fcntl
 import os
 from pathlib import Path
 import sqlite3
@@ -270,8 +272,8 @@ def populate(db, source):
         "format_version": 1,
         "generated_at": now(),
         "cli_version": __version__,
-        "activity_start_utc": min(times) if times else None,
-        "activity_end_utc": max(times) if times else None,
+        "activity_start_utc": min(times, key=datetime.fromisoformat) if times else None,
+        "activity_end_utc": max(times, key=datetime.fromisoformat) if times else None,
         "coverage_start": mark["start"] if mark else None,
         "coverage_end": mark["end"] if mark else None,
         "covered_ranges_json": json_text(state["covered_ranges"]),
@@ -335,6 +337,43 @@ def check_destination(parent, name):
         raise BridgeError("busy")
 
 
+def publish(staging, parent, target):
+    # Serialize cooperating exporters without adding a persistent lock file.
+    fd = os.open(parent.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    previous = None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise BridgeError("busy") from None
+        check_destination(parent, target.name)
+        if target.exists():
+            saved = staging.with_suffix(".previous")
+            os.link(target, saved)
+            previous = saved
+        # Check directory flushing before replacement and preserve the old inode
+        # until the new directory entry has been flushed successfully.
+        os.fsync(fd)
+        os.replace(staging, target)
+        try:
+            os.fsync(fd)
+        except BaseException:
+            if previous is None:
+                target.unlink()
+            else:
+                saved, previous = previous, None
+                # If rollback itself fails, keep the private recovery link.
+                os.replace(saved, target)
+            os.fsync(fd)
+            raise
+    finally:
+        try:
+            if previous is not None:
+                previous.unlink()
+        finally:
+            os.close(fd)
+
+
 def export_analysis(source, destination):
     target = Store(Path(destination)).root
     if target.is_relative_to(source.root):
@@ -367,9 +406,7 @@ def export_analysis(source, destination):
             )
             with staging.open("rb") as handle:
                 os.fsync(handle.fileno())
-            check_destination(parent, target.name)
-            # Keep publication last so flush/validation failures preserve the old file.
-            os.replace(staging, target)
+            publish(staging, parent, target)
             return receipt
         finally:
             for suffix in ("", "-journal", "-wal", "-shm"):
