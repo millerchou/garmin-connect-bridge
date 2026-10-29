@@ -178,3 +178,16 @@ class Source:
         if isinstance(value, BaseException):
             raise value
         return value
+
+
+def corrupt_document(store, name, content):
+    """Bypass the write contract to model on-disk corruption of synthetic data."""
+    with store.database(write=True) as db:
+        db.execute("INSERT OR REPLACE INTO documents VALUES (?,?)", (name, content))
+
+
+def delete_document(store, name):
+    """Remove a synthetic artifact including its ordered rows."""
+    with store.database(write=True) as db:
+        db.execute("DELETE FROM samples WHERE name=?", (name,))
+        db.execute("DELETE FROM documents WHERE name=?", (name,))

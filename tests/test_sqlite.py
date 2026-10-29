@@ -1,4 +1,4 @@
-"""Synthetic-only primary-store, migration and portable snapshot regression."""
+"""Synthetic-only primary-store and portable snapshot regression."""
 
 import copy
 import json
@@ -7,10 +7,10 @@ from unittest.mock import Mock
 
 import pytest
 
-from garmin_bridge import cli, normalize, segments, sync, sqlite_transfer as transfer
+from garmin_bridge import cli, normalize, segments, sqlite_transfer as transfer
 from garmin_bridge.errors import BridgeError
 from garmin_bridge.import_fit import import_file
-from garmin_bridge.sqlite_store import DATABASE, SQLiteStore
+from garmin_bridge.sqlite_store import ARRAY_LIMITS, DATABASE, SQLiteStore
 from garmin_bridge.storage import canonical
 from .synthetic import Source, activity, fit_bytes
 from .test_import_fit import private_file
@@ -81,30 +81,7 @@ def test_failed_transaction_preserves_revision(database, tmp_path, monkeypatch):
     assert transfer.inspect_store(database)["counts"]["revisions"] == 1
 
 
-def test_migrate_readonly_full_history_and_no_originals(store, tmp_path):
-    put(store, tmp_path)
-    old = store.state()["activities"]["1001"]["summary"]
-    put(store, tmp_path, power=222)
-    raw = store.state()["activities"]["1001"]["raw_ref"]
-    store.path(raw).unlink()  # Synthetic raw-free input.
-    before = {
-        p: (p.read_bytes(), p.stat().st_mtime_ns) for p in store.root.rglob("*") if p.is_file()
-    }
-    dest = tmp_path / "migrated"
-    result = transfer.migrate(store.root, dest)
-    assert result["revision_count"] == 2 and result["sample_count"] == 6
-    migrated = SQLiteStore(dest)
-    assert migrated.read_json(old["files"]["streams"]) == store.read_json(old["files"]["streams"])
-    assert before == {
-        p: (p.read_bytes(), p.stat().st_mtime_ns) for p in store.root.rglob("*") if p.is_file()
-    }
-    assert migrated.state()["activities"]["1001"]["raw_ref"] is None
-    with pytest.raises(BridgeError):
-        transfer.migrate(store.root, dest)
-
-
-def test_snapshot_roundtrip_and_old_zip(database, tmp_path):
-    from garmin_bridge.backup import export_bundle
+def test_snapshot_roundtrip(database, tmp_path):
 
     put(database, tmp_path)
     put(database, tmp_path, power=222)
@@ -120,13 +97,11 @@ def test_snapshot_roundtrip_and_old_zip(database, tmp_path):
     assert not (target / "auth").exists() and not (target / "raw").exists()
     with pytest.raises(BridgeError):
         transfer.export_snapshot(database, directory)
-    package = tmp_path / "old.zip"
-    export_bundle(database, package)
-    result = transfer.migrate(package, tmp_path / "zip-restored", bundle=True)
-    assert result["activity_count"] == 1 and result["revision_count"] == 1
 
 
-@pytest.mark.parametrize("attack", ["table", "column", "nested", "trailing", "freed", "manifest"])
+@pytest.mark.parametrize(
+    "attack", ["table", "column", "trigger", "nested", "trailing", "freed", "manifest"]
+)
 def test_snapshot_rejects_rehashed_injection(database, tmp_path, attack):
     from garmin_bridge.normalize import sha256
 
@@ -134,12 +109,16 @@ def test_snapshot_rejects_rehashed_injection(database, tmp_path, attack):
     directory = tmp_path / "snapshot"
     transfer.export_snapshot(database, directory)
     path = directory / DATABASE
-    if attack in {"table", "column", "nested", "freed"}:
+    if attack in {"table", "column", "trigger", "nested", "freed"}:
         with sqlite3.connect(path) as db:
             if attack == "table":
                 db.execute("CREATE TABLE secret (position_lat REAL)")
             elif attack == "column":
                 db.execute("ALTER TABLE segments ADD COLUMN secret TEXT")
+            elif attack == "trigger":
+                db.execute(
+                    "CREATE TRIGGER unexpected AFTER INSERT ON documents BEGIN SELECT 1; END"
+                )
             elif attack == "nested":
                 name, payload = db.execute(
                     "SELECT name,payload FROM documents WHERE name LIKE '%summary.json'"
@@ -159,8 +138,12 @@ def test_snapshot_rejects_rehashed_injection(database, tmp_path, attack):
     if attack == "manifest":
         manifest["position_lat"] = 42
     (directory / "manifest.json").write_bytes(canonical(manifest))
-    with pytest.raises(BridgeError):
-        transfer.verify_snapshot(directory)
+    if attack in {"trailing", "freed"}:
+        # Private integrity checks no longer certify physical canonical encoding.
+        assert transfer.verify_snapshot(directory)["verified"]
+    else:
+        with pytest.raises(BridgeError):
+            transfer.verify_snapshot(directory)
 
 
 def test_cli_default_sqlite_window_and_no_implicit_auth(tmp_path, capsys, monkeypatch):
@@ -266,47 +249,6 @@ def test_snapshot_queries_do_not_modify_package(database, tmp_path, capsys):
     capsys.readouterr()
 
 
-def test_migration_requires_read_lock_and_does_not_publish_partial(store, tmp_path, monkeypatch):
-    put(store, tmp_path)
-    with store.lock(write=True), pytest.raises(BridgeError) as error:
-        transfer.migrate(store.root, tmp_path / "busy-target")
-    assert error.value.code == "busy"
-    assert not (tmp_path / "busy-target").exists()
-    original = transfer.inspect_store
-
-    def fail(*args):
-        original(*args)
-        raise RuntimeError("synthetic validation interruption")
-
-    monkeypatch.setattr(transfer, "inspect_store", fail)
-    with pytest.raises(RuntimeError):
-        transfer.migrate(store.root, tmp_path / "failed-target")
-    assert not (tmp_path / "failed-target").exists()
-    assert store.state()["activities"]["1001"]
-
-
-@pytest.mark.parametrize("attack", ["unknown", "nested", "duplicate", "damaged"])
-def test_migration_rejects_invalid_old_input(store, tmp_path, attack):
-    put(store, tmp_path)
-    summary = store.state()["activities"]["1001"]["summary"]
-    name = summary["files"]["streams"]
-    if attack in {"unknown", "nested"}:
-        value = store.read_json(name)
-        if attack == "unknown":
-            value["position_lat"] = 42
-        else:
-            value["records"][0]["nested"] = {"token": "synthetic"}
-        store.write_json(name, value)
-    elif attack == "duplicate":
-        value = store.read_bytes("index.json")
-        store.write_bytes("index.json", b'{"version":1,' + value[1:])
-    else:
-        store.write_bytes(name, b"broken-synthetic")
-    with pytest.raises(BridgeError):
-        transfer.migrate(store.root, tmp_path / "target")
-    assert not (tmp_path / "target").exists()
-
-
 def test_killed_sqlite_transaction_recovers_prior_commit(database, tmp_path):
     import os
     import subprocess
@@ -389,33 +331,6 @@ def test_backup_cli_uses_sqlite_and_preserves_revisions(database, tmp_path, caps
     assert listing["activities"][0]["coverage"]["power"]["missing"] == 1
 
 
-def test_default_legacy_query_never_migrates_and_acquisition_requires_migration(
-    store, tmp_path, capsys
-):
-    put(store, tmp_path)
-    before = {p: p.read_bytes() for p in store.root.rglob("*") if p.is_file()}
-    assert cli.main(["--data-dir", str(store.root), "list"]) == 0
-    capsys.readouterr()
-    assert not store.path(DATABASE).exists()
-    path = private_file(tmp_path, fit_bytes())
-    assert (
-        cli.main(
-            [
-                "--data-dir",
-                str(store.root),
-                "import-fit",
-                "--file",
-                str(path),
-                "--activity-id",
-                "1001",
-            ]
-        )
-        == 2
-    )
-    assert json.loads(capsys.readouterr().err)["error"] == "migration_required"
-    assert before == {p: p.read_bytes() for p in store.root.rglob("*") if p.is_file()}
-
-
 def test_snapshot_cross_sqlite_creator_header(database, tmp_path):
     put(database, tmp_path)
     path = tmp_path / "snapshot"
@@ -428,32 +343,6 @@ def test_snapshot_cross_sqlite_creator_header(database, tmp_path):
     manifest["sha256"] = transfer.digest_file(db)
     (path / "manifest.json").write_bytes(canonical(manifest))
     assert transfer.verify_snapshot(path)["verified"]
-
-
-@pytest.mark.parametrize("incomplete", [False, True])
-def test_legacy_api_migration_preserves_all_progress_and_resumes(store, tmp_path, incomplete):
-    from garmin_bridge.backup import snapshot
-    from garmin_bridge.jobs import load_job
-
-    source = Source(
-        [activity(), activity(1002)], downloads={"1002": b"broken-synthetic"} if incomplete else {}
-    )
-    with store.lock(write=True):
-        result = sync.synchronize(store, lambda: source, mode="full")
-    assert result["complete"] is not incomplete
-    expected_state, expected_job = snapshot(store)
-    transfer.migrate(store.root, tmp_path / "converted")
-    target = SQLiteStore(tmp_path / "converted")
-    assert target.state() == expected_state
-    assert load_job(target) == expected_job
-    for entry in expected_state["activities"].values():
-        for ref in entry["summary"]["files"].values():
-            assert target.read_bytes(ref) == store.read_bytes(ref)
-    if incomplete:
-        source.downloads = {}
-        with target.lock(write=True):
-            assert sync.synchronize(target, lambda: source, mode="resume")["complete"]
-    assert target.state()["history_initialized"]
 
 
 def test_empty_sqlite_snapshot_and_invalid_db_are_safe(tmp_path):
@@ -473,3 +362,145 @@ def test_export_absent_store_freezes_empty_snapshot(tmp_path):
     transfer.export_snapshot(absent, tmp_path / "snapshot")
     assert not absent.root.exists()
     assert transfer.verify_snapshot(tmp_path / "snapshot")["activity_count"] == 0
+
+
+def test_reads_trust_stored_rows_but_writes_exports_and_cli_validate(database, tmp_path, capsys):
+    put(database, tmp_path, count=8)
+    ref = database.state()["activities"]["1001"]["summary"]["files"]["streams"]
+    with database.database(write=True) as db:
+        row = json.loads(
+            db.execute(
+                "SELECT payload FROM samples WHERE name=? AND kind='records' AND ordinal=1", (ref,)
+            ).fetchone()[0]
+        )
+        row["unreviewed"] = {"position_lat": 123}
+        db.execute(
+            "UPDATE samples SET payload=? WHERE name=? AND kind='records' AND ordinal=1",
+            (canonical(row), ref),
+        )
+    # Normal reads trust the store; boundary validation remains explicit.
+    content = database.read_bytes(ref)
+    assert json.loads(content)["records"][1] == row
+    with pytest.raises(BridgeError):
+        database.write_bytes(ref, content)
+    with pytest.raises(BridgeError):
+        transfer.export_snapshot(database, tmp_path / "rejected")
+    assert not (tmp_path / "rejected").exists()
+    assert (
+        cli.main(
+            [
+                "--data-dir",
+                str(database.root),
+                "window",
+                "1001",
+                "--start",
+                "2025-01-02T00:00:00Z",
+                "--end",
+                "2025-01-02T00:00:20Z",
+            ]
+        )
+        == 2
+    )
+    captured = capsys.readouterr()
+    assert not captured.out and "position_lat" not in captured.err
+    assert json.loads(captured.err)["error"] == "privacy_failed"
+
+
+@pytest.mark.parametrize("damage", ["ordinal", "kind", "count", "row_size", "read_limit"])
+def test_normal_reads_keep_row_order_and_size_limits(database, tmp_path, monkeypatch, damage):
+    put(database, tmp_path)
+    ref = database.state()["activities"]["1001"]["summary"]["files"]["streams"]
+    if damage == "count":
+        monkeypatch.setitem(ARRAY_LIMITS, "records", 2)
+    elif damage != "read_limit":
+        with database.database(write=True) as db:
+            if damage == "ordinal":
+                db.execute("UPDATE samples SET ordinal=99 WHERE kind='records' AND ordinal=1")
+            elif damage == "kind":
+                db.execute("UPDATE samples SET kind='unknown' WHERE kind='records'")
+            else:
+                db.execute(
+                    "UPDATE samples SET payload=? WHERE kind='records' AND ordinal=1",
+                    (canonical({"synthetic": "x" * 32768}),),
+                )
+    with pytest.raises(BridgeError):
+        database.read_bytes(ref, limit=1 if damage == "read_limit" else None)
+
+
+def test_verify_does_not_rebuild_or_require_writable_parent(database, tmp_path, monkeypatch):
+    put(database, tmp_path)
+    path = tmp_path / "snapshot"
+    transfer.export_snapshot(database, path)
+    before = {p.name: p.read_bytes() for p in path.iterdir()}
+
+    def denied(*args, **kwargs):
+        pytest.fail("verification attempted to rebuild or create temporary files")
+
+    monkeypatch.setattr(transfer, "copy_logical", denied)
+    monkeypatch.setattr(transfer.tempfile, "TemporaryDirectory", denied)
+    assert transfer.verify_snapshot(path)["verified"]
+    assert before == {p.name: p.read_bytes() for p in path.iterdir()}
+
+
+def test_format_one_manifest_is_rejected(database, tmp_path):
+    put(database, tmp_path)
+    path = tmp_path / "snapshot"
+    transfer.export_snapshot(database, path)
+    manifest = json.loads((path / "manifest.json").read_bytes())
+    manifest["format_version"] = 1
+    for key in ("fit_fields_versions", "fit_counts", "identity_included"):
+        del manifest[key]
+    (path / "manifest.json").write_bytes(canonical(manifest))
+    with pytest.raises(BridgeError):
+        transfer.verify_snapshot(path)
+
+
+def test_verify_samples_contracts_but_restore_validates_every_row(database, tmp_path):
+    put(database, tmp_path, count=8)
+    path = tmp_path / "snapshot"
+    transfer.export_snapshot(database, path)
+    with sqlite3.connect(path / DATABASE) as db:
+        name, payload = db.execute(
+            "SELECT name,payload FROM samples WHERE kind='records' AND ordinal=1"
+        ).fetchone()
+        row = json.loads(payload)
+        row["unreviewed"] = "synthetic"
+        db.execute(
+            "UPDATE samples SET payload=? WHERE name=? AND kind='records' AND ordinal=1",
+            (canonical(row), name),
+        )
+    manifest = json.loads((path / "manifest.json").read_bytes())
+    manifest["sha256"] = transfer.digest_file(path / DATABASE)
+    manifest["size"] = (path / DATABASE).stat().st_size
+    (path / "manifest.json").write_bytes(canonical(manifest))
+    # A private checksum receipt is deliberately not a full privacy certification.
+    assert transfer.verify_snapshot(path)["verified"]
+    with pytest.raises(BridgeError):
+        transfer.restore_snapshot(path, tmp_path / "rejected")
+    assert not (tmp_path / "rejected").exists()
+
+
+@pytest.mark.parametrize("command", ["sanitize-fit", "verify-fit", "migrate"])
+def test_removed_commands_are_not_available(capsys, command):
+    assert cli.main([command]) == 2
+    assert json.loads(capsys.readouterr().err)["error"] == "usage"
+
+
+def test_snapshot_rejects_raw_references_even_with_updated_checksum(database, tmp_path):
+    put(database, tmp_path)
+    original = database.state()["activities"]["1001"]
+    path = tmp_path / "snapshot"
+    transfer.export_snapshot(database, path)
+    with sqlite3.connect(path / DATABASE) as db:
+        state = json.loads(
+            db.execute("SELECT payload FROM documents WHERE name='index.json'").fetchone()[0]
+        )
+        for key in ("raw_ref", "raw_sha256"):
+            state["activities"]["1001"][key] = original[key]
+        db.execute("UPDATE documents SET payload=? WHERE name='index.json'", (canonical(state),))
+    manifest = json.loads((path / "manifest.json").read_bytes())
+    manifest["sha256"] = transfer.digest_file(path / DATABASE)
+    manifest["size"] = (path / DATABASE).stat().st_size
+    (path / "manifest.json").write_bytes(canonical(manifest))
+    with pytest.raises(BridgeError):
+        transfer.verify_snapshot(path)

@@ -55,9 +55,6 @@ def build_parser():
         type=Path,
         help="Private store outside Git; defaults to the OS user data directory",
     )
-    parser.add_argument(
-        "--legacy-store", action="store_true", help="Explicit legacy JSON compatibility mode"
-    )
     commands = parser.add_subparsers(dest="command", required=True)
     auth = commands.add_parser("auth", help="Interactive sign-in and MFA; save a protected session")
     auth.add_argument(
@@ -82,35 +79,6 @@ def build_parser():
         "--include-fit-identity",
         action="store_true",
         help="Explicitly retain reviewed user profile and serial fields in private artifacts",
-    )
-    cleaning = commands.add_parser(
-        "sanitize-fit",
-        help="Offline derived training FIT archive; explicit location/identity removal",
-    )
-    cleaning.add_argument(
-        "--file", type=Path, required=True, help="Private original FIT or single-FIT ZIP"
-    )
-    cleaning.add_argument(
-        "--output-dir",
-        type=Path,
-        required=True,
-        help="New private archive outside the activity store",
-    )
-    verifying = commands.add_parser(
-        "verify-fit",
-        help="Offline archive checks, optionally including comparison with its original source",
-    )
-    verification_mode = verifying.add_mutually_exclusive_group(required=True)
-    verification_mode.add_argument(
-        "--source", type=Path, help="Unchanged private original FIT or ZIP; required for fidelity"
-    )
-    verification_mode.add_argument(
-        "--archive-only",
-        action="store_true",
-        help="Check the three archive files only; source fidelity is not checked",
-    )
-    verifying.add_argument(
-        "--directory", type=Path, required=True, help="Derived FIT archive to verify"
     )
     sync = commands.add_parser(
         "sync", help="Explicitly discover cycling activities and store private original FIT data"
@@ -161,25 +129,18 @@ def build_parser():
     )
     actions = backup.add_subparsers(dest="backup_action", required=True)
     for action, help_text in (
-        ("export", "Export reviewed current data and recovery state; omit auth and originals"),
-        ("verify", "Validate every package member without changing any store"),
-        ("restore", "Restore a verified package into an empty private store"),
+        ("export", "Export all reviewed revisions and recovery state; omit auth and originals"),
+        ("verify", "Check snapshot integrity and contract samples without changing any store"),
+        ("restore", "Restore a verified snapshot into a new private store"),
     ):
         command = actions.add_parser(action, help=help_text)
         command.add_argument(
             "--file",
             type=Path,
             required=True,
-            help="Private snapshot directory (SQLite) or legacy ZIP path outside Git",
+            help="Private SQLite snapshot directory outside Git",
         )
-    migration = commands.add_parser(
-        "migrate", help="Explicit read-only JSON/old ZIP to new SQLite store"
-    )
-    inputs = migration.add_mutually_exclusive_group(required=True)
-    inputs.add_argument("--source", type=Path)
-    inputs.add_argument("--bundle", type=Path)
-    migration.add_argument("--destination", type=Path, required=True)
-    snapshots = commands.add_parser("snapshot", help="Self-contained SQLite snapshots")
+    snapshots = commands.add_parser("snapshot", help="Private self-contained SQLite backups")
     actions = snapshots.add_subparsers(dest="snapshot_action", required=True)
     for action in ("export", "verify", "restore"):
         command = actions.add_parser(action)
@@ -229,9 +190,7 @@ def private_prompt(label):
 def query(store, args):
     state = store.state()
     base = {"schema_version": SCHEMA_VERSION, "freshness": freshness(state)}
-    sqlite = hasattr(store, "database")
-    if sqlite:
-        base["storage_version"] = 1
+    base["storage_version"] = 1
     if args.command == "status":
         from .jobs import load_job, report
 
@@ -286,12 +245,11 @@ def query(store, args):
         }
         for s in page
     ]
-    if sqlite:
-        for card, summary in zip(cards, page):
-            card.update(
-                {key: summary[key] for key in ("coverage", "normalizer_version", "sample_count")}
-            )
-            card["revision"] = summary["files"]["summary"].split("/")[2]
+    for card, summary in zip(cards, page):
+        card.update(
+            {key: summary[key] for key in ("coverage", "normalizer_version", "sample_count")}
+        )
+        card["revision"] = summary["files"]["summary"].split("/")[2]
     next_offset = args.offset + len(page)
     return {
         **base,
@@ -301,58 +259,22 @@ def query(store, args):
 
 
 def execute(args):
-    if args.command in {"sanitize-fit", "verify-fit"}:
-        from .sanitize_fit import sanitize_file, verify_archive, verify_archive_only
-
-        if args.command == "sanitize-fit":
-            return sanitize_file(args.file, args.output_dir, args.data_dir)
-        if args.archive_only:
-            return verify_archive_only(args.directory, args.data_dir)
-        return verify_archive(args.source, args.directory, args.data_dir)
-    from .sqlite_store import LegacyStore, SQLiteStore, open_store
+    from .sqlite_store import SQLiteStore
     from . import sqlite_transfer as transfer
+    from .storage import default_root
 
-    if args.command == "migrate":
-        return transfer.migrate(
-            args.source or args.bundle, args.destination, bundle=args.bundle is not None
-        )
-    if args.command == "snapshot":
-        if args.snapshot_action == "verify":
-            return transfer.verify_snapshot(args.directory)
-        if args.snapshot_action == "restore":
-            from .storage import default_root
-
-            return transfer.restore_snapshot(args.directory, args.data_dir or default_root())
-        return transfer.export_snapshot(SQLiteStore(args.data_dir), args.directory)
-    if args.command == "backup":
-        from .backup import export_bundle, restore_bundle, verify_bundle
-
-        if args.backup_action == "verify":
-            return (
-                transfer.verify_snapshot(args.file)
-                if args.file.is_dir()
-                else verify_bundle(args.file)
-            )
-        if args.legacy_store:
-            operation = export_bundle if args.backup_action == "export" else restore_bundle
-            return operation(LegacyStore(args.data_dir), args.file)
-        if args.backup_action == "restore":
-            from .storage import default_root
-
-            target = args.data_dir or default_root()
-            if args.file.is_dir():
-                return transfer.restore_snapshot(args.file, target)
-            return transfer.migrate(args.file, target, bundle=True)
-        source = open_store(args.data_dir)
-        if isinstance(source, SQLiteStore):
-            return transfer.export_snapshot(source, args.file)
-        return export_bundle(source, args.file)
-    store = LegacyStore(args.data_dir) if args.legacy_store else open_store(args.data_dir)
+    if args.command in {"snapshot", "backup"}:
+        action = args.snapshot_action if args.command == "snapshot" else args.backup_action
+        directory = args.directory if args.command == "snapshot" else args.file
+        if action == "verify":
+            return transfer.verify_snapshot(directory)
+        if action == "restore":
+            return transfer.restore_snapshot(directory, args.data_dir or default_root())
+        return transfer.export_snapshot(SQLiteStore(args.data_dir), directory)
+    store = SQLiteStore(args.data_dir)
     write = args.command in {"auth", "sync", "import-fit"}
     write = write or (args.command == "segment" and args.segment_action != "history")
     with store.lock(write=write):
-        if write and not args.legacy_store and not isinstance(store, SQLiteStore):
-            raise BridgeError("migration_required")
         if args.command == "window":
             from .sqlite_query import window
 
@@ -360,8 +282,6 @@ def execute(args):
         if args.command == "segment":
             from . import segments
 
-            if not isinstance(store, SQLiteStore):
-                raise BridgeError("migration_required")
             if args.segment_action == "define":
                 return {
                     "definition": segments.define(

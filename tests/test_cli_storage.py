@@ -8,13 +8,22 @@ import pytest
 
 from garmin_bridge import cli
 from garmin_bridge.errors import BridgeError
-from garmin_bridge.storage import Store, default_root
-from .synthetic import SECRET, Source, activity, archive, fit_bytes
+from garmin_bridge.sqlite_store import SQLiteStore as Store
+from garmin_bridge.storage import canonical, default_root
+from .synthetic import (
+    corrupt_document,
+    delete_document,
+    SECRET,
+    Source,
+    activity,
+    archive,
+    fit_bytes,
+)
 from .test_sync import run
 
 
 def command(store, capsys, *args):
-    code = cli.main(["--legacy-store", "--data-dir", str(store.root), *args])
+    code = cli.main(["--data-dir", str(store.root), *args])
     captured = capsys.readouterr()
     return code, json.loads(captured.out or captured.err), captured
 
@@ -49,8 +58,8 @@ def test_full_resolution_private_streams_but_bounded_offline_activity(store, cap
     assert "records" not in captured.out and len(captured.out) < 10_000
     for forbidden in (SECRET, "position_lat", "position_long", "auth/session", "/raw/"):
         assert forbidden not in captured.out
-    assert os.stat(store.path(reference)).st_mode & 0o777 == 0o600
-    store.path(reference).unlink()
+    assert os.stat(store.path("activities.sqlite")).st_mode & 0o777 == 0o600
+    delete_document(store, reference)
     assert command(store, capsys, "activity", "1001")[1]["files_available"] is False
 
 
@@ -117,7 +126,7 @@ def test_tampered_nested_index_is_not_printed(store, capsys):
     state = store.state()
     state["activities"]["1001"]["summary"]["metrics"]["duration"]["value"] = SECRET
     with store.lock(write=True):
-        store.write_json("index.json", state)
+        corrupt_document(store, "index.json", canonical(state))
     code, result, captured = command(store, capsys, "activity", "1001")
     assert code == 2 and result["error"] == "privacy_failed"
     assert captured.out == "" and SECRET not in captured.err
@@ -203,7 +212,7 @@ def test_failed_replace_preserves_file_and_cleans_staging(store, monkeypatch):
 
 def test_corrupt_index_is_reported_without_raw_contents(store, capsys):
     with store.lock(write=True):
-        store.write_bytes("index.json", SECRET.encode())
+        corrupt_document(store, "index.json", SECRET.encode())
     code, result, captured = command(store, capsys, "status")
     assert code == 2 and result["error"] == "storage_failed"
     assert SECRET not in captured.err

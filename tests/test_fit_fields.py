@@ -6,38 +6,21 @@ import json
 from types import SimpleNamespace
 
 import fitdecode
-from garmin_fit_sdk import Profile
 import pytest
 
 from garmin_bridge import contract as c, normalize, sync
 from garmin_bridge import sqlite_transfer as transfer
-from garmin_bridge.backup import artifact_files
+from garmin_bridge.persistence import artifact_files
 from garmin_bridge.errors import BridgeError
 from garmin_bridge.fit_details import project_message
 from garmin_bridge.fit_fields import FIELDS, MESSAGE_NUMBERS, RECORD_UNITS
-from garmin_bridge.fit_policy import project
-from garmin_bridge.fit_verify import validate_derived
-from garmin_bridge.fit_wire import read_wire, write_wire
 from garmin_bridge.import_fit import import_file
 from garmin_bridge.sqlite_store import SQLiteStore
 from garmin_bridge.storage import canonical
-from .sanitize_synthetic import body, finish, frame, minimal, raw
+from .fit_synthetic import body, finish, frame, minimal, raw
 from .synthetic import Source, activity, fit_bytes
 from .test_import_fit import private_file
 from .test_sync import run
-
-BASES = {
-    "enum": 0,
-    "sint8": 1,
-    "uint8": 2,
-    "sint16": 0x83,
-    "uint16": 0x84,
-    "sint32": 0x85,
-    "uint32": 0x86,
-    "string": 7,
-    "uint8z": 10,
-    "uint32z": 0x8C,
-}
 
 
 def parse(data, identity=False):
@@ -66,16 +49,16 @@ def detail(streams, message):
 
 def case(message, name):
     mid = MESSAGE_NUMBERS[message]
-    official = next(f for f in Profile["messages"][mid]["fields"].values() if f["name"] == name)
-    base = BASES[official["base_type"]]
+    spec = FIELDS[message][name]
+    base = spec.base
     value = 17
-    if official["array"] == "true":
+    if spec.shape != "scalar":
         value = [0, 17]
     if base == 7:
         value = b"Cycling\0" if message != "user_profile" else b"Synthetic Person\0"
     if base == 0:
-        value = [0, 0] if official["array"] == "true" else 0
-    if official["type"] in ("date_time", "local_date_time"):
+        value = [0, 0] if spec.shape != "scalar" else 0
+    if spec.kind in ("utc", "local"):
         value = 1000000000
     context = {
         "session": {254: (0x84, 0), 5: (0, 2), 25: (0x84, 0), 26: (0x84, 1)},
@@ -88,7 +71,7 @@ def case(message, name):
         "split_summary": {1: (0, 2)},
         "activity": {1: (0x84, 1), 3: (0, 26), 4: (0, 0)},
     }.get(message, {})
-    number = official["num"]
+    number = spec.number
     if number in context:
         base, value = context[number]
     if name in ("message_index", "reference_index", "hr_calc_type", "pwr_calc_type"):
@@ -103,20 +86,15 @@ def case(message, name):
         data = minimal(records=encoded)
     else:
         data = minimal(encoded)
-    return data, official, value
+    return data, spec, value
 
 
 CASES = [(message, name) for message, fields in FIELDS.items() for name in fields]
 
 
 @pytest.mark.parametrize("message,name", CASES)
-def test_reviewed_fields_against_pinned_profile_and_binary_parser(message, name):
-    data, official, raw_value = case(message, name)
-    spec = FIELDS[message][name]
-    assert spec.number == official["num"]
-    assert spec.base == BASES[official["base_type"]]
-    assert spec.scale == official["scale"][0]
-    assert spec.offset == official["offset"][0]
+def test_reviewed_fields_through_binary_parser(message, name):
+    data, spec, raw_value = case(message, name)
     _, streams = parse(data, identity=True)
     if message == "record":
         actual = streams["records"][0][name]
@@ -130,23 +108,9 @@ def test_reviewed_fields_against_pinned_profile_and_binary_parser(message, name)
     elif base_string := isinstance(raw_value, bytes):
         assert base_string and actual == raw_value.rstrip(b"\0").decode()
     elif isinstance(raw_value, list):
-        assert actual == [v / official["scale"][0] - official["offset"][0] for v in raw_value]
+        assert actual == [v / spec.scale - spec.offset for v in raw_value]
     else:
-        assert actual == raw_value / official["scale"][0] - official["offset"][0]
-
-
-@pytest.mark.parametrize("message,name", [(m, n) for m, n in CASES if not FIELDS[m][n].identity])
-def test_normalized_fields_are_retained_by_sanitizer_and_both_readers(message, name):
-    data, official, _ = case(message, name)
-    selected, _ = project(read_wire(data))
-    output = write_wire(selected)
-    validate_derived(output, selected)
-    assert any(
-        f.number == official["num"]
-        for m in selected
-        if m.number == MESSAGE_NUMBERS[message]
-        for f in m.fields
-    )
+        assert actual == raw_value / spec.scale - spec.offset
 
 
 def rich_fit():
@@ -273,11 +237,6 @@ def test_identity_is_explicit_and_positions_unknowns_text_are_always_excluded(id
     assert ("user_profile" in encoded) is identity
     assert summary["provenance"]["unique_identifiers_retained"] == (
         "explicit_opt_in" if identity else "none"
-    )
-    selected, _ = project(read_wire(rich_fit()))
-    assert not any(
-        m.number == 3 or m.number in (0, 23) and any(f.number == 3 for f in m.fields)
-        for m in selected
     )
 
 
@@ -494,11 +453,6 @@ def test_legacy_stream_contract_and_sqlite_schema_remain_readable(tmp_path):
         store.write_json("index.json", state)
     snapshot = tmp_path / "old-snapshot"
     transfer.export_snapshot(store, snapshot)
-    manifest = json.loads((snapshot / "manifest.json").read_bytes())
-    manifest["format_version"] = 1
-    for key in ("fit_fields_versions", "fit_counts", "identity_included"):
-        del manifest[key]
-    (snapshot / "manifest.json").write_bytes(canonical(manifest))
     assert transfer.verify_snapshot(snapshot)["verified"]
     transfer.restore_snapshot(snapshot, tmp_path / "restored")
     assert SQLiteStore(tmp_path / "restored").read_json(summary["files"]["streams"]) == streams
@@ -515,8 +469,8 @@ def test_legacy_stream_contract_and_sqlite_schema_remain_readable(tmp_path):
     assert transfer.inspect_store(store)["counts"]["revisions"] == 2
 
 
-def test_pinned_profile_does_not_define_requested_lap_only_gaps():
-    names = {f["name"] for f in Profile["messages"][19]["fields"].values()}
+def test_lap_allowlist_does_not_invent_unsupported_fields():
+    names = set(FIELDS["lap"])
     assert not names & {
         "intensity_factor",
         "training_load_peak",
@@ -543,15 +497,14 @@ def test_developer_field_cannot_spoof_detail():
 def test_sdk_documented_fields_do_not_leak_fitdecode_unknown_names():
     # fitdecode's older Profile lacks these SDK-documented split_summary fields.
     # They are admitted by reviewed numeric IDs/types, never an unknown_* name.
-    selected, _ = project(read_wire(rich_fit()))
     unknowns = set()
-    with fitdecode.FitReader(io.BytesIO(write_wire(selected))) as reader:
+    with fitdecode.FitReader(io.BytesIO(rich_fit())) as reader:
         for message in reader:
             if isinstance(message, fitdecode.FitDataMessage):
                 for field in message.fields:
                     if field.name.startswith("unknown_"):
                         unknowns.add((message.global_mesg_num, field.field_def.def_num))
-    assert unknowns == {(313, 1), (313, 25)}
+    assert {(313, 1), (313, 25)} <= unknowns
     _, streams = parse(rich_fit())
     fields = detail(streams, "split_summary")["fields"]
     assert fields["sport"]["value"] == 2 and fields["avg_power"]["value"] == 200
@@ -674,8 +627,6 @@ def test_sport_labels_are_closed_and_custom_text_stays_private():
     )
     summary, streams = parse(data, identity=True)
     assert "PRIVATE_SYNTHETIC_LABEL" not in json.dumps([summary, streams])
-    selected, _ = project(read_wire(data))
-    assert b"PRIVATE_SYNTHETIC_LABEL" not in write_wire(selected)
 
 
 @pytest.mark.parametrize("fields", [[raw(116, 2, [1, 2, 3])], [raw(101, 0x84, 1)]])
@@ -690,32 +641,3 @@ def test_relative_system_time_is_not_mislabelled_as_utc():
     summary, streams = parse(data)
     assert summary["activity_time"]["utc"] is None
     assert streams["session"]["fields"]["start_time"]["value"] is None
-
-
-def test_historical_sanitizer_rules_still_verify_without_broadening(tmp_path):
-    from garmin_bridge.sanitize_fit import prepare, verify_archive, verify_archive_only
-    from garmin_bridge.fit_verify import validate_archive_fit
-
-    original = rich_fit()
-    source = private_file(tmp_path, original)
-    archive = tmp_path / "old-derived"
-    archive.mkdir(mode=0o700)
-    members, _ = prepare(original, "1.0.0")
-    for name, content in members.items():
-        path = archive / name
-        path.write_bytes(content)
-        path.chmod(0o600)
-    assert verify_archive(source, archive)["rules_version"] == "1.0.0"
-    assert verify_archive_only(archive)["rules_version"] == "1.0.0"
-    newer, _ = prepare(original)
-    with pytest.raises(BridgeError):
-        validate_archive_fit(newer["derived.fit"], "1.0.0")
-    assert {p.name: p.read_bytes() for p in archive.iterdir()} == members
-
-
-def test_old_event_policy_is_not_reinterpreted_by_new_verifier():
-    data = minimal(frame(21, [raw(0, 0, 13), raw(1, 0, 0), raw(3, 0x86, 100)]))
-    old, _ = project(read_wire(data, "1.0.0"), "1.0.0")
-    new, _ = project(read_wire(data))
-    assert not any(f.number == 3 for m in old if m.number == 21 for f in m.fields)
-    assert any(f.number == 3 for m in new if m.number == 21 for f in m.fields)

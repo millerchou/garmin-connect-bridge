@@ -5,9 +5,10 @@ import struct
 
 import pytest
 
-from garmin_bridge import backup, contract, normalize, sanitize_fit, sync
+from garmin_bridge import contract, normalize, sync
+from garmin_bridge import sqlite_transfer as backup
 from garmin_bridge.errors import BridgeError
-from garmin_bridge.storage import Store
+from garmin_bridge.sqlite_store import SQLiteStore as Store
 from .synthetic import START, activity, crc16, message
 from .test_cli_storage import command
 from .test_import_fit import importing, private_file
@@ -138,12 +139,12 @@ def test_old_backup_cache_reparse_and_immutable_revision(
         patch.setattr(contract, "NORMALIZER_VERSION", old_version)
         patch.setattr(normalize, "_cadence_quality", lambda *args: set())
         old = importing(store, capsys, path)[1]["activity"]
-        bundle = tmp_path / "old.zip"
-        backup.export_bundle(store, bundle)
+        bundle = tmp_path / "old-snapshot"
+        backup.export_snapshot(store, bundle)
     before = {ref: store.read_bytes(ref) for ref in old["files"].values()}
-    backup.verify_bundle(bundle)
+    backup.verify_snapshot(bundle)
     restored = Store(tmp_path / "restored")
-    backup.restore_bundle(restored, bundle)
+    backup.restore_snapshot(bundle, restored.root)
     assert command(restored, capsys, "activity", "1001")[1]["activity"] == old
     for target in (store, restored):
         result = importing(target, capsys, path)[1]
@@ -156,28 +157,19 @@ def test_old_backup_cache_reparse_and_immutable_revision(
         assert all(target.read_bytes(ref) == content for ref, content in before.items())
 
 
-def test_sanitize_import_backup_restore_preserves_values_and_flags(store, tmp_path, capsys):
+def test_import_snapshot_restore_preserves_values_and_flags(store, tmp_path, capsys):
     content = cadence_fit(avg=90, samples=((0, 0, 0), (30, 100, 64), (31, 255, 64)))
     path = private_file(tmp_path, content)
-    destination = tmp_path / "derived"
-    sanitize_fit.sanitize_file(path, destination)
-    clean = (destination / "derived.fit").read_bytes()
     original_summary, original_streams = normalize.normalize(
         content, normalize.local_metadata("1001"), "2025-01-03T00:00:00Z", "a" * 64
     )
-    clean_summary, clean_streams = normalize.normalize(
-        clean, normalize.local_metadata("1001"), "2025-01-03T00:00:00Z", "a" * 64
-    )
-    assert original_streams == clean_streams
-    for key in ("metrics", "coverage", "quality_flags"):
-        assert original_summary[key] == clean_summary[key]
-    summary = importing(store, capsys, destination / "derived.fit")[1]["activity"]
+    summary = importing(store, capsys, path)[1]["activity"]
     assert {SUMMARY, RECORD} <= set(summary["quality_flags"])
-    bundle = tmp_path / "new.zip"
-    backup.export_bundle(store, bundle)
-    backup.verify_bundle(bundle)
+    bundle = tmp_path / "new-snapshot"
+    backup.export_snapshot(store, bundle)
+    backup.verify_snapshot(bundle)
     restored = Store(tmp_path / "restored")
-    backup.restore_bundle(restored, bundle)
+    backup.restore_snapshot(bundle, restored.root)
     assert command(restored, capsys, "activity", "1001")[1]["activity"] == summary
     assert restored.read_json(summary["files"]["streams"])["records"] == original_streams["records"]
     bad = copy.deepcopy(summary)

@@ -1,8 +1,9 @@
 """Only reviewed, constant diagnostics may cross the CLI boundary."""
 
 MESSAGES = {
-    "storage_format_conflict": "Storage formats conflict. Do not use legacy mode on SQLite or mix stores; use separate destinations.",
-    "migration_required": "Use explicit migrate into a new SQLite store before acquisition.",
+    # Historical SQLite journals can contain this code from document validation.
+    "invalid_bundle": "Stored document failed integrity or contract validation.",
+    "storage_format_conflict": "Only SQLite stores are supported. Use a separate directory for other storage formats.",
     "usage": "Invalid arguments. Use --help; never pass credentials as arguments.",
     "interactive_required": "Run auth in a private interactive terminal.",
     "auth_required": "No saved session. Run auth in a private terminal.",
@@ -12,18 +13,13 @@ MESSAGES = {
     "rate_limited": "Garmin rate limit reached. Wait before retrying.",
     "upstream_invalid": "Unexpected Garmin response. Sync remains incomplete.",
     "invalid_fit": "Original activity is not a supported, complete FIT input.",
-    "sanitize_context": "Sanitization requires one cycling session and an activity FIT with records.",
-    "sanitize_verification": "Derived FIT archive failed policy, preservation, parser, or integrity checks.",
-    "sanitize_publish": "Atomic publication is unavailable; no archive was published.",
     "unsafe_archive": "Original archive failed size, path, or format validation.",
     "unsafe_input": "Use one private regular FIT or ZIP file outside Git and authentication directories.",
     "import_conflict": "Local input conflicts with saved API data or scan evidence. Existing results were preserved.",
     "unsafe_store": "Use an owner-only private directory outside any Git checkout.",
     "storage_failed": "Private storage could not be read or written safely.",
     "busy": "Private store is in use by another command. Retry later.",
-    "invalid_bundle": "Backup failed format, checksum, privacy, or consistency validation.",
     "destination_exists": "Destination is not empty. Use a new private path; existing data was preserved.",
-    "restore_pending": "Restore is interrupted. Repeat backup restore with the same verified package.",
     "privacy_failed": "Output failed privacy validation; no data was returned.",
     "not_found": "Activity is not in the local index. Run an explicit sync if needed.",
     "activity_unavailable": "Garmin cannot provide this original activity. The gap remains recorded.",

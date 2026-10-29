@@ -1,6 +1,6 @@
 """Conservative directed whole-path matching. Coordinates live only in memory.
 
-No normalizer/sanitizer policy is expanded. This module reads only timestamp,
+No normalizer field policy is expanded. This module reads only timestamp,
 position_lat/long from record frames of an already verified private original.
 No location hash, name, path, or coordinate enters a persisted result.
 """
@@ -13,11 +13,10 @@ import uuid
 import fitdecode
 
 from . import contract as c
-from .backup import decode
 from .errors import BridgeError
 from .normalize import extract_fit, sha256, timestamp
 from .persistence import require
-from .storage import canonical
+from .storage import canonical, decode
 
 ALGORITHM = "1.0.1"
 # Historical caches remain readable/portable, but are not current evidence.

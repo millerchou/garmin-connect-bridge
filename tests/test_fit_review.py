@@ -10,7 +10,7 @@ from garmin_bridge.fit_details import EPOCH
 from garmin_bridge.sqlite_store import SQLiteStore
 from garmin_bridge import sqlite_transfer as transfer
 from garmin_bridge.import_fit import import_file
-from .sanitize_synthetic import definition, frame, minimal, raw
+from .fit_synthetic import definition, frame, minimal, raw
 from .synthetic import Source, activity
 from .test_fit_fields import detail, parse
 from .test_import_fit import private_file

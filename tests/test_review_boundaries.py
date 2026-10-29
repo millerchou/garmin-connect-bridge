@@ -10,7 +10,7 @@ from garmin_bridge import normalize, segments, sqlite_transfer as transfer, sync
 from garmin_bridge.errors import BridgeError
 from garmin_bridge.jobs import load_job
 from garmin_bridge.sqlite_store import SQLiteStore
-from garmin_bridge.storage import Store, canonical
+from garmin_bridge.storage import canonical
 from .synthetic import Source, activity
 from .test_sqlite import put
 from .test_sync import run
@@ -69,15 +69,6 @@ def test_efforts_must_agree_with_revision_samples(database, tmp_path, straight, 
     assert not (tmp_path / "snapshot").exists()
 
 
-def test_migration_rejects_lost_catalog(tmp_path):
-    old = Store(tmp_path / "old")
-    put(old, tmp_path)
-    old.path("index.json").unlink()
-    with pytest.raises(BridgeError):
-        transfer.migrate(old.root, tmp_path / "target")
-    assert not (tmp_path / "target").exists()
-
-
 def test_snapshot_rejects_lost_catalog(database, tmp_path):
     put(database, tmp_path)
     with database.database(write=True) as db:
@@ -124,15 +115,9 @@ def test_same_definition_is_idempotent(database, tmp_path, straight):
     assert segments.history(database, definition["id"]) == before
 
 
-@pytest.mark.parametrize("operation", ["migrate", "restore", "export"])
+@pytest.mark.parametrize("operation", ["restore", "export"])
 def test_destinations_cannot_mutate_inputs(database, tmp_path, operation):
-    if operation == "migrate":
-        source = Store(tmp_path / "old")
-        put(source, tmp_path)
-
-        def call(target):
-            return transfer.migrate(source.root, target)
-    elif operation == "restore":
+    if operation == "restore":
         put(database, tmp_path)
         transfer.export_snapshot(database, tmp_path / "snapshot")
         source = SQLiteStore(tmp_path / "snapshot")
@@ -271,16 +256,13 @@ def test_report_filename_must_match_job_identity(database, tmp_path):
 
 def test_mixed_storage_is_rejected_instead_of_choosing_a_catalog(database, tmp_path):
     from garmin_bridge.storage import empty_state
-    from garmin_bridge.sqlite_store import open_store
 
     put(database, tmp_path)
     # An owner manually creates an incompatible second catalog. Never merge or delete it.
     (database.root / "index.json").write_bytes(canonical(empty_state()))
     (database.root / "index.json").chmod(0o600)
     with pytest.raises(BridgeError):
-        open_store(database.root).state()
-    with pytest.raises(BridgeError):
-        transfer.migrate(database.root, tmp_path / "target")
+        SQLiteStore(database.root).state()
     assert (database.root / "index.json").exists()
 
 

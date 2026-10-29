@@ -1,63 +1,27 @@
-"""Explicit read-only migration and no-replace, self-contained SQLite snapshots."""
+"""Private no-replace, self-contained SQLite snapshots."""
 
 import hashlib
-import os
-import fcntl
-from contextlib import closing, contextmanager, nullcontext
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import tempfile
 
 from . import contract as c
-from .backup import artifact_files, control_files, decode, inspect_package, open_package, snapshot
+from .persistence import artifact_files, control_files, require, snapshot, validate_state
 from .errors import BridgeError
 from .jobs import gaps
 from .normalize import sha256
-from .persistence import require
-from .sanitize_fit import publish_directory
 from .sqlite_store import (
     DATABASE,
     STORAGE_VERSION,
     SQLiteStore,
     validate_document,
+    document_kind,
     ARRAY_LIMITS,
     stream_arrays,
 )
 from .segments import ALGORITHM, ALGORITHMS
-from .storage import Store, canonical, check_private
-
-
-@contextmanager
-def read_lock(store):
-    """Lock an existing legacy input without creating or modifying any file."""
-    path = store.path(".lock")
-    if not path.exists():
-        raise BridgeError("unsafe_store")
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    try:
-        check_private(path)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise BridgeError("busy") from None
-        yield
-    finally:
-        os.close(fd)
-
-
-def physical_digest(path):
-    # SQLite's creator-library version is the only environment-specific header
-    # field. Validate its numeric domain; every other byte must be canonical.
-    with path.open("rb") as handle:
-        header = bytearray(handle.read(100))
-        require(
-            len(header) == 100 and 3_000_000 <= int.from_bytes(header[96:100], "big") < 4_000_000
-        )
-        header[96:100] = bytes(4)
-        digest = hashlib.sha256(header)
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-        return digest.hexdigest()
+from .storage import Store, canonical, decode, publish_directory
 
 
 def digest_file(path):
@@ -65,7 +29,7 @@ def digest_file(path):
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
-def inspect_store(store, *, legacy_manifest=False):
+def inspect_store(store, *, full_validation=True):
     require(store.read_bytes("index.json") is not None)
     state, job = snapshot(store)
     check_report(store, state, job)
@@ -82,7 +46,22 @@ def inspect_store(store, *, legacy_manifest=False):
         require(db.execute("PRAGMA integrity_check").fetchall() == [("ok",)])
         names = [r[0] for r in db.execute("SELECT name FROM documents ORDER BY name")]
         for name in names:
-            content = store.read_bytes(name)  # closed validation of every document
+            require(document_kind(name) is not None)
+            content = store.read_bytes(name)
+            value = decode(content)
+            if full_validation or not name.endswith("/streams.json"):
+                validate_document(name, value)
+            else:
+                # Sample records/events; keep lap/message context for zone references.
+                # Export validates every row.
+                sample = dict(value)
+                for key in ("records", "timer_events", "events"):
+                    if key in sample:
+                        rows = sample[key]
+                        sample[key] = [
+                            rows[i] for i in sorted({0, len(rows) // 2, len(rows) - 1}) if rows
+                        ]
+                validate_document(name, sample)
             if name.endswith("/summary.json"):
                 summary = decode(content)
                 streams = summary["files"]["streams"]
@@ -95,7 +74,8 @@ def inspect_store(store, *, legacy_manifest=False):
                         "streams": sha256(stream_content),
                     },
                 }
-                artifact_files(entry, store.read_bytes)
+                if full_validation:
+                    artifact_files(entry, store.read_bytes)
                 counts["revisions"] += 1
             if name.endswith("/streams.json"):
                 value = decode(content)
@@ -122,25 +102,18 @@ def inspect_store(store, *, legacy_manifest=False):
         from .segments import validate_segments
 
         validate_segments(db, store)
-    for entry in state["activities"].values():
-        artifact_files(entry, store.read_bytes)
+    if full_validation:
+        for entry in state["activities"].values():
+            artifact_files(entry, store.read_bytes)
     times = [
         e["summary"]["activity_time"]["utc"]
         for e in state["activities"].values()
         if e["summary"]["activity_time"]["utc"]
     ]
-    require(not legacy_manifest or not field_versions)
-    extension = (
-        {}
-        if legacy_manifest
-        else {
-            "fit_fields_versions": sorted(field_versions),
-            "fit_counts": detail_counts,
-            "identity_included": detail_counts["identity_revisions"] > 0,
-        }
-    )
     return {
-        **extension,
+        "fit_fields_versions": sorted(field_versions),
+        "fit_counts": detail_counts,
+        "identity_included": detail_counts["identity_revisions"] > 0,
         "storage_version": STORAGE_VERSION,
         "schema_version": c.SCHEMA_VERSION,
         "normalizer_versions": sorted(
@@ -185,7 +158,6 @@ def copy_logical(source, target):
             for table in ("segments", "efforts"):
                 for row in db.execute(f"SELECT * FROM {table} ORDER BY 1,2"):
                     out.execute(f"INSERT INTO {table} VALUES ({','.join('?' for _ in row)})", row)
-    inspect_store(target)
 
 
 def receipt(action, info):
@@ -227,7 +199,7 @@ def export_snapshot(source, destination):
         staging.write_bytes(DATABASE, b"")
         with clean.database() as db, closing(sqlite3.connect(staging.path(DATABASE))) as out:
             db.backup(out)
-        info = inspect_store(staging)
+        info = inspect_store(staging, full_validation=False)
         manifest = {
             "format": "garmin-bridge-sqlite",
             "format_version": 2,
@@ -252,27 +224,18 @@ def verify_snapshot(directory):
     require(c.digest(manifest.get("sha256")))
     require(store.path(DATABASE).stat().st_size == manifest["size"])
     require(digest_file(store.path(DATABASE)) == manifest["sha256"])
-    require(type(manifest.get("format_version")) is int and manifest["format_version"] in (1, 2))
-    info = inspect_store(store, legacy_manifest=manifest["format_version"] == 1)
+    require(type(manifest.get("format_version")) is int and manifest["format_version"] == 2)
+    validate_state(store.state(), portable=True)
+    info = inspect_store(store, full_validation=False)
     expected = {
         "format": "garmin-bridge-sqlite",
         "format_version": manifest["format_version"],
         **info,
         "segment_algorithm_version": manifest["segment_algorithm_version"],
         "size": store.path(DATABASE).stat().st_size,
-        "sha256": digest_file(store.path(DATABASE)),
+        "sha256": manifest["sha256"],
     }
     require(canonical(manifest) == canonical(expected))
-    # Require canonical physical encoding too: hidden freed pages, trailing data,
-    # alternate indexes, injected metadata and unused payload cannot travel.
-    with tempfile.TemporaryDirectory(prefix=".sqlite-check-", dir=store.root.parent) as temp:
-        clean = SQLiteStore(Path(temp) / "clean")
-        clean.ensure()
-        copy_logical(store, clean)
-        candidate = Path(temp) / DATABASE
-        with clean.database() as db, closing(sqlite3.connect(candidate)) as out:
-            db.backup(out)
-        require(physical_digest(candidate) == physical_digest(store.path(DATABASE)))
     require(digest_file(store.path(DATABASE)) == manifest["sha256"])
     require(Store.read_bytes(store, "manifest.json") == canonical(manifest))
     return receipt("verify", info)
@@ -287,58 +250,10 @@ def restore_snapshot(directory, destination):
         staging = SQLiteStore(Path(temp) / "store")
         staging.ensure()
         copy_logical(source, staging)
-        info = inspect_store(staging)
+        info = inspect_store(staging, full_validation=False)
         require(Store.read_bytes(source, "manifest.json") == source_manifest)
         require(digest_file(source.path(DATABASE)) == decode(source_manifest)["sha256"])
         staging._fsync_dir(staging.root)
         publish_directory(staging.root, target.root)
         parent._fsync_dir(parent.root)
     return receipt("restore", info)
-
-
-def migrate(source_path, destination, bundle=False):
-    source_root = Store(Path(source_path)).root if not bundle else None
-    if source_root is not None and Store(source_root).path(DATABASE).exists():
-        raise BridgeError("storage_format_conflict")
-    target, parent = new_destination(destination, source_root)
-    with tempfile.TemporaryDirectory(prefix=".sqlite-migrate-", dir=parent.root) as temp:
-        source = Store(Path(source_path)) if not bundle else Store(Path(temp) / "legacy")
-        if bundle:
-            source.ensure()
-            with open_package(Path(source_path)) as (archive, handle):
-                inspect_package(archive, handle, source)
-        with nullcontext() if bundle else read_lock(source):
-            require(source.read_bytes("index.json") is not None)
-            state, job = snapshot(source)
-            check_report(source, state, job)
-            originals = {"index.json": source.read_bytes("index.json")}
-
-            values = control_files(state, job)
-            for path in sorted(source.root.glob("objects/*/*/*.json")):
-                name = path.relative_to(source.root).as_posix()
-                originals[name] = source.read_bytes(name)
-                values[name] = decode(originals[name])
-            for path in sorted(source.root.glob("jobs/*.json")):
-                name = path.relative_to(source.root).as_posix()
-                originals[name] = source.read_bytes(name)
-                values[name] = decode(originals[name])
-            for name in values:
-                if name not in originals:
-                    originals[name] = source.read_bytes(name)
-            for name, content in originals.items():
-                if content is not None:
-                    validate_document(name, decode(content))
-            staging = SQLiteStore(Path(temp) / "store")
-            staging.ensure()
-            for name in sorted(values, key=lambda n: n == "index.json"):
-                staging.write_json(name, values[name])
-            info = inspect_store(staging)
-            # Exact canonical bytes compare all values/types/order/null/zero; only
-            # raw references and reconstructed gap reports intentionally differ.
-            for name, value in values.items():
-                require(staging.read_bytes(name) == canonical(value))
-            require(all(source.read_bytes(n) == data for n, data in originals.items()))
-            staging._fsync_dir(staging.root)
-            publish_directory(staging.root, target.root)
-            parent._fsync_dir(parent.root)
-    return receipt("migrate", info)

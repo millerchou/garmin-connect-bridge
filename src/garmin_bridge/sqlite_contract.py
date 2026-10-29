@@ -6,7 +6,7 @@ from .segments import DEFINITION, EFFORT, ALGORITHM
 TRANSFER = c.obj(
     {
         "schema_version": c.literal(c.SCHEMA_VERSION),
-        "action": c.literal("export", "verify", "restore", "migrate"),
+        "action": c.literal("export", "verify", "restore"),
         "storage_version": c.literal(1),
         "activity_count": c.count,
         "revision_count": c.count,
@@ -74,7 +74,7 @@ HISTORY = c.obj(
 
 
 def validate(kind, value):
-    if kind in {"snapshot", "migrate", "backup"}:
+    if kind in {"snapshot", "backup"}:
         return TRANSFER(value)
     if kind == "window":
         return WINDOW(value)

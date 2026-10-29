@@ -12,7 +12,7 @@ from .fit_fields import (
     STROKES_MESSAGES,
     event_payload_allowed,
 )
-from .fit_rules import RULES
+from .fit_rules import TIMESTAMP_MESSAGES
 
 EPOCH = datetime(1989, 12, 31, tzinfo=timezone.utc)
 
@@ -51,7 +51,7 @@ class TimestampContext:
         timestamp = None
         for field in physical:
             definition = field.field_def
-            if 253 not in RULES.get(frame.global_mesg_num, {}) or (
+            if frame.global_mesg_num not in TIMESTAMP_MESSAGES or (
                 definition.base_type.identifier,
                 definition.size,
             ) != (0x86, 4):
@@ -172,7 +172,7 @@ def get(fields, name):
 
 
 def filter_message_context(session, laps, messages):
-    """Zone references use the same unique session/lap index rule as sanitize-fit."""
+    """Zone references require a unique surviving session/lap index."""
     targets = Counter()
     for number, row in [(18, session), *((19, lap["fit"]) for lap in laps)]:
         index = get(row["fields"], "message_index")

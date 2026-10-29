@@ -87,9 +87,7 @@ def choose_range(state, start=None, end=None, lookback=14, today=None):
 
 
 def files_available(store, summary):
-    if hasattr(store, "has_artifacts"):
-        return store.has_artifacts(summary)
-    return all(store.path(ref).is_file() for ref in summary["files"].values())
+    return store.has_artifacts(summary)
 
 
 def artifacts_intact(store, entry):
@@ -163,11 +161,7 @@ def publish_original(
                 store.write_json("index.json", committed)
                 state.update(committed)
             return False
-    cached = (
-        store.revision_artifacts(source_id, digest, fit_hash)
-        if hasattr(store, "revision_artifacts")
-        else None
-    )
+    cached = store.revision_artifacts(source_id, digest, fit_hash)
     summary, streams = cached or parser.normalize(
         fit, meta, now(), digest, local_import=local_import, include_identity=include_identity
     )
@@ -190,8 +184,6 @@ def publish_original(
     file_hashes = {}
     for name, value in (("streams", streams), ("summary", summary)):
         content = canonical(value)
-        if not hasattr(store, "publish_activity"):
-            store.write_bytes(summary["files"][name], content)
         file_hashes[name] = parser.sha256(content)
     entry = {
         "summary": summary,
@@ -201,10 +193,7 @@ def publish_original(
         "metadata_digest": parser.sha256(canonical(meta)),
     }
     committed = {**state, "activities": {**state["activities"], source_id: entry}}
-    if hasattr(store, "publish_activity"):
-        store.publish_activity(streams, summary, committed)
-    else:
-        store.write_json("index.json", committed)
+    store.publish_activity(streams, summary, committed)
     state.update(committed)
     return True
 
