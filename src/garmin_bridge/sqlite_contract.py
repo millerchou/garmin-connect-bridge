@@ -21,24 +21,31 @@ def TIME(x):
     return c.iso_time(x, True)
 
 
-SAMPLE_FIELDS = {k: c.nullable(c.numeric) for k in c.STREAM_UNITS}
-SAMPLE_FIELDS["timestamp"] = c.nullable(TIME)
-SAMPLE_FIELDS["balance_side"] = c.nullable(c.literal("right", "unknown"))
-WINDOW = c.obj(
-    {
-        "schema_version": c.literal(c.SCHEMA_VERSION),
-        "normalizer_version": c.ACTIVITY_FIELDS["normalizer_version"],
-        "revision": c.digest,
-        "activity_id": c.identifier,
-        "start": TIME,
-        "end": TIME,
-        "units": c.obj({k: c.literal(v) for k, v in c.STREAM_UNITS.items()}),
-        "coverage": c.COVERAGE,
-        "quality_flags": c.QUALITY,
-        "records": c.sequence(c.obj({"ordinal": c.count, "sample": c.obj(SAMPLE_FIELDS)}), 200),
-        "next_offset": c.nullable(c.count),
-    }
-)
+def window_contract(units):
+    sample = {k: c.nullable(c.numeric) for k in units}
+    sample["timestamp"] = c.nullable(TIME)
+    sample["balance_side"] = c.nullable(c.literal("right", "unknown"))
+    return c.obj(
+        {
+            "schema_version": c.literal(c.SCHEMA_VERSION),
+            "normalizer_version": c.ACTIVITY_FIELDS["normalizer_version"],
+            "revision": c.digest,
+            "activity_id": c.identifier,
+            "start": TIME,
+            "end": TIME,
+            "units": c.obj({k: c.literal(v) for k, v in units.items()}),
+            "coverage": c.coverage_for(units),
+            "quality_flags": c.QUALITY,
+            "records": c.sequence(c.obj({"ordinal": c.count, "sample": c.obj(sample)}), 200),
+            "next_offset": c.nullable(c.count),
+        }
+    )
+
+
+def WINDOW(value):
+    return window_contract(c.STREAM_UNITS)(value) or window_contract(c.LEGACY_STREAM_UNITS)(value)
+
+
 HISTORY_ROW = c.obj(
     {
         "segment_id": c.JOB_ID,

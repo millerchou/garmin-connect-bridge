@@ -187,7 +187,7 @@ def test_stale_algorithm_is_portable_but_never_returned_as_current(database, tmp
     result = segments.history(database, definition["id"])
     assert result["definition"]["algorithm_version"] == segments.ALGORITHM == "1.0.1"
     assert result["results"][0]["algorithm_version"] == segments.ALGORITHM
-    assert result["results"][0]["normalizer_version"] == "1.2.1"
+    assert result["results"][0]["normalizer_version"] == "1.3.0"
 
 
 @pytest.mark.parametrize("operation", ["list", "backup", "import-fit"])

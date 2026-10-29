@@ -401,8 +401,11 @@ are printed. The syntactically valid ID is accepted as supplied; offline import
 cannot prove its association with the file or an account. Check it privately.
 
 Missing API metadata stays missing. Only observed FIT session/record values are
-retained; session start may supply UTC, but local time, time zone and offset
-remain null. Missing start time is not guessed from records or the host. Garmin
+retained; session start may supply UTC. Unambiguous activity `local_timestamp`
+or historical `device_settings` offset evidence can supply local time and UTC
+offset (see the data contract below); an IANA zone is never inferred. Without
+that evidence local time and offset remain null. Missing start time is not
+guessed from records or the host. Garmin
 estimates/settings remain separately labeled. The input digest includes source,
 supplied ID, missing metadata, decompressed FIT SHA-256 and local provenance;
 the parse cache also checks schema/parser version and saved artifact hashes.
@@ -556,12 +559,15 @@ array bounds, scale/offset facts and contextual rules are in
   removed; future SDK recognition grants no new permission. Wrong base types or
   unsupported array lengths are removed and reported, never coerced.
 - Additional individually reviewed fields retain file type, sport, session/lap
-  indices and counts, activity timing, historical HR/power zone configurations,
-  legacy speed/altitude and power-phase pairs. No current settings, timezone, FTP,
-  interpolated data or independently recomputed metrics are added. Garmin estimates
+  indices and counts, activity timing, historical zone configurations, split metrics,
+  device clock/battery context, legacy speed/altitude and power-phase pairs.
+  Rule `1.1.0` adds the reviewed non-identity fields in the normalized FIT detail
+  allowlist. No current settings, inferred timezone name, interpolated data or
+  independently recomputed metrics are written to the derived FIT. Garmin estimates
   and configuration remain source-reported historical fields, not validated metrics.
-- Timer, rider-position and gear-change event payloads have explicit conditions.
-  Other opaque `event.data`/`data16` payloads are removed and reported. Zone records
+- Documented event headers and reviewed `data`/`data16` contexts have explicit
+  conditions. Gear components are retained only for gear-change events. Course-point
+  indices, opaque payloads and unknown events are removed and reported. Zone records
   require unique surviving session/lap targets. Dangling indices/counts and ambiguous
   global zone configurations are removed and reported, without synthesizing replacements.
 - Integers, bitfields, fractional cadence, left/right balance, array order, invalid
@@ -656,7 +662,7 @@ root, so output does not disclose the user's home-directory name.
 Fresh CLI stores use SQLite by default. API sync and offline import share the
 same publication function, provenance protections and immutable revision IDs.
 `list`, `activity`, `status`, gap/watermark logic and backup all read that store.
-`storage_version: 1` is independent of activity schema `1.0`, normalizer `1.2.1`
+`storage_version: 1` is independent of activity schema `1.0`, normalizer `1.3.0`
 and segment algorithm `1.0.1`; changing storage does not change metric semantics.
 
 ```text
@@ -842,7 +848,12 @@ all structured revisions, current/archived scan journals, gap state, segment
 definitions and cached efforts. It omits raw FIT/ZIP, authentication, private
 absolute paths and raw references. The manifest records byte size, SHA-256,
 storage/schema/normalizer/algorithm versions, current-activity and total revision/
-record/lap/event counts, the current activity time range and full current gap list.
+record/lap/timer counts, the current activity time range and full current gap list.
+Manifest format `2` also records `fit_fields_versions`, `fit_counts` (detailed events,
+auxiliary messages, sessions and identity-enabled revisions), and `identity_included`.
+The latter covers **all revisions**, including historical opt-in revisions after the
+current activity has been reimported with identity disabled. Format `1` snapshots
+remain verifiable/restorable with their original closed contract.
 A verified snapshot can still contain incomplete API history; consult gaps/status.
 
 Export validates every document, row, relation and contract, rebuilds a clean database
@@ -902,22 +913,133 @@ Version the output schema. Include the provider, source activity ID, source
 digest, acquisition time, activity time and time zone, units, field coverage,
 quality flags, and normalizer version.
 
-Schema `1.0`, normalizer `1.2.1` retain full-resolution standard FIT record time,
-heart rate, power, cadence, speed, altitude, distance, temperature, enhanced
-respiration with reviewed units, and balance percentage/side. Laps retain times,
-duration and distance; timer events retain reviewed types/times. Device provenance
-is deliberately limited to message count and input/parser attribution. Unique
-identifiers, arbitrary developer fields and unreviewed message types are omitted.
-The bridge selects a message-specific field allowlist **before reading field
-values into its intermediate projection**; it never collects all standard fields
-first. Final summaries, streams, receipts and portable packages still undergo
-recursive closed-schema validation. The FIT dependency decodes private input
-internally; its raw frames are not outputs. Version `1.1.0` adds a closed local
-provenance variant and quality flags. Existing API records from `1.0.0` remain
-queryable without recomputation; older clients cannot read the new local variant.
-No resampling is performed. Missing samples remain JSON null, actual zero remains
-zero, and timestamps retain their observed irregular spacing. Missing local zone
-names/offsets remain missing; no current configuration fills historical gaps.
+Normalizer **`1.3.0`** extends the reviewed FIT projection. The outer activity and
+control schema remains `1.0`; the additive stream detail has its own required
+`fit_fields_version: "1.0"`. Historical streams without that key retain their exact
+old shape. The validators accept both closed variants, never arbitrary extra keys.
+The existing **12 summary metrics and five `garmin_reported` quantities are
+unchanged**, including their sources, units and fallback behavior.
+
+| Stream member | Reviewed content |
+| --- | --- |
+| `records` / `units` / summary `coverage` | Existing full-resolution fields plus `left_torque_effectiveness`, `right_torque_effectiveness`, `left_pedal_smoothness`, `right_pedal_smoothness`, `combined_pedal_smoothness` (%) and `accumulated_power` (FIT accumulated watts, **not joules**). |
+| `session` | A typed FIT detail object containing observed session fields. |
+| `laps[].fit` | The same typed detail structure for each lap, alongside unchanged `start`, `end`, `duration`, `distance` and `lap_units`. |
+| `events` | Ordered documented event headers and explicitly reviewed payloads, including gear changes. |
+| `timer_events` | The existing start/stop-only compatibility view; `timer_event_count` still counts that view. |
+| `messages` | Ordered `time_in_zone`, `split`, `split_summary`, `activity`, `device_settings`, `zones_target`, `sport`, `training_settings`, `device_info`, `device_aux_battery_info`, `file_id`, and `file_creator` detail. Reviewed `user_profile` fields require identity opt-in. |
+
+Each detail object is exactly `{message, fields, garmin_reported}`. Each present
+field is `{value, unit}`. Absent detail fields are omitted; physically present FIT
+invalids become null. Arrays preserve order, zero and null slots. Pair arrays
+(power phases and posture-indexed power/cadence) require two entries; zone arrays
+allow 1–32 and device clock arrays 1–8. Enum and bitfield units are `FIT:<type>` and
+values retain numeric Profile codes; phase units are degrees. Posture and pedal
+phase fields describe the rider/pedal, not geographic position. Unreviewed fields,
+wrong wire types, unsupported shapes and all developer fields are omitted.
+The literal table in [fit_fields.py](src/garmin_bridge/fit_fields.py) is the complete
+normalized detail allowlist, with physical IDs, types, scales and output units.
+SDK recognition alone never adds permission. The pinned fitdecode Profile labels
+some newer SDK-documented `split_summary` fields internally as `unknown_*` (including
+313:1 sport and 313:25 average power). Only the reviewed numeric IDs and exact wire
+types in the literal table are mapped to their documented names; those internal
+parser labels and all unreviewed unknown fields are never stored.
+
+Session/lap detail includes average torque effectiveness and pedal smoothness,
+power-phase and phase-peak pairs, left/right balance as the original FIT bitfield,
+posture-indexed average/maximum power and cadence, fractional cadence, temperature,
+VAM (m/s per Profile), total work (J), respiration (breaths/min), calories (kcal),
+elapsed time (s), cycling strokes, and sport/sub-sport context. Session adds lap
+count, intensity factor and training load. Lap adds average/maximum HR, power,
+cadence and speed, ascent/descent and lap trigger. Enhanced speed takes precedence
+for the detail's `avg_speed`/`max_speed` as it does for the summary; the explicitly
+present enhanced field remains available too. Fractional session/lap cadence is
+stored separately, without changing the 12-item summary's integer cadence.
+`total_strokes` is the documented `total_cycles` subfield when that message declares
+cycling; without the sport context the base `total_cycles` remains labelled cycles.
+
+The pinned Profile **does not define lap** `intensity_factor`, `training_load_peak`,
+`enhanced_min_respiration_rate`, or `sport_profile_name`. Those are retained for
+sessions where documented and present, never fabricated on laps or mapped from an
+`unknown_*` field. Session minimum enhanced respiration follows its documented
+hundredths scale and the enhanced respiration family unit. The existing summary's
+Garmin estimates, plus detail normalized power, intensity factor, training stress,
+training effect, threshold power and training load, remain in `garmin_reported`.
+Historical configuration is file evidence, not a current athlete profile or an
+independently validated measurement.
+
+All documented event IDs in the pinned Profile have a closed header allowlist.
+`event`, `event_type`, `event_group` and timestamp are retained; unknown IDs are
+excluded. Payloads remain raw, labelled `FIT:event_data`; their event code supplies
+the subfield meaning and scale. Timers, gear changes, rider position, battery,
+pace/HR/speed/cadence/power/duration alerts, equipment state, sport-point scores,
+communication timeout, auto-activity duration, dive alert and radar alert have
+reviewed payload contexts. Course-point indices and other opaque payloads are
+excluded. Gear changes expose `gear_change_data` and the four gear components;
+explicit physical components take precedence over packed-data expansion. The
+sanitizer preserves only physical components and never synthesizes new fields.
+Zone records require a unique surviving session/lap index; ambiguous global zone
+configuration and dangling zone references are omitted.
+
+Local-time filling uses only unambiguous file evidence: paired UTC/local activity
+timestamps, the active `time_zone_offset`, or active `time_offset - utc_offset`
+with FIT unsigned wrapping. `utc_offset` alone is a system-clock correction,
+**not a timezone offset**. Conflicting offsets, missing start time, invalid active
+indices and offsets outside ±14 hours do not fill local time. A known file offset
+is applied to the observed session start; this does not establish a timezone name
+or prove that an offset stayed constant across a DST change during the activity.
+Existing API local time/offset is preserved. Relative FIT system times below the
+Profile's UTC timestamp threshold are not relabelled as absolute UTC.
+
+Normalization checks the compressed timestamp clock independently of fitdecode.
+Only approved standard timestamp fields with the exact wire type and size can
+anchor it. Unknown, mistyped or invalid standard timestamps clear the anchor;
+developer fields cannot change it. Compressed headers without an approved anchor,
+or with a second physical timestamp, reject the input. Valid header timestamps
+are retained in records and in session, lap, event and auxiliary detail.
+An explicitly invalid active-zone index never selects a default clock offset.
+
+Identity retention is an explicit per-invocation option, default **off**:
+
+```sh
+garmin-bridge import-fit --file "$BRIDGE_FIT" --activity-id "$BRIDGE_ID" --include-fit-identity
+garmin-bridge sync --start 2025-01-02 --end 2025-01-02 --include-fit-identity
+```
+
+This permits only `file_id.serial_number`, `device_info.serial_number` and the
+reviewed `user_profile` subset in the literal table (including friendly name, age,
+gender, height and weight). User/global IDs, ANT device numbers and other unlisted
+identity fields remain excluded. The flag does not enable positions or arbitrary
+product names. `product_name` and device descriptors are always excluded. The only
+default string fields are `session.sport_profile_name` and `sport.name`, restricted
+to the exact closed sport labels in `SPORT_LABELS`; custom labels are omitted even
+with identity enabled. Opt-in friendly names are bounded to 64 printable characters.
+Identity values remain in private artifacts and snapshots; bounded CLI summaries
+report only `provenance.unique_identifiers_retained: "explicit_opt_in"` or `"none"`.
+Treat retained text as data, never instructions.
+
+The identity setting participates in the source digest and is recorded in the
+stream and scan journal. Changing it creates/reuses the appropriate immutable
+revision and requeues completed work on resume. Omitting the option on a later
+invocation restores default-off behavior. It does **not erase old revisions**;
+snapshots include and explicitly declare any historical identity-enabled revision.
+`sanitize-fit` always strips identity and has no identity opt-in. API-derived
+activity protection on offline imports remains unchanged.
+
+SQLite storage/user version remains **`1`**: existing `documents` and ordered
+`samples` tables already support the extra typed JSON rows. Session detail stays
+in stream metadata; detailed events and auxiliary messages have separate ordered
+sample kinds. No database rewrite or ALTER TABLE is needed. Old rows, streams,
+revisions, query windows and format-1 snapshots remain readable unchanged. Format-2
+snapshot verification validates all new rows, identity declarations, counts and
+nested units before canonical physical verification. New snapshots require this
+reader; older readers correctly reject the new detail/manifest contract.
+
+Range sync downloads/rechecks the original, sees normalizer `1.2.1` versus `1.3.0`,
+and publishes a new revision; another unchanged run is idempotent. Existing
+originals are required to obtain new fields; raw-free snapshots cannot reconstruct
+them. Failed parsing/publication keeps the last usable revision and does not
+advance the watermark. No dependency or lockfile change accompanies this extension.
 
 Normalizer `1.2.0` adds exactly two non-fatal cadence quality flags:
 
@@ -928,9 +1050,10 @@ Normalizer `1.2.0` adds exactly two non-fatal cadence quality flags:
 
 The record comparison uses the original integer component internally because the
 existing session extraction retains integer precision. Thus record `80.5` versus
-session `80` does not trigger a flag. Session fractional fields remain unextracted;
-record fractions remain merged exactly as before. The session end timestamp is a
-non-location internal comparison boundary, not a new output metric. Active
+session `80` does not trigger a flag. In versions `1.2.x`, session fractional
+fields were unextracted; `1.3.0` retains them separately in FIT detail. Record
+fractions remain merged as before. The session end timestamp supplies the explicit
+comparison boundary and is now also available in session FIT detail. Active
 `total_timer_time` is never used to reconstruct elapsed end time.
 
 Missing/invalid bounds, missing timestamps or cadence, out-of-range records, and
@@ -949,9 +1072,9 @@ coverage unchanged. Mixed negative/valid records still retain valid evidence.
 This patch version also invalidates `1.2.0` offline parse caches.
 
 The closed quality vocabulary accepts these two names, not arbitrary flags or
-fields. Existing `1.0.0`/`1.1.0`/`1.2.0` summaries and backups remain readable. Reimporting
-an old offline cache with original FIT bytes creates a new immutable `1.2.1`
-revision; the next identical import is unchanged. API-source protection still
+fields. Existing `1.0.0`/`1.1.0`/`1.2.0`/`1.2.1` summaries and backups remain readable.
+Reimporting an old offline cache with original FIT bytes creates a new immutable
+`1.3.0` revision; the next identical import is unchanged. API-source protection still
 applies: offline import cannot upgrade or overwrite an existing API record.
 
 Keep Garmin-reported estimates and settings in a separate namespace. Values
@@ -964,8 +1087,8 @@ accepts one FIT file per original; traversal, absolute/Windows paths, symlinks,
 encryption, ambiguous multiple FIT files, expansion ratios over 200, more than
 32 entries and inputs/inflated content over 64 MiB are rejected. FIT framing and
 CRC are checked strictly. Multi-session/non-cycling FIT, more than 500,000 record
-samples, 10,000 laps or 100,000 timer events are explicit API gaps or per-file
-import errors. Larger activities, non-FIT originals and additional reviewed
+samples, 10,000 laps, 100,000 events or 100,000 auxiliary messages are explicit
+API gaps or per-file import errors. Larger activities, non-FIT originals and additional reviewed
 field types need later support. The
 SDK materializes download bytes before the bridge applies its size limit.
 
@@ -1034,6 +1157,24 @@ imports, local-only and incomplete-API backup recovery, and subsequent mocked
 API full/resume/incremental synchronization.
 
 ## Verification and remaining private validation
+
+Non-location FIT extension (`1.3.0`), 2026-10-29: **1,342 offline synthetic tests
+passed** (705 existing cases retained and 637 added). `uv run ruff check`,
+`uv run ruff format --check` (43 Python files), and `git diff --check` passed.
+Commands used `UV_OFFLINE=1` and a task-specific temporary uv cache. No dependency,
+lockfile, CI, deployment or account change was made.
+
+New cases compare every approved detail field with the pinned official Profile,
+parse invented binary FIT, and reread sanitizer output with both parsers. They
+cover all auxiliary message types through SQLite/snapshot restore, arrays/nulls/
+zeros/units, estimates, gear and other events, default-off identity and opt-in,
+closed labels, position/unknown/developer exclusion, local-time evidence, policy
+changes on resume, version-triggered revisions, idempotence, failure watermarks,
+and rehashed snapshot injections. Actual legacy stream shapes and format-1 SQLite
+snapshots remain readable and can acquire new revisions without migration.
+Historical sanitizer rule-1.0.0 archives verify under their original policy.
+No real FIT, database, credential, Garmin account or running deployment was used;
+live compatibility remains unverified.
 
 The follow-up review added 27 adversarial cases. Fixes cover truncated segment
 boundaries; effort/sample consistency; algorithm cache invalidation and idempotent

@@ -6,10 +6,11 @@ import re
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .errors import BridgeError, MESSAGES
+from .fit_fields import AUXILIARY_MESSAGES, FIT_FIELDS_VERSION, RECORD_UNITS
 
 SCHEMA_VERSION = "1.0"
-NORMALIZER_VERSION = "1.2.1"
-STREAM_UNITS = {
+NORMALIZER_VERSION = "1.3.0"
+LEGACY_STREAM_UNITS = {
     "timestamp": "UTC",
     "heart_rate": "bpm",
     "power": "W",
@@ -22,6 +23,9 @@ STREAM_UNITS = {
     "balance_percent": "%",
     "balance_side": "side",
 }
+
+STREAM_UNITS = {**LEGACY_STREAM_UNITS, **RECORD_UNITS}
+
 METRIC_UNITS = {
     "duration": "s",
     "distance": "m",
@@ -152,9 +156,16 @@ TIME = obj(
         "utc_offset_seconds": nullable(numeric),
     }
 )
-COVERAGE = obj(
-    {name: obj({"present": count, "missing": count, "total": count}) for name in STREAM_UNITS}
-)
+
+
+def coverage_for(units):
+    return obj({name: obj({"present": count, "missing": count, "total": count}) for name in units})
+
+
+def COVERAGE(value):
+    return coverage_for(STREAM_UNITS)(value) or coverage_for(LEGACY_STREAM_UNITS)(value)
+
+
 FILES = obj(
     {
         name: (
@@ -171,7 +182,7 @@ QUALITY = sequence(literal(*sorted(FLAGS)), len(FLAGS))
 PROVENANCE_FIELDS = {
     "parser": literal("fitdecode/0.11.0"),
     "device_messages": count,
-    "unique_identifiers_retained": literal("none"),
+    "unique_identifiers_retained": literal("none", "explicit_opt_in"),
 }
 LOCAL_INPUT = obj(
     {
@@ -376,7 +387,7 @@ FIT_ARCHIVE_FIELDS = {
     "action": literal("sanitize", "verify"),
     "format": literal("garmin-bridge-derived-training-fit"),
     "format_version": literal(1),
-    "rules_version": literal("1.0.0"),
+    "rules_version": literal("1.0.0", "1.1.0"),
     "description": literal("去除显式位置的派生训练FIT"),
     "status": literal("verified"),
     "summary": obj(
@@ -483,9 +494,30 @@ def project_activity(value):
 
 
 def validate_streams(value):
-    fields = {key: nullable(numeric) for key in STREAM_UNITS}
+    from .fit_details import filter_message_context, valid_message
+
+    extended = type(value) is dict and "fit_fields_version" in value
+    units = STREAM_UNITS if extended else LEGACY_STREAM_UNITS
+    identity = value.get("include_identity", False) if type(value) is dict else False
+    fields = {key: nullable(numeric) for key in units}
     fields["timestamp"] = nullable(lambda x: iso_time(x, True))
     fields["balance_side"] = nullable(literal("right", "unknown"))
+    lap = {
+        "start": nullable(lambda x: iso_time(x, True)),
+        "end": nullable(lambda x: iso_time(x, True)),
+        "duration": nullable(numeric),
+        "distance": nullable(numeric),
+    }
+    extra = {}
+    if extended:
+        lap["fit"] = lambda x: valid_message(x, identity, {"lap"})
+        extra = {
+            "fit_fields_version": literal(FIT_FIELDS_VERSION),
+            "include_identity": lambda x: type(x) is bool,
+            "session": lambda x: valid_message(x, identity, {"session"}),
+            "events": sequence(lambda x: valid_message(x, identity, {"event"}), 100_000),
+            "messages": sequence(lambda x: valid_message(x, identity, AUXILIARY_MESSAGES), 100_000),
+        }
     check = obj(
         {
             "schema_version": literal(SCHEMA_VERSION),
@@ -493,7 +525,7 @@ def validate_streams(value):
             "provider": literal("garmin"),
             "source_activity_id": identifier,
             "source_digest": digest,
-            "units": obj({k: literal(v) for k, v in STREAM_UNITS.items()}),
+            "units": obj({k: literal(v) for k, v in units.items()}),
             "lap_units": obj(
                 {
                     "start": literal("UTC"),
@@ -503,17 +535,7 @@ def validate_streams(value):
                 }
             ),
             "records": sequence(obj(fields), 500_000),
-            "laps": sequence(
-                obj(
-                    {
-                        "start": nullable(lambda x: iso_time(x, True)),
-                        "end": nullable(lambda x: iso_time(x, True)),
-                        "duration": nullable(numeric),
-                        "distance": nullable(numeric),
-                    }
-                ),
-                10_000,
-            ),
+            "laps": sequence(obj(lap), 10_000),
             "timer_events": sequence(
                 obj(
                     {
@@ -525,9 +547,16 @@ def validate_streams(value):
                 ),
                 100_000,
             ),
+            **extra,
         }
     )
     if not check(value):
+        raise BridgeError("privacy_failed")
+    if (
+        extended
+        and filter_message_context(value["session"], value["laps"], value["messages"])
+        != value["messages"]
+    ):
         raise BridgeError("privacy_failed")
     return value
 

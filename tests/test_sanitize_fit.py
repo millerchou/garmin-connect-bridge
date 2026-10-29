@@ -118,6 +118,8 @@ def test_official_fixed_profile_and_candidate_audit():
     assert len(list(candidates())) == 152
     assert Profile["version"] == {"major": 21, "minor": 218, "patch": 0, "type": "Release"}
     bases = {
+        "string": 7,
+        "uint8z": 10,
         "enum": 0,
         "sint8": 1,
         "uint8": 2,
@@ -216,7 +218,7 @@ def test_presence_invalid_zero_array_order_bitfields_precision_and_redefinitions
         (42, 0x01020304, True),
         (43, 0xFFFFFFFF, True),
         (10, 0, False),
-        (13, 10, False),
+        (13, 10, True),
     ],
 )
 def test_event_data_is_context_specific(event, payload, kept):

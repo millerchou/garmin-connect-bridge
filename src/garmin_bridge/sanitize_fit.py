@@ -67,7 +67,7 @@ SUMMARY = obj({name: count for name in SUMMARY_NAMES})
 VALIDATIONS = obj({name: lambda x: x is True for name in VALIDATION_NAMES})
 COMMON = {
     "format_version": literal(FORMAT_VERSION),
-    "rules_version": literal(RULES_VERSION),
+    "rules_version": literal("1.0.0", RULES_VERSION),
     "description": literal(DESCRIPTION),
     "summary": SUMMARY,
     "validations": VALIDATIONS,
@@ -142,12 +142,12 @@ def paths(source, destination, data_root):
     return source, archive
 
 
-def prepare(original):
+def prepare(original, rules_version=RULES_VERSION):
     fit = extract_fit(original)
-    document = read_wire(fit)
-    selected, inventory = project(document)
+    document = read_wire(fit, rules_version)
+    selected, inventory = project(document, rules_version)
     derived = write_wire(selected)
-    validations = validate_derived(derived, selected)
+    validations = validate_derived(derived, selected, rules_version)
     fields = inventory["fields"]
     summary = {
         "input_messages": inventory["input_messages"],
@@ -160,7 +160,7 @@ def prepare(original):
     }
     report = {
         "format_version": FORMAT_VERSION,
-        "rules_version": RULES_VERSION,
+        "rules_version": rules_version,
         "description": DESCRIPTION,
         "status": "verified",
         "summary": summary,
@@ -171,7 +171,7 @@ def prepare(original):
     manifest = {
         "format": FORMAT,
         "format_version": FORMAT_VERSION,
-        "rules_version": RULES_VERSION,
+        "rules_version": rules_version,
         "profile_version": PROFILE_VERSION,
         "sdk_version": SDK_VERSION,
         "fitdecode_version": "0.11.0",
@@ -195,14 +195,14 @@ def prepare(original):
     }, summary
 
 
-def receipt(action, summary, *, archive_only=False):
+def receipt(action, summary, *, archive_only=False, rules_version=RULES_VERSION):
     # Only constants and bounded counts. Never expose names, paths, hashes or values.
     result = {
         "schema_version": SCHEMA_VERSION,
         "action": action,
         "format": FORMAT,
         "format_version": FORMAT_VERSION,
-        "rules_version": RULES_VERSION,
+        "rules_version": rules_version,
         "description": DESCRIPTION,
         "status": "verified",
         "summary": summary,
@@ -307,14 +307,14 @@ def verify_archive_only(directory, data_root=None):
         require(sha256(observed["derived.fit"]).hexdigest() == manifest["output_sha256"])
         require(sha256(observed["report.json"]).hexdigest() == manifest["report_sha256"])
         # Historical pass flags are format metadata, never verification evidence.
-        document = validate_archive_fit(observed["derived.fit"])
+        document = validate_archive_fit(observed["derived.fit"], manifest["rules_version"])
         summary = check_inventory(manifest, report, document)
         exact_members(archive)
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception:
         raise BridgeError("sanitize_verification") from None
-    return receipt("verify", summary, archive_only=True)
+    return receipt("verify", summary, archive_only=True, rules_version=manifest["rules_version"])
 
 
 def publish_directory(source: Path, destination: Path):
@@ -381,7 +381,17 @@ def verify_archive(source, directory, data_root=None):
         if not archive.root.is_dir() or {p.name for p in archive.root.iterdir()} != set(FILES):
             raise BridgeError("sanitize_verification")
         original = read_input(None, source)
-        expected, summary = prepare(original)
+        historical_manifest = strict_json(
+            archive.read_bytes(
+                "manifest.json",
+                limit=min(
+                    archive.path("manifest.json").stat().st_size, ARCHIVE_LIMITS["manifest.json"]
+                ),
+            )
+        )
+        require(MANIFEST(historical_manifest))
+        rules_version = historical_manifest["rules_version"]
+        expected, summary = prepare(original, rules_version)
         observed = {}
         for name in FILES:
             observed[name] = archive.read_bytes(name, limit=len(expected[name]))
@@ -389,10 +399,10 @@ def verify_archive(source, directory, data_root=None):
                 raise BridgeError("sanitize_verification")
         # Validate the actual stored FIT through every physical field and both
         # independent parsers, even if its manifest makes a validity claim.
-        selected, _ = project(read_wire(extract_fit(original)))
-        validate_derived(observed["derived.fit"], selected)
+        selected, _ = project(read_wire(extract_fit(original), rules_version), rules_version)
+        validate_derived(observed["derived.fit"], selected, rules_version)
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception:
         raise BridgeError("sanitize_verification") from None
-    return receipt("verify", summary)
+    return receipt("verify", summary, rules_version=rules_version)

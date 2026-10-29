@@ -1,35 +1,60 @@
-# Physical FIT policy 1.0.0
+# Physical FIT policy 1.1.0
 
 Reviewed against official Garmin FIT Python SDK/Profile **21.218.0**. This is a
 closed list of field numbers and exact wire base types; Profile recognition is
 not permission. All rows require one cycling session (sport 2). Scalar fields
-have exactly one element. Pair arrays have exactly two; zone arrays have 1–32.
+have exactly one element. Pair arrays have exactly two; zone arrays have 1–32,
+clock arrays 1–8, and approved label strings 1–65 bytes including padding.
 Original bytes, including invalid sentinels, are retained; scale/offset below
 describe the Profile and are **not** applied during transcription.
 
 Core candidates: **152**. Candidate lap 19:40 (`num_active_lengths`) is deferred:
 its swimming-length context is outside this cycling-only version. The other
 151 are eligible subject to type, size, context and reference checks.
+Policy `1.1.0` adds reviewed fields from the explicit normalized detail table in
+`fit_fields.py`; there are 318 physical field rules in total. New output uses
+`1.1.0`. Historical `1.0.0` archives remain verifiable in both modes using the
+original field table, event rules, removal reasons and timestamp-anchor rules;
+verification never silently applies broader permissions to an old manifest.
 
 ## Semantic and dependency review
 
 The eligible core fields describe timing, sport, distance, speed, altitude, ascent,
 work, calories, HR, cadence, power, temperature, breathing, pedalling dynamics,
 training estimates and subjective numeric workout ratings. None is a geographic
-coordinate, device/account identifier or free text. These remain private health
+coordinate, device/account identifier or arbitrary free text. The only additional
+strings are exact closed sport labels, described below. These remain private health
 and training data: retaining altitude, exact time and physiology is **not anonymity**.
 Training effect/load, normalized power, TSS, intensity factor, grit/flow and ratings
 remain Garmin/source-reported values, not independently verified measurements.
 
 The table below also records the individually reviewed additional fields:
 
-- `file_id 0:0` only: file type must be activity (4). Manufacturer, product, serial,
-  creation time, file number and product text are not needed to retain training
-  semantics and are removed. No identity or replacement device is invented.
+- `file_id 0:0-2,4`: activity file type (4), numeric manufacturer/product and
+  creation time. Serial number, file number and product text remain removed.
+  `file_creator 49:0-1` retains software/hardware versions. No identity or
+  replacement device is invented.
+- `device_info 23` retains only timestamp, file-local device index, numeric device
+  type/manufacturer/product, software/hardware version, operating time, battery
+  voltage/status/level, body-worn sensor position and source type. Serial numbers,
+  ANT identity/network parameters, product names and descriptors are excluded.
+  `device_aux_battery_info 375` retains timestamp, file-local device/battery indices,
+  voltage and status. These indices are not globally unique device identifiers.
+- `device_settings 2:0-2,4-5` retains historical clock context. `utc_offset` is a
+  system-clock correction, not a timezone offset. The transcriber copies physical
+  offsets; it does not infer a timezone or add derived local times.
+- `training_settings 13:31-33,153` retains historical distance/speed/time targets.
+  It does not import current account settings or infer training recommendations.
 - `sport 12:0-1` and session/lap sport fields provide cycling context. Exactly one
   session with sport 2 is required. A lap explicitly declaring another sport
   rejects the file; a separate non-cycling sport message is removed. Subtypes are
   a closed list in `CYCLING_SUBTYPES`, not arbitrary future enum values.
+- `sport 12:3` and `session 18:110` are the only permitted strings. Their entire
+  physical value, excluding zero padding, must be an exact label in `SPORT_LABELS`
+  in `fit_fields.py` (for example, `Cycling`). Custom labels, nonzero hidden suffixes
+  and arbitrary product/user text are removed as `explicit_private_field`.
+  Import's identity opt-in **never applies to this sanitizer**: serial numbers and
+  the entire `user_profile` message are always stripped from derived FIT archives.
 - `session 18:254,25,26`, `lap 19:254`: retain physical indices and counts. The
   index mask is `0x0fff`, with only the `0x8000` selected flag additionally allowed.
   Duplicate/reserved indices cannot be reference targets. A valid first-lap/count
@@ -65,23 +90,47 @@ The table below also records the individually reviewed additional fields:
   elements, 1–32 elements per field; arrays are never zipped together, relabelled,
   or assigned thresholds from another message. Missing boundaries/configuration
   remain missing. Inline thresholds/calculation enums are file-provided historical
-  context only. Speed/cadence-zone arrays are not approved in this version.
-- `event 21:0-1,4,253` provide a closed set of training-event types, event group and
-  timestamp. Events outside `EVENTS` are removed altogether. Valid event_type is
-  0–9; an invalid sentinel is retained but prevents payload retention. `event 21:3`
-  is retained only for timer (event 0: data 0/1/2 or invalid), rider position
-  (event 44: data 0–3 or invalid), or front/rear gear change (events 42/43: the
-  original four packed 8-bit gear components). No component-derived fields are
-  written. All other `data` contexts and all `data16` fields are removed/reported.
-  Course-point indices and opaque event payloads are never forwarded.
+  context only. Policy `1.1.0` also approves speed/cadence duration and boundary
+  arrays with the same 1–32 bound and ordering. The Profile spelling
+  `cadence_zone_high_bondary` is retained exactly; no boundary is reconstructed.
+- `event 21:0-1,4,253` retains documented headers from the closed `EVENT_NAMES`
+  table. Valid event_type is 0–9; an invalid sentinel is retained but prevents
+  payload retention. Data/data16 eligibility is shared with normalization via
+  `event_payload_allowed`: only documented timer, battery, virtual-pace, HR/speed/
+  cadence/power/duration alerts, equipment state, sport-point scores, gear changes,
+  rider position, communication timeout, auto-activity duration, dive and radar
+  payloads are eligible. Raw bytes/scales are unchanged. Course-point indices and
+  opaque/unknown contexts are removed. Packed 32-bit scores/gears/radar are never
+  accepted through truncated `data16`. Invalid physical sentinels stay invalid.
+  Gear fields 9–12 require a gear-change event and valid event_type; physically
+  absent components are never written. The normalizer may expose components of
+  the retained packed gear value in its separate JSON representation.
+- `split 312` and `split_summary 313` retain only the numeric timing, sport,
+  distance, speed, ascent/descent, HR, cadence, work/power, temperature and pedal
+  fields enumerated below. Every coordinate, start/end position, bounding box,
+  arbitrary text and unreviewed field is removed. Split identifiers are numeric
+  message indices/types only; no segment UUIDs or course identities are retained.
+- `record 20:47` adds combined pedal smoothness; `lap 19:24` adds lap trigger.
+  Session/lap cycling `total_strokes` is a decoded subfield of physical
+  `total_cycles`; the physical table uses the parent name/encoding. Some requested
+  session fields do not exist on laps in Profile 21.218.0: intensity factor,
+  training load peak, minimum enhanced respiration and sport profile name. No
+  unknown field numbers are assigned those meanings.
 
 Rules compare numeric message/field IDs, exact base type and byte-array shape
 before inspecting any context value. Unknown/developer fields are opaque input
 bytes; neither their value nor any developer-provided name is decoded or reported.
 The extra enum constraints in `ENUM_VALUES` reject newly introduced meanings
 without silently broadening approval. Invalid sentinels are not confused with 0.
-Personal profiles, device settings, sensor identity, segment/split messages,
-UUIDs and arbitrary text have no message-wide approval.
+Personal profiles, sensor identity, course/segment messages, UUIDs and arbitrary
+text have no approval. Device/split messages have only the individual permissions
+below, never message-wide pass-through. Normalized JSON keeps source estimates
+under `garmin_reported`; the derived FIT retains the original Profile encodings.
+The normalizer's complete permission table is `fit_fields.py`; the sanitizer also
+retains its previously approved training fields that normalization does not expose.
+Physical index/count validation can remove dangling references that a numeric
+source count alone cannot establish. The two representations are not lossless
+copies of one another.
 
 Explicit regressions include `lap 19:27-30`, `split 312:17-20`, and
 `segment_lap 142:65` (UUID), as well as record/session coordinates and bounding
@@ -108,6 +157,14 @@ payload bytes or guessing an earlier timestamp.
 | Message:field | Semantic name | Base type | Elements | Scale / offset | Scope |
 | --- | --- | --- | --- | --- | --- |
 | 0:0 | `type` | `enum` | 1 | 1 / 0 | additional context/training |
+| 0:1 | `manufacturer` | `uint16` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 0:2 | `product` | `uint16` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 0:4 | `time_created` | `uint32` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 2:0 | `active_time_zone` | `uint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 2:1 | `utc_offset` | `uint32` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 2:2 | `time_offset` | `uint32` | 1–8 | 1 / 0 | 1.1.0 additional non-location context |
+| 2:4 | `time_mode` | `enum` | 1–8 | 1 / 0 | 1.1.0 additional non-location context |
+| 2:5 | `time_zone_offset` | `sint8` | 1–8 | 4 / 0 | 1.1.0 additional non-location context |
 | 7:1 | `max_heart_rate` | `uint8` | 1 | 1 / 0 | core |
 | 7:2 | `threshold_heart_rate` | `uint8` | 1 | 1 / 0 | core |
 | 7:3 | `functional_threshold_power` | `uint16` | 1 | 1 / 0 | core |
@@ -119,6 +176,11 @@ payload bytes or guessing an earlier timestamp.
 | 9:254 | `message_index` | `uint16` | 1 | 1 / 0 | additional context/training |
 | 12:0 | `sport` | `enum` | 1 | 1 / 0 | additional context/training |
 | 12:1 | `sub_sport` | `enum` | 1 | 1 / 0 | additional context/training |
+| 12:3 | `name` | `string` | 1–65 | 1 / 0 | 1.1.0 additional non-location context |
+| 13:31 | `target_distance` | `uint32` | 1 | 100 / 0 | 1.1.0 additional non-location context |
+| 13:32 | `target_speed` | `uint16` | 1 | 1000 / 0 | 1.1.0 additional non-location context |
+| 13:33 | `target_time` | `uint32` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 13:153 | `precise_target_speed` | `uint32` | 1 | 1000000 / 0 | 1.1.0 additional non-location context |
 | 18:0 | `event` | `enum` | 1 | 1 / 0 | additional context/training |
 | 18:1 | `event_type` | `enum` | 1 | 1 / 0 | additional context/training |
 | 18:2 | `start_time` | `uint32` | 1 | 1 / 0 | core |
@@ -161,6 +223,7 @@ payload bytes or guessing an earlier timestamp.
 | 18:103 | `avg_left_pedal_smoothness` | `uint8` | 1 | 2 / 0 | core |
 | 18:104 | `avg_right_pedal_smoothness` | `uint8` | 1 | 2 / 0 | core |
 | 18:105 | `avg_combined_pedal_smoothness` | `uint8` | 1 | 2 / 0 | core |
+| 18:110 | `sport_profile_name` | `string` | 1–65 | 1 / 0 | 1.1.0 additional non-location context |
 | 18:112 | `time_standing` | `uint32` | 1 | 1000 / 0 | core |
 | 18:113 | `stand_count` | `uint16` | 1 | 1 / 0 | core |
 | 18:114 | `avg_left_pco` | `sint8` | 1 | 1 / 0 | core |
@@ -209,11 +272,11 @@ payload bytes or guessing an earlier timestamp.
 | 19:21 | `total_ascent` | `uint16` | 1 | 1 / 0 | core |
 | 19:22 | `total_descent` | `uint16` | 1 | 1 / 0 | core |
 | 19:23 | `intensity` | `enum` | 1 | 1 / 0 | core |
+| 19:24 | `lap_trigger` | `enum` | 1 | 1 / 0 | 1.1.0 additional non-location context |
 | 19:25 | `sport` | `enum` | 1 | 1 / 0 | core |
 | 19:33 | `normalized_power` | `uint16` | 1 | 1 / 0 | core |
 | 19:34 | `left_right_balance` | `uint16` | 1 | 1 / 0 | core |
 | 19:39 | `sub_sport` | `enum` | 1 | 1 / 0 | core |
-| 19:40 | `num_active_lengths` | `uint16` | 1 | 1 / 0 | deferred: length_context |
 | 19:41 | `total_work` | `uint32` | 1 | 1 / 0 | core |
 | 19:50 | `avg_temperature` | `sint8` | 1 | 1 / 0 | core |
 | 19:51 | `max_temperature` | `sint8` | 1 | 1 / 0 | core |
@@ -261,6 +324,7 @@ payload bytes or guessing an earlier timestamp.
 | 20:44 | `right_torque_effectiveness` | `uint8` | 1 | 2 / 0 | core |
 | 20:45 | `left_pedal_smoothness` | `uint8` | 1 | 2 / 0 | core |
 | 20:46 | `right_pedal_smoothness` | `uint8` | 1 | 2 / 0 | core |
+| 20:47 | `combined_pedal_smoothness` | `uint8` | 1 | 2 / 0 | 1.1.0 additional non-location context |
 | 20:53 | `fractional_cadence` | `uint8` | 1 | 128 / 0 | core |
 | 20:69 | `left_power_phase` | `uint8` | 2 | 0.7111111 / 0 | additional context/training |
 | 20:70 | `left_power_phase_peak` | `uint8` | 2 | 0.7111111 / 0 | additional context/training |
@@ -272,9 +336,27 @@ payload bytes or guessing an earlier timestamp.
 | 20:253 | `timestamp` | `uint32` | 1 | 1 / 0 | core |
 | 21:0 | `event` | `enum` | 1 | 1 / 0 | core |
 | 21:1 | `event_type` | `enum` | 1 | 1 / 0 | core |
+| 21:2 | `data16` | `uint16` | 1 | 1 / 0 | 1.1.0 additional non-location context |
 | 21:3 | `data` | `uint32` | 1 | 1 / 0 | additional context/training |
 | 21:4 | `event_group` | `uint8` | 1 | 1 / 0 | additional context/training |
+| 21:9 | `front_gear_num` | `uint8z` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 21:10 | `front_gear` | `uint8z` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 21:11 | `rear_gear_num` | `uint8z` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 21:12 | `rear_gear` | `uint8z` | 1 | 1 / 0 | 1.1.0 additional non-location context |
 | 21:253 | `timestamp` | `uint32` | 1 | 1 / 0 | core |
+| 23:0 | `device_index` | `uint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 23:1 | `device_type` | `uint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 23:2 | `manufacturer` | `uint16` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 23:4 | `product` | `uint16` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 23:5 | `software_version` | `uint16` | 1 | 100 / 0 | 1.1.0 additional non-location context |
+| 23:6 | `hardware_version` | `uint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 23:7 | `cum_operating_time` | `uint32` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 23:10 | `battery_voltage` | `uint16` | 1 | 256 / 0 | 1.1.0 additional non-location context |
+| 23:11 | `battery_status` | `uint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 23:18 | `sensor_position` | `enum` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 23:25 | `source_type` | `enum` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 23:32 | `battery_level` | `uint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 23:253 | `timestamp` | `uint32` | 1 | 1 / 0 | 1.1.0 additional non-location context |
 | 34:0 | `total_timer_time` | `uint32` | 1 | 1000 / 0 | additional context/training |
 | 34:1 | `num_sessions` | `uint16` | 1 | 1 / 0 | additional context/training |
 | 34:2 | `type` | `enum` | 1 | 1 / 0 | additional context/training |
@@ -283,11 +365,17 @@ payload bytes or guessing an earlier timestamp.
 | 34:5 | `local_timestamp` | `uint32` | 1 | 1 / 0 | additional context/training |
 | 34:6 | `event_group` | `uint8` | 1 | 1 / 0 | additional context/training |
 | 34:253 | `timestamp` | `uint32` | 1 | 1 / 0 | additional context/training |
+| 49:0 | `software_version` | `uint16` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 49:1 | `hardware_version` | `uint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
 | 216:0 | `reference_mesg` | `uint16` | 1 | 1 / 0 | core |
 | 216:1 | `reference_index` | `uint16` | 1 | 1 / 0 | core |
 | 216:2 | `time_in_hr_zone` | `uint32` | 1–32 | 1000 / 0 | core |
+| 216:3 | `time_in_speed_zone` | `uint32` | 1–32 | 1000 / 0 | 1.1.0 additional non-location context |
+| 216:4 | `time_in_cadence_zone` | `uint32` | 1–32 | 1000 / 0 | 1.1.0 additional non-location context |
 | 216:5 | `time_in_power_zone` | `uint32` | 1–32 | 1000 / 0 | core |
 | 216:6 | `hr_zone_high_boundary` | `uint8` | 1–32 | 1 / 0 | core |
+| 216:7 | `speed_zone_high_boundary` | `uint16` | 1–32 | 1000 / 0 | 1.1.0 additional non-location context |
+| 216:8 | `cadence_zone_high_bondary` | `uint8` | 1–32 | 1 / 0 | 1.1.0 additional non-location context |
 | 216:9 | `power_zone_high_boundary` | `uint16` | 1–32 | 1 / 0 | core |
 | 216:10 | `hr_calc_type` | `enum` | 1 | 1 / 0 | core |
 | 216:11 | `max_heart_rate` | `uint8` | 1 | 1 / 0 | core |
@@ -296,3 +384,95 @@ payload bytes or guessing an earlier timestamp.
 | 216:14 | `pwr_calc_type` | `enum` | 1 | 1 / 0 | core |
 | 216:15 | `functional_threshold_power` | `uint16` | 1 | 1 / 0 | core |
 | 216:253 | `timestamp` | `uint32` | 1 | 1 / 0 | core |
+| 312:0 | `split_type` | `enum` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:1 | `total_elapsed_time` | `uint32` | 1 | 1000 / 0 | 1.1.0 additional non-location context |
+| 312:2 | `total_timer_time` | `uint32` | 1 | 1000 / 0 | 1.1.0 additional non-location context |
+| 312:3 | `total_distance` | `uint32` | 1 | 100 / 0 | 1.1.0 additional non-location context |
+| 312:4 | `avg_speed` | `uint32` | 1 | 1000 / 0 | 1.1.0 additional non-location context |
+| 312:9 | `start_time` | `uint32` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:11 | `sport` | `enum` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:12 | `sub_sport` | `enum` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:13 | `total_ascent` | `uint16` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:14 | `total_descent` | `uint16` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:15 | `avg_heart_rate` | `uint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:16 | `max_heart_rate` | `uint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:25 | `max_speed` | `uint32` | 1 | 1000 / 0 | 1.1.0 additional non-location context |
+| 312:26 | `avg_vert_speed` | `sint32` | 1 | 1000 / 0 | 1.1.0 additional non-location context |
+| 312:27 | `end_time` | `uint32` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:28 | `total_calories` | `uint32` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:29 | `avg_cadence` | `uint16` | 1 | 128 / 0 | 1.1.0 additional non-location context |
+| 312:30 | `max_cadence` | `uint16` | 1 | 128 / 0 | 1.1.0 additional non-location context |
+| 312:31 | `total_cycles` | `uint32` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:32 | `avg_temperature` | `sint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:33 | `max_temperature` | `sint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:34 | `min_temperature` | `sint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:40 | `avg_power` | `uint16` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:41 | `max_power` | `uint16` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:42 | `normalized_power` | `uint16` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:43 | `left_right_balance` | `uint16` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:44 | `time_standing` | `uint32` | 1 | 1000 / 0 | 1.1.0 additional non-location context |
+| 312:45 | `avg_left_pco` | `sint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:46 | `avg_right_pco` | `sint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:47 | `avg_left_power_phase` | `uint8` | 2 | 0.7111111 / 0 | 1.1.0 additional non-location context |
+| 312:48 | `avg_left_power_phase_peak` | `uint8` | 2 | 0.7111111 / 0 | 1.1.0 additional non-location context |
+| 312:49 | `avg_right_power_phase` | `uint8` | 2 | 0.7111111 / 0 | 1.1.0 additional non-location context |
+| 312:50 | `avg_right_power_phase_peak` | `uint8` | 2 | 0.7111111 / 0 | 1.1.0 additional non-location context |
+| 312:51 | `avg_power_position` | `uint16` | 2 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:52 | `max_power_position` | `uint16` | 2 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:53 | `avg_left_torque_effectiveness` | `uint8` | 1 | 2 / 0 | 1.1.0 additional non-location context |
+| 312:54 | `avg_right_torque_effectiveness` | `uint8` | 1 | 2 / 0 | 1.1.0 additional non-location context |
+| 312:55 | `avg_left_pedal_smoothness` | `uint8` | 1 | 2 / 0 | 1.1.0 additional non-location context |
+| 312:56 | `avg_right_pedal_smoothness` | `uint8` | 1 | 2 / 0 | 1.1.0 additional non-location context |
+| 312:57 | `avg_combined_pedal_smoothness` | `uint8` | 1 | 2 / 0 | 1.1.0 additional non-location context |
+| 312:67 | `first_lap_index` | `uint16` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:68 | `num_laps` | `uint16` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 312:74 | `start_elevation` | `uint32` | 1 | 5 / 500 | 1.1.0 additional non-location context |
+| 312:99 | `avg_vam` | `uint16` | 1 | 1000 / 0 | 1.1.0 additional non-location context |
+| 313:0 | `split_type` | `enum` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:1 | `sport` | `enum` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:2 | `sub_sport` | `enum` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:3 | `num_splits` | `uint16` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:4 | `total_timer_time` | `uint32` | 1 | 1000 / 0 | 1.1.0 additional non-location context |
+| 313:5 | `total_distance` | `uint32` | 1 | 100 / 0 | 1.1.0 additional non-location context |
+| 313:6 | `avg_speed` | `uint32` | 1 | 1000 / 0 | 1.1.0 additional non-location context |
+| 313:7 | `max_speed` | `uint32` | 1 | 1000 / 0 | 1.1.0 additional non-location context |
+| 313:8 | `total_ascent` | `uint16` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:9 | `total_descent` | `uint16` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:10 | `avg_heart_rate` | `uint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:11 | `max_heart_rate` | `uint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:12 | `avg_vert_speed` | `sint32` | 1 | 1000 / 0 | 1.1.0 additional non-location context |
+| 313:13 | `total_calories` | `uint32` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:14 | `avg_cadence` | `uint16` | 1 | 128 / 0 | 1.1.0 additional non-location context |
+| 313:15 | `max_cadence` | `uint16` | 1 | 128 / 0 | 1.1.0 additional non-location context |
+| 313:16 | `total_cycles` | `uint32` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:17 | `avg_temperature` | `sint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:18 | `max_temperature` | `sint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:19 | `min_temperature` | `sint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:25 | `avg_power` | `uint16` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:26 | `max_power` | `uint16` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:27 | `normalized_power` | `uint16` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:28 | `left_right_balance` | `uint16` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:29 | `time_standing` | `uint32` | 1 | 1000 / 0 | 1.1.0 additional non-location context |
+| 313:30 | `avg_left_pco` | `sint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:31 | `avg_right_pco` | `sint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:32 | `avg_left_power_phase` | `uint8` | 2 | 0.7111111 / 0 | 1.1.0 additional non-location context |
+| 313:33 | `avg_left_power_phase_peak` | `uint8` | 2 | 0.7111111 / 0 | 1.1.0 additional non-location context |
+| 313:34 | `avg_right_power_phase` | `uint8` | 2 | 0.7111111 / 0 | 1.1.0 additional non-location context |
+| 313:35 | `avg_right_power_phase_peak` | `uint8` | 2 | 0.7111111 / 0 | 1.1.0 additional non-location context |
+| 313:36 | `avg_power_position` | `uint16` | 2 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:37 | `max_power_position` | `uint16` | 2 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:38 | `avg_left_torque_effectiveness` | `uint8` | 1 | 2 / 0 | 1.1.0 additional non-location context |
+| 313:39 | `avg_right_torque_effectiveness` | `uint8` | 1 | 2 / 0 | 1.1.0 additional non-location context |
+| 313:40 | `avg_left_pedal_smoothness` | `uint8` | 1 | 2 / 0 | 1.1.0 additional non-location context |
+| 313:41 | `avg_right_pedal_smoothness` | `uint8` | 1 | 2 / 0 | 1.1.0 additional non-location context |
+| 313:42 | `avg_combined_pedal_smoothness` | `uint8` | 1 | 2 / 0 | 1.1.0 additional non-location context |
+| 313:79 | `start_time` | `uint32` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:253 | `timestamp` | `uint32` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 313:254 | `message_index` | `uint16` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 375:0 | `device_index` | `uint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 375:1 | `battery_voltage` | `uint16` | 1 | 256 / 0 | 1.1.0 additional non-location context |
+| 375:2 | `battery_status` | `uint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 375:3 | `battery_identifier` | `uint8` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+| 375:253 | `timestamp` | `uint32` | 1 | 1 / 0 | 1.1.0 additional non-location context |
+
+Deferred core candidate: `lap 19:40 num_active_lengths` (`uint16`, scalar, scale 1 / offset 0), reason `length_context`.
