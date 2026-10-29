@@ -21,6 +21,8 @@ from .contract import (
     timezone_name,
 )
 from .errors import BridgeError
+from .fit_details import fill_local_time, filter_message_context, project_message
+from .fit_fields import AUXILIARY_MESSAGES, FIT_FIELDS_VERSION, RECORD_UNITS
 from .storage import canonical
 
 MAX_ARCHIVE = 64 * 1024 * 1024
@@ -80,8 +82,8 @@ REPORTED_FIELDS = {
     "threshold_power": ("threshold_power", "functionalThresholdPower"),
 }
 LOCAL_FLAGS = frozenset({"local_file_import", "missing_api_metadata", "unverified_activity_id"})
-# Select by message BEFORE accessing any field value. In particular file_id,
-# device_info, developer descriptions and all unknown messages have no fields.
+# Legacy summary/record projection. Additional physical FIT detail has its own
+# reviewed, typed allowlist in fit_fields.py, selected before value access.
 MESSAGE_FIELDS = {
     "record": frozenset(
         {
@@ -262,7 +264,17 @@ def _prefer(values, first, second):
     return value if value is not None else values.get(second)
 
 
-def normalize(fit: bytes, meta: dict, acquired_at: str, source_digest: str, *, local_import=False):
+def normalize(
+    fit: bytes,
+    meta: dict,
+    acquired_at: str,
+    source_digest: str,
+    *,
+    local_import=False,
+    include_identity=False,
+):
+    if type(include_identity) is not bool:
+        raise BridgeError("usage")
     flags = {
         "non_location_projection",
         "unreviewed_fields_omitted",
@@ -273,6 +285,8 @@ def normalize(fit: bytes, meta: dict, acquired_at: str, source_digest: str, *, l
             raise BridgeError("import_conflict")
         flags.update(LOCAL_FLAGS)
     records, laps, events, sessions = [], [], [], []
+    detailed_events, messages = [], []
+    session_detail = None
     device_count = 0
     cadence_integers = []
 
@@ -291,6 +305,7 @@ def normalize(fit: bytes, meta: dict, acquired_at: str, source_digest: str, *, l
                 if not isinstance(frame, fitdecode.FitDataMessage):
                     continue
                 values = _values(frame)
+                detail = project_message(frame, include_identity)
                 if frame.name == "record":
                     balance = values.get("left_right_balance")
                     balance_value = (balance & 0x7F) if type(balance) is int else None
@@ -318,6 +333,12 @@ def normalize(fit: bytes, meta: dict, acquired_at: str, source_digest: str, *, l
                         if balance_value is not None
                         else None,
                     }
+                    row.update(
+                        {
+                            key: detail["fields"].get(key, {}).get("value") if detail else None
+                            for key in RECORD_UNITS
+                        }
+                    )
                     records.append(row)
                     if len(records) > MAX_RECORDS:
                         raise BridgeError("invalid_fit")
@@ -325,6 +346,7 @@ def normalize(fit: bytes, meta: dict, acquired_at: str, source_digest: str, *, l
                     if values.get("sport") != "cycling" or sessions:
                         raise BridgeError("invalid_fit")
                     sessions.append(values)
+                    session_detail = detail
                 elif frame.name == "lap":
                     laps.append(
                         {
@@ -332,6 +354,8 @@ def normalize(fit: bytes, meta: dict, acquired_at: str, source_digest: str, *, l
                             "end": timestamp(values.get("timestamp"), utc=True),
                             "duration": clean(values.get("total_timer_time")),
                             "distance": clean(values.get("total_distance")),
+                            "fit": detail
+                            or {"message": "lap", "fields": {}, "garmin_reported": {}},
                         }
                     )
                     if len(laps) > 10_000:
@@ -347,8 +371,16 @@ def normalize(fit: bytes, meta: dict, acquired_at: str, source_digest: str, *, l
                         )
                     if len(events) > 100_000:
                         raise BridgeError("invalid_fit")
-                elif frame.name == "device_info":
-                    device_count += 1  # No serial numbers, device names or IDs.
+                if frame.name == "event" and detail:
+                    detailed_events.append(detail)
+                    if len(detailed_events) > 100_000:
+                        raise BridgeError("invalid_fit")
+                if frame.name in AUXILIARY_MESSAGES and detail:
+                    messages.append(detail)
+                    if len(messages) > 100_000:
+                        raise BridgeError("invalid_fit")
+                if frame.name == "device_info":
+                    device_count += 1
     except BridgeError:
         raise
     except Exception:
@@ -356,6 +388,7 @@ def normalize(fit: bytes, meta: dict, acquired_at: str, source_digest: str, *, l
     if not sessions:
         raise BridgeError("invalid_fit")
     session = sessions[0]
+    messages = filter_message_context(session_detail, laps, messages)
     for key in ("avg_speed", "max_speed"):
         session["enhanced_" + key] = _prefer(session, "enhanced_" + key, key)
 
@@ -375,6 +408,7 @@ def normalize(fit: bytes, meta: dict, acquired_at: str, source_digest: str, *, l
 
     activity_time = dict(meta["activity_time"])
     activity_time["utc"] = activity_time["utc"] or timestamp(session.get("start_time"), utc=True)
+    fill_local_time(activity_time, messages)
     if activity_time["timezone"] is None:
         flags.add("missing_timezone")
     if activity_time["utc"] is None:
@@ -405,6 +439,11 @@ def normalize(fit: bytes, meta: dict, acquired_at: str, source_digest: str, *, l
         "records": records,
         "laps": laps,
         "timer_events": events,
+        "fit_fields_version": FIT_FIELDS_VERSION,
+        "include_identity": include_identity,
+        "session": session_detail,
+        "events": detailed_events,
+        "messages": messages,
     }
     summary = {
         "schema_version": SCHEMA_VERSION,
@@ -427,7 +466,7 @@ def normalize(fit: bytes, meta: dict, acquired_at: str, source_digest: str, *, l
             "input": "local_fit_file" if local_import else "garmin_original_fit",
             "parser": "fitdecode/0.11.0",
             "device_messages": device_count,
-            "unique_identifiers_retained": "none",
+            "unique_identifiers_retained": "explicit_opt_in" if include_identity else "none",
         },
     }
     summary["quality_flags"] = sorted(
@@ -478,10 +517,12 @@ def _cadence_quality(metrics, session, records, integers):
     return flags
 
 
-def input_digest(meta, fit_hash, *, local_import=False):
+def input_digest(meta, fit_hash, *, local_import=False, include_identity=False):
     value = {"provider": "garmin", "metadata": meta, "fit_sha256": fit_hash}
     if local_import:
         # Do not let a later API acquisition reuse an unverified local result,
         # even when the API happens to supply no optional metadata either.
         value["input"] = "local_fit_file"
+    if include_identity:
+        value["include_fit_identity"] = True
     return sha256(canonical(value))

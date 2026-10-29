@@ -78,6 +78,11 @@ def build_parser():
         required=True,
         help="Explicit Garmin activity ID from the website",
     )
+    importing.add_argument(
+        "--include-fit-identity",
+        action="store_true",
+        help="Explicitly retain reviewed user profile and serial fields in private artifacts",
+    )
     cleaning = commands.add_parser(
         "sanitize-fit",
         help="Offline derived training FIT archive; explicit location/identity removal",
@@ -202,6 +207,11 @@ def build_parser():
     history.add_argument("id")
     history.add_argument("--offset", type=bounded_int(0, 10**9), default=0)
     history.add_argument("--limit", type=bounded_int(1, 50), default=20)
+    sync.add_argument(
+        "--include-fit-identity",
+        action="store_true",
+        help="Explicitly retain reviewed user profile and serial fields in private artifacts",
+    )
     return parser
 
 
@@ -364,7 +374,9 @@ def execute(args):
         if args.command == "import-fit":
             from .import_fit import import_file
 
-            return import_file(store, args.file, args.activity_id)
+            return import_file(
+                store, args.file, args.activity_id, include_identity=args.include_fit_identity
+            )
         if args.command == "auth":
             verified = (
                 GarminSource(store).verified_at
@@ -401,6 +413,7 @@ def execute(args):
                 lookback=args.lookback_days,
                 new_scan=args.new_scan,
                 max_pages=args.max_pages,
+                include_identity=args.include_fit_identity,
             )
         return query(store, args)
 

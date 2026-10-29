@@ -72,7 +72,7 @@ ITEM = c.obj(
         "outcome": c.nullable(c.literal("updated", "unchanged")),
     }
 )
-JOB = c.obj(
+LEGACY_JOB = c.obj(
     {
         "version": c.literal(1),
         "schema_version": c.literal(c.SCHEMA_VERSION),
@@ -100,6 +100,20 @@ JOB = c.obj(
 )
 
 
+def JOB(value):
+    if type(value) is not dict:
+        return False
+    if "include_fit_identity" not in value:
+        return LEGACY_JOB(value)
+    return BOOLEAN(value["include_fit_identity"]) and LEGACY_JOB(
+        {k: v for k, v in value.items() if k != "include_fit_identity"}
+    )
+
+
+def identity_enabled(summary):
+    return summary["provenance"]["unique_identifiers_retained"] == "explicit_opt_in"
+
+
 def require(condition):
     if not condition:
         raise BridgeError("privacy_failed")
@@ -116,15 +130,20 @@ def validate_summary_provenance(summary, metadata_digest=None):
         if metadata_digest is not None:
             require(metadata_digest == sha256(canonical(meta)))
         require(
-            summary["source_digest"] == input_digest(meta, summary["fit_sha256"], local_import=True)
-        )
-        require(LOCAL_FLAGS <= set(summary["quality_flags"]))
-        require(
-            all(
-                summary["activity_time"][k] is None
-                for k in ("local", "timezone", "utc_offset_seconds")
+            summary["source_digest"]
+            == input_digest(
+                meta,
+                summary["fit_sha256"],
+                local_import=True,
+                include_identity=identity_enabled(summary),
             )
         )
+        require(LOCAL_FLAGS <= set(summary["quality_flags"]))
+        require(summary["activity_time"]["timezone"] is None)
+        if tuple(map(int, summary["normalizer_version"].split("."))) < (1, 3, 0):
+            require(
+                all(summary["activity_time"][k] is None for k in ("local", "utc_offset_seconds"))
+            )
         require(
             all(
                 q["source"] != "garmin_activity"
@@ -206,7 +225,11 @@ def validate_pair(state, job):
             require(entry["metadata_digest"] == sha256(canonical(item["metadata"])))
             require(
                 entry["summary"]["source_digest"]
-                == input_digest(item["metadata"], entry["summary"]["fit_sha256"])
+                == input_digest(
+                    item["metadata"],
+                    entry["summary"]["fit_sha256"],
+                    include_identity=identity_enabled(entry["summary"]),
+                )
             )
     if job["status"] == "complete":
         require(state["last_success_at"] is not None and state["last_failure"] is None)

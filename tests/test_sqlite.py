@@ -385,7 +385,7 @@ def test_backup_cli_uses_sqlite_and_preserves_revisions(database, tmp_path, caps
     assert cli.main(["--data-dir", str(target), "list"]) == 0
     listing = json.loads(capsys.readouterr().out)
     assert listing["storage_version"] == 1
-    assert listing["activities"][0]["normalizer_version"] == "1.2.1"
+    assert listing["activities"][0]["normalizer_version"] == "1.3.0"
     assert listing["activities"][0]["coverage"]["power"]["missing"] == 1
 
 

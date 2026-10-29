@@ -114,8 +114,12 @@ class Runner:
         max_passes,
         attempts,
         sleep,
+        include_identity,
     ):
+        if type(include_identity) is not bool:
+            raise BridgeError("usage")
         self.store, self.source_factory = store, source_factory
+        self.include_identity = include_identity
         self.state = store.state()
         self.max_pages, self.max_passes, self.attempts = max_pages, max_passes, attempts
         self.sleep = sleep
@@ -154,6 +158,7 @@ class Runner:
                 "version": 1,
                 "schema_version": SCHEMA_VERSION,
                 "normalizer_version": parser.NORMALIZER_VERSION,
+                "include_fit_identity": include_identity,
                 "id": uuid.uuid4().hex,
                 "mode": mode,
                 "filter": interval,
@@ -177,7 +182,9 @@ class Runner:
         if (
             self.job["normalizer_version"] != parser.NORMALIZER_VERSION
             or self.job["schema_version"] != SCHEMA_VERSION
+            or self.job.get("include_fit_identity", False) != include_identity
         ):
+            self.job["include_fit_identity"] = include_identity
             self.job["normalizer_version"] = parser.NORMALIZER_VERSION
             self.job["schema_version"] = SCHEMA_VERSION
             self.job["enumeration_complete"] = False
@@ -295,6 +302,11 @@ class Runner:
             and previous.get("metadata_digest") == parser.sha256(canonical(meta))
             and previous["summary"]["normalizer_version"] == parser.NORMALIZER_VERSION
             and previous["summary"]["schema_version"] == SCHEMA_VERSION
+            and (
+                previous["summary"]["provenance"]["unique_identifiers_retained"]
+                == "explicit_opt_in"
+            )
+            == self.include_identity
             and artifacts_intact(self.store, previous)
         )
 
@@ -318,6 +330,7 @@ class Runner:
                         item["metadata"],
                         self.state,
                         cutoff_at=self.job["cutoff_at"],
+                        include_identity=self.include_identity,
                     ),
                     item,
                 )
@@ -458,6 +471,7 @@ def run_job(
     max_passes=3,
     attempts=3,
     sleep=None,
+    include_identity=False,
 ):
     return Runner(
         store,
@@ -471,4 +485,5 @@ def run_job(
         max_passes,
         attempts,
         sleep or time.sleep,
+        include_identity,
     ).run()

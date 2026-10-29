@@ -101,22 +101,33 @@ def artifacts_intact(store, entry):
     return True
 
 
-def acquire(store, source, meta, state, cutoff_at=None):
+def acquire(store, source, meta, state, cutoff_at=None, *, include_identity=False):
     return publish_original(
-        store, source.download(meta["source_activity_id"]), meta, state, cutoff_at
+        store,
+        source.download(meta["source_activity_id"]),
+        meta,
+        state,
+        cutoff_at,
+        include_identity=include_identity,
     )
 
 
-def publish_original(store, original, meta, state, cutoff_at=None, *, local_import=False):
+def publish_original(
+    store, original, meta, state, cutoff_at=None, *, local_import=False, include_identity=False
+):
     """Shared validation/publication; caller holds the exclusive store lock.
 
     Only the activities map changes here. API scan progress belongs to jobs.py.
     An offline input cannot replace an API-derived result with missing metadata.
     """
+    if type(include_identity) is not bool:
+        raise BridgeError("usage")
     source_id = meta["source_activity_id"]
     fit = parser.extract_fit(original)
     fit_hash = parser.sha256(fit)
-    digest = parser.input_digest(meta, fit_hash, local_import=local_import)
+    digest = parser.input_digest(
+        meta, fit_hash, local_import=local_import, include_identity=include_identity
+    )
     previous = state["activities"].get(source_id)
     if previous:
         summary = project_activity(previous["summary"])
@@ -158,7 +169,7 @@ def publish_original(store, original, meta, state, cutoff_at=None, *, local_impo
         else None
     )
     summary, streams = cached or parser.normalize(
-        fit, meta, now(), digest, local_import=local_import
+        fit, meta, now(), digest, local_import=local_import, include_identity=include_identity
     )
     validate_streams(streams)
     if (

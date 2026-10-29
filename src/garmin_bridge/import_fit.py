@@ -24,7 +24,7 @@ def read_input(store, filename):
     return original
 
 
-def import_file(store, filename, source_id):
+def import_file(store, filename, source_id, *, include_identity=False):
     """Caller holds the exclusive lock. Never checkpoint/resolve an API job."""
     meta = normalize.local_metadata(source_id)
     state = store.state()
@@ -34,7 +34,14 @@ def import_file(store, filename, source_id):
     if item and (item["state"] == "completed" or item["reason"] == "outside_recheck_window"):
         if not previous or previous["summary"]["provenance"]["input"] != "garmin_original_fit":
             raise BridgeError("import_conflict")
-    changed = publish_original(store, read_input(store, filename), meta, state, local_import=True)
+    changed = publish_original(
+        store,
+        read_input(store, filename),
+        meta,
+        state,
+        local_import=True,
+        include_identity=include_identity,
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "status": ("updated" if previous else "created") if changed else "unchanged",

@@ -12,12 +12,12 @@ import struct
 from fitdecode.utils import compute_crc
 
 from .errors import BridgeError
-from .fit_rules import RULES
+from .fit_rules import RULE_VERSIONS, RULES_VERSION
 from .normalize import MAX_FIT
 
 MAX_MESSAGES = 500_000
 MAX_FIELDS = 2_000_000
-WIDTHS = {0: 1, 1: 1, 2: 1, 0x83: 2, 0x84: 2, 0x85: 4, 0x86: 4, 0x88: 4}
+WIDTHS = {0: 1, 1: 1, 2: 1, 7: 1, 10: 1, 0x83: 2, 0x84: 2, 0x85: 4, 0x86: 4, 0x88: 4}
 
 
 @dataclass(frozen=True, repr=False)
@@ -49,7 +49,7 @@ def invalid():
     raise BridgeError("invalid_fit")
 
 
-def read_wire(data: bytes) -> Document:
+def read_wire(data: bytes, rules_version=RULES_VERSION) -> Document:
     """Consume exactly one file, including every unused/redefined definition."""
     if not 14 <= len(data) <= MAX_FIT:
         invalid()
@@ -135,7 +135,10 @@ def read_wire(data: bytes) -> Document:
                     if f.developer is None and f.number == 253:
                         # Unknown payloads must not enter the approved output
                         # indirectly as an anchor for later compressed records.
-                        if 253 not in RULES.get(definition.number, {}) or (f.base, f.size) != (
+                        if 253 not in RULE_VERSIONS[rules_version].get(definition.number, {}) or (
+                            f.base,
+                            f.size,
+                        ) != (
                             0x86,
                             4,
                         ):

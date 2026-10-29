@@ -20,6 +20,25 @@ from .storage import Store, canonical, check_private
 
 DATABASE = "activities.sqlite"
 STORAGE_VERSION = 1
+# The physical schema already stores typed ordered JSON rows. New detail kinds
+# require no ALTER TABLE or rewriting of immutable historical revisions.
+ARRAY_LIMITS = {
+    "records": 500_000,
+    "laps": 10_000,
+    "timer_events": 100_000,
+    "events": 100_000,
+    "messages": 100_000,
+}
+
+
+def stream_arrays(value):
+    return (
+        tuple(ARRAY_LIMITS)
+        if "fit_fields_version" in value
+        else ("records", "laps", "timer_events")
+    )
+
+
 DDL = (
     "CREATE TABLE documents (name TEXT PRIMARY KEY, payload BLOB NOT NULL) WITHOUT ROWID",
     "CREATE TABLE samples (name TEXT NOT NULL, kind TEXT NOT NULL, ordinal INTEGER NOT NULL, payload BLOB NOT NULL, PRIMARY KEY(name,kind,ordinal)) WITHOUT ROWID",
@@ -253,17 +272,23 @@ class SQLiteStore(Store):
                 return None
             value = decode(row[0])
             if kind == "streams":
-                require(not ({"records", "laps", "timer_events"} & value.keys()))
-                for array in ("records", "laps", "timer_events"):
+                require(not (ARRAY_LIMITS.keys() & value.keys()))
+                arrays = stream_arrays(value)
+                require(
+                    all(
+                        row[0] in arrays
+                        for row in db.execute(
+                            "SELECT DISTINCT kind FROM samples WHERE name=?", (relative,)
+                        )
+                    )
+                )
+                for array in arrays:
                     count, size = db.execute(
                         "SELECT count(*),max(length(payload)) FROM samples WHERE name=? AND kind=?",
                         (relative, array),
                     ).fetchone()
-                    require(
-                        count
-                        <= {"records": 500_000, "laps": 10_000, "timer_events": 100_000}[array]
-                    )
-                    require(size is None or size <= 4096)
+                    require(count <= ARRAY_LIMITS[array])
+                    require(size is None or size <= 32_768)
                     rows = db.execute(
                         "SELECT ordinal,payload FROM samples WHERE name=? AND kind=? ORDER BY ordinal",
                         (relative, array),
@@ -287,10 +312,8 @@ class SQLiteStore(Store):
                     require(self.read_bytes(relative) == content)
                     return
             if kind == "streams":
-                metadata = {
-                    k: v for k, v in value.items() if k not in {"records", "laps", "timer_events"}
-                }
-                for array in ("records", "laps", "timer_events"):
+                metadata = {k: v for k, v in value.items() if k not in ARRAY_LIMITS}
+                for array in stream_arrays(value):
                     db.executemany(
                         "INSERT INTO samples VALUES (?,?,?,?)",
                         (

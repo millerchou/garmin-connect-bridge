@@ -15,7 +15,14 @@ from .jobs import gaps
 from .normalize import sha256
 from .persistence import require
 from .sanitize_fit import publish_directory
-from .sqlite_store import DATABASE, STORAGE_VERSION, SQLiteStore, validate_document
+from .sqlite_store import (
+    DATABASE,
+    STORAGE_VERSION,
+    SQLiteStore,
+    validate_document,
+    ARRAY_LIMITS,
+    stream_arrays,
+)
 from .segments import ALGORITHM, ALGORITHMS
 from .storage import Store, canonical, check_private
 
@@ -58,7 +65,7 @@ def digest_file(path):
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
-def inspect_store(store):
+def inspect_store(store, *, legacy_manifest=False):
     require(store.read_bytes("index.json") is not None)
     state, job = snapshot(store)
     check_report(store, state, job)
@@ -69,6 +76,8 @@ def inspect_store(store):
         "laps": 0,
         "timer_events": 0,
     }
+    detail_counts = {"events": 0, "messages": 0, "sessions": 0, "identity_revisions": 0}
+    field_versions = set()
     with store.database() as db:
         require(db.execute("PRAGMA integrity_check").fetchall() == [("ok",)])
         names = [r[0] for r in db.execute("SELECT name FROM documents ORDER BY name")]
@@ -91,8 +100,13 @@ def inspect_store(store):
             if name.endswith("/streams.json"):
                 value = decode(content)
                 require(name.replace("/streams.json", "/summary.json") in names)
-                for key in ("records", "laps", "timer_events"):
-                    counts[key] += len(value[key])
+                if "fit_fields_version" in value:
+                    field_versions.add(value["fit_fields_version"])
+                    detail_counts["sessions"] += 1
+                    detail_counts["identity_revisions"] += value["include_identity"]
+                for key in stream_arrays(value):
+                    target = counts if key in counts else detail_counts
+                    target[key] += len(value[key])
         require(
             db.execute(
                 "SELECT COUNT(*) FROM samples WHERE name NOT IN (SELECT name FROM documents)"
@@ -101,7 +115,7 @@ def inspect_store(store):
         )
         require(
             all(
-                r[0] in {"records", "laps", "timer_events"} and r[1].endswith("/streams.json")
+                r[0] in ARRAY_LIMITS and r[1].endswith("/streams.json")
                 for r in db.execute("SELECT DISTINCT kind,name FROM samples")
             )
         )
@@ -115,7 +129,18 @@ def inspect_store(store):
         for e in state["activities"].values()
         if e["summary"]["activity_time"]["utc"]
     ]
+    require(not legacy_manifest or not field_versions)
+    extension = (
+        {}
+        if legacy_manifest
+        else {
+            "fit_fields_versions": sorted(field_versions),
+            "fit_counts": detail_counts,
+            "identity_included": detail_counts["identity_revisions"] > 0,
+        }
+    )
     return {
+        **extension,
         "storage_version": STORAGE_VERSION,
         "schema_version": c.SCHEMA_VERSION,
         "normalizer_versions": sorted(
@@ -205,7 +230,7 @@ def export_snapshot(source, destination):
         info = inspect_store(staging)
         manifest = {
             "format": "garmin-bridge-sqlite",
-            "format_version": 1,
+            "format_version": 2,
             **info,
             "size": staging.path(DATABASE).stat().st_size,
             "sha256": digest_file(staging.path(DATABASE)),
@@ -227,10 +252,11 @@ def verify_snapshot(directory):
     require(c.digest(manifest.get("sha256")))
     require(store.path(DATABASE).stat().st_size == manifest["size"])
     require(digest_file(store.path(DATABASE)) == manifest["sha256"])
-    info = inspect_store(store)
+    require(type(manifest.get("format_version")) is int and manifest["format_version"] in (1, 2))
+    info = inspect_store(store, legacy_manifest=manifest["format_version"] == 1)
     expected = {
         "format": "garmin-bridge-sqlite",
-        "format_version": 1,
+        "format_version": manifest["format_version"],
         **info,
         "segment_algorithm_version": manifest["segment_algorithm_version"],
         "size": store.path(DATABASE).stat().st_size,

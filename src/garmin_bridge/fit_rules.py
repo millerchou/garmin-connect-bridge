@@ -5,8 +5,9 @@ Names document semantics only; decisions use numeric IDs, type, size and context
 """
 
 from dataclasses import dataclass
+from .fit_fields import ARRAY_LIMITS, EVENT_NAMES, FIELDS, MESSAGE_NUMBERS
 
-RULES_VERSION = "1.0.0"
+RULES_VERSION = "1.1.0"
 PROFILE_VERSION = "21.218.0"
 SDK_VERSION = "21.218.0"
 
@@ -234,11 +235,33 @@ RULES = {
     },
 }
 
+LEGACY_RULES = {mid: dict(fields) for mid, fields in RULES.items()}
+
+# Share the reviewed physical permission table with normalized FIT detail. The
+# sanitizer always excludes identity, regardless of an import's opt-in setting.
+for _message, _fields in FIELDS.items():
+    for _name, _spec in _fields.items():
+        if _spec.identity:
+            continue
+        _limits = (1, 65) if _spec.kind == "label" else ARRAY_LIMITS.get(_spec.shape, (1, 1))
+        RULES.setdefault(MESSAGE_NUMBERS[_message], {}).setdefault(
+            _spec.number, Rule(_name, _spec.base, *_limits)
+        )
+
 # Explicitly deferred candidate. Other unapproved numbers are pending review.
 DEFERRED = {(19, 40)}
 
 # Known examples; absence here does NOT grant permission. No substring matching.
 EXPLICIT_REMOVALS = {
+    0: {3, 5, 8},
+    18: {3, 4, 29, 30, 31, 32, 38, 39, 84},
+    19: {3, 4, 5, 6, 27, 28, 29, 30},
+    20: {0, 1},
+    23: {3, 19, 20, 21, 27},
+    142: {65},
+    312: {17, 18, 19, 20, 21, 22, 23, 24},
+}
+LEGACY_REMOVALS = {
     0: {1, 2, 3, 4, 5, 8},
     12: {3},
     18: {3, 4, 29, 30, 31, 32, 38, 39, 84, 110},
@@ -247,9 +270,10 @@ EXPLICIT_REMOVALS = {
     142: {65},
     312: {17, 18, 19, 20},
 }
+LEGACY_EVENTS = frozenset({0, 8, 9, 13, 14, 15, 16, 17, 18, 19, 20, 23, 24, 25, 42, 43, 44})
+RULE_VERSIONS = {"1.0.0": LEGACY_RULES, RULES_VERSION: RULES}
 
-# No device, profile, course, segment or split message is admitted.
-EVENTS = frozenset({0, 8, 9, 13, 14, 15, 16, 17, 18, 19, 20, 23, 24, 25, 42, 43, 44})
+EVENTS = frozenset(EVENT_NAMES)
 
 # Closed cycling subtypes and contextual enums; invalid sentinels stay invalid.
 CYCLING_SUBTYPES = frozenset(

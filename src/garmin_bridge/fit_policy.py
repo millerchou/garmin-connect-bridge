@@ -3,7 +3,17 @@
 from collections import Counter
 
 from .errors import BridgeError
-from .fit_rules import DEFERRED, ENUM_VALUES, EVENTS, EXPLICIT_REMOVALS, RULES
+from .fit_fields import SPORT_LABELS, event_payload_allowed
+from .fit_rules import (
+    DEFERRED,
+    ENUM_VALUES,
+    EVENTS,
+    EXPLICIT_REMOVALS,
+    LEGACY_EVENTS,
+    LEGACY_REMOVALS,
+    RULE_VERSIONS,
+    RULES_VERSION,
+)
 from .fit_wire import Message, WIDTHS, unsigned
 
 REASONS = frozenset(
@@ -26,16 +36,18 @@ REASONS = frozenset(
 )
 
 
-def field_reason(message, f):
+def field_reason(message, f, rules_version=RULES_VERSION):
+    rules = RULE_VERSIONS[rules_version]
+    removals = LEGACY_REMOVALS if rules_version == "1.0.0" else EXPLICIT_REMOVALS
     if f.developer is not None:
         return "developer_field"
-    if f.number in EXPLICIT_REMOVALS.get(message.number, ()):
+    if f.number in removals.get(message.number, ()):
         return "explicit_private_field"
     if (message.number, f.number) in DEFERRED:
         return "length_context"
-    if message.number not in RULES:
+    if message.number not in rules:
         return "unreviewed_message"
-    rule = RULES[message.number].get(f.number)
+    rule = rules[message.number].get(f.number)
     if rule is None:
         return "unreviewed_field"
     if f.base != rule.base:
@@ -52,7 +64,7 @@ def index_of(message):
     return value & 0xFFF if value is not None and not value & 0x7000 else None
 
 
-def project(document):
+def project(document, rules_version=RULES_VERSION):
     """Return approved physical records and a value-free, bounded audit inventory."""
     messages = document.messages
     file_ids = [m for m in messages if m.number == 0]
@@ -103,7 +115,7 @@ def project(document):
     # its context. They are not copied to the output unless an approved record uses them.
     for definition in document.definitions:
         for f in definition.fields:
-            count(definition, f, field_reason(definition, f), definition=True)
+            count(definition, f, field_reason(definition, f, rules_version), definition=True)
 
     for message in messages:
         overrides = {}
@@ -170,22 +182,41 @@ def project(document):
         if mid == 21:
             event = unsigned(message, 0, 0, 1)
             kind = unsigned(message, 1, 0, 1)
-            if event not in EVENTS or kind not in (*range(10), None):
+            allowed_events = LEGACY_EVENTS if rules_version == "1.0.0" else EVENTS
+            if event not in allowed_events or kind not in (*range(10), None):
                 whole = "event_context"
             else:
-                data = unsigned(message, 3, 0x86, 4)
-                allowed = kind is not None and (
-                    (event == 0 and data in (None, 0, 1, 2))
-                    or (event == 44 and data in (None, 0, 1, 2, 3))
-                    or event in (42, 43)
-                )
-                if not allowed:
-                    overrides[3] = "event_payload"
+                for number, base, size in ((3, 0x86, 4), (2, 0x84, 2)):
+                    if not event_payload_allowed(
+                        event, kind, unsigned(message, number, base, size), short=number == 2
+                    ):
+                        overrides[number] = "event_payload"
+                if event not in (42, 43) or kind is None:
+                    overrides.update({n: "event_payload" for n in (9, 10, 11, 12)})
+                if rules_version == "1.0.0":
+                    data = unsigned(message, 3, 0x86, 4)
+                    if not (
+                        kind is not None
+                        and (
+                            event == 0
+                            and data in (None, 0, 1, 2)
+                            or event == 44
+                            and data in (None, 0, 1, 2, 3)
+                            or event in (42, 43)
+                        )
+                    ):
+                        overrides[3] = "event_payload"
         selected = []
         for f in message.fields:
-            reason = field_reason(message, f)
+            reason = field_reason(message, f, rules_version)
             if reason == "approved":
                 reason = whole or overrides.get(f.number, "approved")
+            if reason == "approved" and f.base == 7:
+                # A string allowlist alone cannot exclude names/locations. Permit
+                # exact reviewed sport labels and zero padding, no hidden suffix.
+                approved = {label.encode("ascii") for label in SPORT_LABELS}
+                if f.raw.rstrip(b"\0") not in approved:
+                    reason = "explicit_private_field"
             count(message, f, reason)
             if reason == "approved":
                 selected.append(f)
@@ -222,14 +253,14 @@ def project(document):
     }
 
 
-def assert_approved(document):
+def assert_approved(document, rules_version=RULES_VERSION):
     """Independent verification also traverses unused definitions, not only values."""
     for message in document.definitions + document.messages:
         if not message.fields or any(
-            field_reason(message, f) != "approved" for f in message.fields
+            field_reason(message, f, rules_version) != "approved" for f in message.fields
         ):
             raise BridgeError("sanitize_verification")
-    projected, _ = project(document)
+    projected, _ = project(document, rules_version)
     if len(projected) != len(document.messages):
         raise BridgeError("sanitize_verification")
     for before, after in zip(document.messages, projected, strict=True):

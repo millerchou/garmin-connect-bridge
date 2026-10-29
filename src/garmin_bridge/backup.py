@@ -123,6 +123,15 @@ def artifact_files(entry, read):
     require(contents["summary"][2] == summary)
     c.project_activity(summary)
     streams = c.validate_streams(contents["streams"][2])
+    from .persistence import identity_enabled
+    from .fit_details import fill_local_time
+
+    require(identity_enabled(summary) == streams.get("include_identity", False))
+    require(summary["coverage"].keys() == streams["units"].keys())
+    if summary["provenance"]["input"] == "local_fit_file" and "fit_fields_version" in streams:
+        expected_time = {**summary["activity_time"], "local": None, "utc_offset_seconds": None}
+        fill_local_time(expected_time, streams["messages"])
+        require(summary["activity_time"] == expected_time)
     for key in (
         "schema_version",
         "normalizer_version",

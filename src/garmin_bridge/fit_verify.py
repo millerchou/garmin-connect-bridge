@@ -11,7 +11,7 @@ from garmin_fit_sdk import Decoder, Stream
 
 from .errors import BridgeError
 from .fit_policy import assert_approved
-from .fit_rules import RULES, SDK_VERSION
+from .fit_rules import RULES, RULES_VERSION, SDK_VERSION
 from .fit_wire import WIDTHS, read_wire, write_wire
 
 
@@ -22,11 +22,24 @@ def require(condition):
 
 def values(message, field):
     """Interpret only approved bytes, without scale/offset/component expansion."""
-    formats = {0: "B", 1: "b", 2: "B", 0x83: "h", 0x84: "H", 0x85: "i", 0x86: "I", 0x88: "f"}
+    if field.base == 7:
+        return (field.raw.rstrip(b"\0").decode("ascii"),)
+    formats = {
+        0: "B",
+        1: "b",
+        2: "B",
+        10: "B",
+        0x83: "h",
+        0x84: "H",
+        0x85: "i",
+        0x86: "I",
+        0x88: "f",
+    }
     invalids = {
         0: 255,
         1: 127,
         2: 255,
+        10: 0,
         0x83: 32767,
         0x84: 65535,
         0x85: 2147483647,
@@ -124,11 +137,11 @@ def independent_readers(data, physical):
             stream.close()
 
 
-def validate_archive_fit(data):
+def validate_archive_fit(data, rules_version=RULES_VERSION):
     """Check the current FIT alone; this proves no fidelity to an absent source."""
     try:
-        document = read_wire(data)
-        assert_approved(document)
+        document = read_wire(data, rules_version)
+        assert_approved(document, rules_version)
         # Canonical framing excludes unused/redundant definitions and alternate
         # headers. Re-encoding observed fields is NOT a source-fidelity comparison.
         require(data == write_wire(document.messages))
@@ -141,9 +154,9 @@ def validate_archive_fit(data):
         raise BridgeError("sanitize_verification") from None
 
 
-def validate_derived(data, expected):
+def validate_derived(data, expected, rules_version=RULES_VERSION):
     try:
-        document = validate_archive_fit(data)
+        document = validate_archive_fit(data, rules_version)
         # Only the separately projected source supplies the preservation evidence.
         require(data == write_wire(expected))
         require(document.messages == expected)

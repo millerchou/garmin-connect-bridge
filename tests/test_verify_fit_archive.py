@@ -336,9 +336,9 @@ def test_physical_checks_reject_recomputed_hashes_and_crcs_without_value_disclos
     original_validator = sanitize_fit.validate_archive_fit
     rejections = []
 
-    def validate_fit(observed):
+    def validate_fit(observed, *args):
         try:
-            return original_validator(observed)
+            return original_validator(observed, *args)
         except BridgeError:
             rejections.append(True)
             raise
