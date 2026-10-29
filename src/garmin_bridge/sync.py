@@ -87,6 +87,8 @@ def choose_range(state, start=None, end=None, lookback=14, today=None):
 
 
 def files_available(store, summary):
+    if hasattr(store, "has_artifacts"):
+        return store.has_artifacts(summary)
     return all(store.path(ref).is_file() for ref in summary["files"].values())
 
 
@@ -126,6 +128,7 @@ def publish_original(store, original, meta, state, cutoff_at=None, *, local_impo
             return False
         if (
             summary["source_digest"] == digest
+            and summary["fit_sha256"] == fit_hash
             and summary["normalizer_version"] == NORMALIZER_VERSION
             and summary["schema_version"] == SCHEMA_VERSION
             and artifacts_intact(store, previous)
@@ -149,7 +152,14 @@ def publish_original(store, original, meta, state, cutoff_at=None, *, local_impo
                 store.write_json("index.json", committed)
                 state.update(committed)
             return False
-    summary, streams = parser.normalize(fit, meta, now(), digest, local_import=local_import)
+    cached = (
+        store.revision_artifacts(source_id, digest, fit_hash)
+        if hasattr(store, "revision_artifacts")
+        else None
+    )
+    summary, streams = cached or parser.normalize(
+        fit, meta, now(), digest, local_import=local_import
+    )
     validate_streams(streams)
     if (
         cutoff_at
@@ -169,7 +179,8 @@ def publish_original(store, original, meta, state, cutoff_at=None, *, local_impo
     file_hashes = {}
     for name, value in (("streams", streams), ("summary", summary)):
         content = canonical(value)
-        store.write_bytes(summary["files"][name], content)
+        if not hasattr(store, "publish_activity"):
+            store.write_bytes(summary["files"][name], content)
         file_hashes[name] = parser.sha256(content)
     entry = {
         "summary": summary,
@@ -179,7 +190,10 @@ def publish_original(store, original, meta, state, cutoff_at=None, *, local_impo
         "metadata_digest": parser.sha256(canonical(meta)),
     }
     committed = {**state, "activities": {**state["activities"], source_id: entry}}
-    store.write_json("index.json", committed)
+    if hasattr(store, "publish_activity"):
+        store.publish_activity(streams, summary, committed)
+    else:
+        store.write_json("index.json", committed)
     state.update(committed)
     return True
 

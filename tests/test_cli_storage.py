@@ -14,7 +14,7 @@ from .test_sync import run
 
 
 def command(store, capsys, *args):
-    code = cli.main(["--data-dir", str(store.root), *args])
+    code = cli.main(["--legacy-store", "--data-dir", str(store.root), *args])
     captured = capsys.readouterr()
     return code, json.loads(captured.out or captured.err), captured
 

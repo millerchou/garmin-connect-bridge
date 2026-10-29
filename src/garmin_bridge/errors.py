@@ -1,6 +1,8 @@
 """Only reviewed, constant diagnostics may cross the CLI boundary."""
 
 MESSAGES = {
+    "storage_format_conflict": "Storage formats conflict. Do not use legacy mode on SQLite or mix stores; use separate destinations.",
+    "migration_required": "Use explicit migrate into a new SQLite store before acquisition.",
     "usage": "Invalid arguments. Use --help; never pass credentials as arguments.",
     "interactive_required": "Run auth in a private interactive terminal.",
     "auth_required": "No saved session. Run auth in a private terminal.",

@@ -448,7 +448,18 @@ OUTPUTS.update({"sanitize-fit": FIT_ARCHIVE_RECEIPT, "verify-fit": fit_verify_re
 
 def validate_output(kind, payload):
     try:
-        valid = OUTPUTS[kind](payload)
+        if kind in {"list", "activity", "status"} and "storage_version" in payload:
+            from .sqlite_contract import validate_query
+
+            valid = validate_query(kind, payload)
+        elif kind in {"snapshot", "migrate", "window", "segment"} or (
+            kind == "backup" and "storage_version" in payload
+        ):
+            from .sqlite_contract import validate
+
+            valid = validate(kind, payload)
+        else:
+            valid = OUTPUTS[kind](payload)
     except (TypeError, ValueError, KeyError, OverflowError):
         valid = False
     if not valid:

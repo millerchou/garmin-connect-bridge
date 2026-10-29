@@ -105,10 +105,37 @@ def require(condition):
         raise BridgeError("privacy_failed")
 
 
-def validate_state(value, portable=False):
+def validate_summary_provenance(summary, metadata_digest=None):
+    """Apply the same source guarantees to current and historical revisions."""
     from .normalize import LOCAL_FLAGS, input_digest, local_metadata, sha256
     from .storage import canonical
 
+    require(c.ACTIVITY(summary))
+    if summary["provenance"]["input"] == "local_fit_file":
+        meta = local_metadata(summary["source_activity_id"])
+        if metadata_digest is not None:
+            require(metadata_digest == sha256(canonical(meta)))
+        require(
+            summary["source_digest"] == input_digest(meta, summary["fit_sha256"], local_import=True)
+        )
+        require(LOCAL_FLAGS <= set(summary["quality_flags"]))
+        require(
+            all(
+                summary["activity_time"][k] is None
+                for k in ("local", "timezone", "utc_offset_seconds")
+            )
+        )
+        require(
+            all(
+                q["source"] != "garmin_activity"
+                for group in ("metrics", "garmin_reported")
+                for q in summary[group].values()
+            )
+        )
+    return summary
+
+
+def validate_state(value, portable=False):
     require(STATE(value))
     for interval in value["covered_ranges"] + value["pending_ranges"]:
         require(interval["start"] <= interval["end"])
@@ -116,27 +143,7 @@ def validate_state(value, portable=False):
     for source_id, entry in value["activities"].items():
         summary = c.project_activity(entry["summary"])
         require(summary["source_activity_id"] == source_id)
-        if summary["provenance"]["input"] == "local_fit_file":
-            meta = local_metadata(source_id)
-            require(entry["metadata_digest"] == sha256(canonical(meta)))
-            require(
-                summary["source_digest"]
-                == input_digest(meta, summary["fit_sha256"], local_import=True)
-            )
-            require(LOCAL_FLAGS <= set(summary["quality_flags"]))
-            require(
-                all(
-                    summary["activity_time"][k] is None
-                    for k in ("local", "timezone", "utc_offset_seconds")
-                )
-            )
-            require(
-                all(
-                    q["source"] != "garmin_activity"
-                    for group in ("metrics", "garmin_reported")
-                    for q in summary[group].values()
-                )
-            )
+        validate_summary_provenance(summary, entry["metadata_digest"])
         if portable or entry["raw_ref"] is None:
             require(entry["raw_ref"] is None and entry["raw_sha256"] is None)
         else:
