@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, timezone
 from collections import Counter
 
+from .errors import BridgeError
 from .fit_fields import (
     ARRAY_LIMITS,
     EVENT_NAMES,
@@ -11,8 +12,53 @@ from .fit_fields import (
     STROKES_MESSAGES,
     event_payload_allowed,
 )
+from .fit_rules import RULES
 
 EPOCH = datetime(1989, 12, 31, tzinfo=timezone.utc)
+
+
+def timestamp_value(value, *, local=False):
+    if type(value) is not int or not 0x10000000 <= value < 0xFFFFFFFF:
+        return None
+    stamp = EPOCH + timedelta(seconds=value)
+    return (
+        stamp.replace(tzinfo=None).isoformat()
+        if local
+        else stamp.isoformat().replace("+00:00", "Z")
+    )
+
+
+class TimestampContext:
+    """Do not trust fitdecode's accumulator: even unknown/developer fields seed it."""
+
+    def __init__(self):
+        self.anchor = None
+
+    def read(self, frame):
+        physical = [
+            f
+            for f in frame.fields
+            if f.field_def is not None and not f.field_def.is_dev and f.field_def.def_num == 253
+        ]
+        if frame.time_offset is not None:
+            if self.anchor is None or physical:
+                raise BridgeError("invalid_fit")
+            offset = frame.time_offset
+            self.anchor = (self.anchor & ~31) + offset + (32 if offset < self.anchor & 31 else 0)
+            if self.anchor >= 0xFFFFFFFF:
+                raise BridgeError("invalid_fit")
+            return self.anchor
+        timestamp = None
+        for field in physical:
+            definition = field.field_def
+            if 253 not in RULES.get(frame.global_mesg_num, {}) or (
+                definition.base_type.identifier,
+                definition.size,
+            ) != (0x86, 4):
+                self.anchor = None
+            else:
+                timestamp = self.anchor = field.raw_value
+        return timestamp
 
 
 def text_value(value):
@@ -34,14 +80,7 @@ def field_value(raw, spec):
         if not numeric(value):
             return None
         if spec.kind in {"utc", "local"}:
-            if type(value) is not int or not 0x10000000 <= value < 0xFFFFFFFF:
-                return None
-            stamp = EPOCH + timedelta(seconds=value)
-            return (
-                stamp.isoformat().replace("+00:00", "Z")
-                if spec.kind == "utc"
-                else stamp.replace(tzinfo=None).isoformat()
-            )
+            return timestamp_value(value, local=spec.kind == "local")
         return value / spec.scale - spec.offset if spec.scale != 1 or spec.offset else value
 
     if spec.shape != "scalar":
@@ -60,7 +99,7 @@ def specs_for(message):
     return specs
 
 
-def project_message(frame, include_identity=False):
+def project_message(frame, include_identity=False, *, timestamp_raw=None):
     specs = FIELDS.get(frame.name)
     if specs is None or frame.name == "user_profile" and not include_identity:
         return None
@@ -91,6 +130,10 @@ def project_message(frame, include_identity=False):
             continue
         target = reported if spec.reported else fields
         target[name] = {"value": value, "unit": spec.unit}
+    # Header timestamps have no physical field_def in fitdecode. Only the
+    # independently checked clock may supply them, never arbitrary components.
+    if timestamp_raw is not None and "timestamp" in specs:
+        fields["timestamp"] = {"value": timestamp_value(timestamp_raw), "unit": "UTC"}
     if frame.name in {"session", "lap"}:
         for name in ("avg_speed", "max_speed"):
             enhanced = fields.get("enhanced_" + name)
@@ -258,7 +301,11 @@ def fill_local_time(activity_time, messages):
             for name in ("time_zone_offset", "time_offset"):
                 offsets = get(fields, name)
                 index = (
-                    active if type(active) is int else 0 if offsets and len(offsets) == 1 else None
+                    active
+                    if type(active) is int
+                    else 0
+                    if "active_time_zone" not in fields and offsets and len(offsets) == 1
+                    else None
                 )
                 if offsets and index is not None and 0 <= index < len(offsets):
                     delta = offsets[index]

@@ -21,7 +21,13 @@ from .contract import (
     timezone_name,
 )
 from .errors import BridgeError
-from .fit_details import fill_local_time, filter_message_context, project_message
+from .fit_details import (
+    TimestampContext,
+    fill_local_time,
+    filter_message_context,
+    project_message,
+    timestamp_value,
+)
 from .fit_fields import AUXILIARY_MESSAGES, FIT_FIELDS_VERSION, RECORD_UNITS
 from .storage import canonical
 
@@ -253,6 +259,8 @@ def _values(frame):
             continue
         if field.name not in allowed:
             continue
+        if field.name == "timestamp":
+            continue  # Supplied only by the independently checked FIT clock.
         if field.name == "enhanced_respiration_rate" and field.units != "Breaths/min":
             continue  # Don't relabel legacy components with ambiguous units.
         values[field.name] = field.raw_value if field.name == "left_right_balance" else field.value
@@ -289,6 +297,7 @@ def normalize(
     session_detail = None
     device_count = 0
     cadence_integers = []
+    clock = TimestampContext()
 
     def clean(value):
         if value is not None and not numeric(value):
@@ -304,8 +313,11 @@ def normalize(
             for frame in reader:
                 if not isinstance(frame, fitdecode.FitDataMessage):
                     continue
+                timestamp_raw = clock.read(frame)
                 values = _values(frame)
-                detail = project_message(frame, include_identity)
+                if timestamp_raw is not None and "timestamp" in MESSAGE_FIELDS.get(frame.name, ()):
+                    values["timestamp"] = timestamp_value(timestamp_raw)
+                detail = project_message(frame, include_identity, timestamp_raw=timestamp_raw)
                 if frame.name == "record":
                     balance = values.get("left_right_balance")
                     balance_value = (balance & 0x7F) if type(balance) is int else None

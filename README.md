@@ -662,7 +662,7 @@ root, so output does not disclose the user's home-directory name.
 Fresh CLI stores use SQLite by default. API sync and offline import share the
 same publication function, provenance protections and immutable revision IDs.
 `list`, `activity`, `status`, gap/watermark logic and backup all read that store.
-`storage_version: 1` is independent of activity schema `1.0`, normalizer `1.2.1`
+`storage_version: 1` is independent of activity schema `1.0`, normalizer `1.3.0`
 and segment algorithm `1.0.1`; changing storage does not change metric semantics.
 
 ```text
@@ -990,6 +990,14 @@ is applied to the observed session start; this does not establish a timezone nam
 or prove that an offset stayed constant across a DST change during the activity.
 Existing API local time/offset is preserved. Relative FIT system times below the
 Profile's UTC timestamp threshold are not relabelled as absolute UTC.
+
+Normalization checks the compressed timestamp clock independently of fitdecode.
+Only approved standard timestamp fields with the exact wire type and size can
+anchor it. Unknown, mistyped or invalid standard timestamps clear the anchor;
+developer fields cannot change it. Compressed headers without an approved anchor,
+or with a second physical timestamp, reject the input. Valid header timestamps
+are retained in records and in session, lap, event and auxiliary detail.
+An explicitly invalid active-zone index never selects a default clock offset.
 
 Identity retention is an explicit per-invocation option, default **off**:
 
