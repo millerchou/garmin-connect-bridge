@@ -483,7 +483,9 @@ def test_verify_samples_contracts_but_restore_validates_every_row(database, tmp_
 @pytest.mark.parametrize("command", ["sanitize-fit", "verify-fit", "migrate"])
 def test_removed_commands_are_not_available(capsys, command):
     assert cli.main([command]) == 2
-    assert json.loads(capsys.readouterr().err)["error"] == "usage"
+    result = json.loads(capsys.readouterr().err)
+    assert result["error"] == "removed_" + command.replace("-", "_")
+    assert command in result["message"] and "removed in this version" in result["message"]
 
 
 def test_snapshot_rejects_raw_references_even_with_updated_checksum(database, tmp_path):

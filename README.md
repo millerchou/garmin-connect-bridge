@@ -19,6 +19,13 @@ uv run --frozen garmin-bridge --help
 `uv.lock` pins all dependencies; `requirements.lock` is the runtime export with
 hashes. Normal installation does not update these pins.
 
+`migrate`, `sanitize-fit`, `verify-fit`, and `--legacy-store` were removed in this
+version. They return explicit errors and are omitted from help. Legacy JSON store
+access/migration and derived FIT archive creation/verification have no replacement.
+Existing SQLite stores work directly without `--legacy-store`. For other handoffs,
+use `export analysis` for a non-location SQLite analysis artifact, or
+`snapshot export|verify|restore` for private SQLite backups.
+
 Choose a persistent private directory outside every Git checkout:
 
 ```sh
@@ -48,6 +55,7 @@ present validity. Sync may refresh and save rotated tokens.
 garmin-bridge sync --resume
 garmin-bridge sync
 garmin-bridge sync --since-last
+garmin-bridge sync --since-last --dry-run
 garmin-bridge sync --lookback-days 30
 garmin-bridge sync --start 2025-01-01 --end 2025-01-31
 garmin-bridge sync --full --new-scan
@@ -88,6 +96,15 @@ later coverage does not move its start forward. Without a watermark it returns
 with `--start`, `--end`, `--full`, `--resume`, or `--new-scan`. The normal two-pass
 enumeration and failure rules apply; an unfinished job may require `--resume`.
 Use ordinary daily sync to discover delayed uploads outside this date range.
+
+`sync --since-last --dry-run` prints only `{"start":"YYYY-MM-DD","end":"YYYY-MM-DD"}`
+and exits successfully. It uses the same watermark and host-date calculation as a
+real run, without constructing a network client, logging in, taking the bridge
+lock, or changing the store, state, or watermark. A missing watermark still returns
+`no_watermark`; `--dry-run` without `--since-last` is an error. The preview reads
+committed SQLite state and refuses journal/WAL sidecars or WAL-mode databases with
+`busy` instead of performing recovery or creating sidecars. Coverage may change
+before a later real run.
 
 ### Offline FIT import
 
@@ -186,7 +203,10 @@ remain personal data; keep the analysis file private.
 Export builds a fresh temporary SQLite file in the destination directory, validates
 the full current source contracts, then checks `PRAGMA integrity_check`, foreign
 keys, the exact table/column whitelist, JSON contracts with identity disabled, and
-per-activity row counts and ordinals before atomic rename. The file and destination
+per-activity row counts and ordinals before atomic rename. An independent denylist
+also checks every column name and every nested `detail_json` key for location and
+identity names, including prefixed/suffixed tokens; approved power/cadence posture
+and sensor-position fields remain allowed. The file and destination
 directory are flushed before success; a directory-flush failure restores the prior
 destination. Failed construction or validation preserves the old destination and
 removes staging files. A hard kill can leave private `.analysis-*` staging or
@@ -270,10 +290,12 @@ archives, unsafe paths, bad FIT framing/CRC, multi-session/non-cycling inputs,
 inputs above 64 MiB, and excessive expansion are rejected. Parser limits are
 500,000 records, 10,000 laps, 100,000 events, and 100,000 auxiliary messages.
 
-New `raw/` objects store decompressed FIT bytes addressed by their SHA-256, so
-different ZIP wrappers and activities with identical FIT content share one object.
-Existing raw references still verify against their stored byte hash and accept
-either FIT or ZIP content. There is no migration or deletion of old objects;
+After raw deduplication, new originals are stored as the decompressed FIT file at
+`raw/<sha256>.bin`, named by the SHA-256 of those FIT bytes. Garmin's ZIP wrapper
+is not retained for new objects; different wrappers and activities with identical
+FIT content share one object. Existing raw references still verify against their
+stored byte hash and accept either FIT or ZIP content, so existing ZIP references
+remain readable. There is no migration or deletion of old objects;
 unchanged existing references and all immutable revisions remain readable.
 
 This public repository contains only code, documentation, and fixtures generated
@@ -304,8 +326,9 @@ Default tests are offline and generate FIT/SQLite inputs in code. They must cove
   on export/restore, revision/progress preservation, and incremental sync after restore.
 - Current-only typed analysis export, identity/location exclusion, atomic overwrite
   and failure preservation, SQL units/provenance, and legacy stream support.
-- `--since-last` overlap and no-watermark errors, successful watermark preservation
-  on failure, decompressed raw deduplication, and existing ZIP reference readability.
+- `--since-last` overlap and no-watermark errors, a dry-run without clients, bridge
+  locks or writes, successful watermark preservation on failure, decompressed raw
+  deduplication, and existing ZIP reference readability.
 - Anonymous segment matching, insufficient/unavailable evidence, cached-result
   invalidation, and exclusion of locations from persisted/output results.
 

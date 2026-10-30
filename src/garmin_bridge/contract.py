@@ -376,6 +376,7 @@ OUTPUTS = {
         }
     ),
     "sync": SYNC_REPORT,
+    "sync-preview": RANGE,
 }
 
 

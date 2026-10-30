@@ -16,6 +16,17 @@ from .upstream import GarminSource, authenticate, auth_status
 
 
 class PrivateParser(argparse.ArgumentParser):
+    def _check_value(self, action, value):
+        # Recognize retired commands without advertising them as parser choices.
+        if action.dest == "command" and value in {"migrate", "sanitize-fit", "verify-fit"}:
+            raise BridgeError("removed_" + value.replace("-", "_"))
+        return super()._check_value(action, value)
+
+    def _parse_optional(self, arg_string):
+        if arg_string.split("=", 1)[0] == "--legacy-store":
+            raise BridgeError("removed_legacy_store")
+        return super()._parse_optional(arg_string)
+
     def error(self, message):
         # argparse normally echoes rejected values; those might be secrets.
         raise BridgeError("usage")
@@ -108,6 +119,11 @@ def build_parser():
         "--since-last",
         action="store_true",
         help="Sync from the contiguous successful watermark end minus one day through today",
+    )
+    sync.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --since-last, print the date window without login, a store lock or writes",
     )
     sync.add_argument(
         "--new-scan",
@@ -286,7 +302,18 @@ def execute(args):
         from .analysis_export import export_analysis
 
         return export_analysis(SQLiteStore(args.data_dir), args.file)
+    if args.command == "sync":
+        if args.dry_run and not args.since_last:
+            raise BridgeError("dry_run_requires_since_last")
+        if ((args.full or args.resume or args.since_last) and (args.start or args.end)) or (
+            args.new_scan and not args.full
+        ):
+            raise BridgeError("usage")
+        if args.end and not args.start:
+            raise BridgeError("usage")
     store = SQLiteStore(args.data_dir)
+    if args.command == "sync" and args.dry_run:
+        return since_last_range(store.preview_state(), date.today())
     write = args.command in {"auth", "sync", "import-fit"}
     write = write or (args.command == "segment" and args.segment_action != "history")
     with store.lock(write=write):
@@ -320,12 +347,6 @@ def execute(args):
             )
             return {"schema_version": SCHEMA_VERSION, "state": "saved", "verified_at": verified}
         if args.command == "sync":
-            if ((args.full or args.resume or args.since_last) and (args.start or args.end)) or (
-                args.new_scan and not args.full
-            ):
-                raise BridgeError("usage")
-            if args.end and not args.start:
-                raise BridgeError("usage")
             interval = (
                 since_last_range(store.state(), date.today())
                 if args.since_last
@@ -361,10 +382,11 @@ def main(argv=None):
     logging.disable(logging.CRITICAL)
     try:
         args = build_parser().parse_args(argv)
-        result = validate_output(args.command, execute(args))
+        preview = args.command == "sync" and args.dry_run
+        result = validate_output("sync-preview" if preview else args.command, execute(args))
         serialized = json.dumps(result, allow_nan=False, separators=(",", ":"))
         print(serialized)
-        return 1 if args.command == "sync" and not result["complete"] else 0
+        return 1 if args.command == "sync" and not preview and not result["complete"] else 0
     except (KeyboardInterrupt, EOFError):
         code = "interrupted"
     except BridgeError as error:

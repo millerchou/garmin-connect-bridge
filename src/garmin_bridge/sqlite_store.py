@@ -228,6 +228,42 @@ class SQLiteStore(Store):
         )
         return summary, decode(stream_data)
 
+    def preview_state(self):
+        """Read one committed catalog without the bridge lock or journal recovery."""
+        path = self._database()
+        if not path.exists():
+            if self.path("index.json").exists():
+                raise BridgeError("storage_format_conflict")
+            return empty_state()
+        # Ordinary readers can recover journals. A preview must never write,
+        # including SQLite's recovery or WAL shared-memory bookkeeping.
+        if any(self.path(DATABASE + suffix).exists() for suffix in ("-journal", "-wal", "-shm")):
+            raise BridgeError("busy")
+        # A closed WAL database may have no sidecars yet. SQLite can create
+        # them even with mode=ro; inspect its read/write format before opening.
+        with path.open("rb") as handle:
+            header = handle.read(20)
+        if header[18:20] == b"\x02\x02":
+            raise BridgeError("busy")
+        if header[:16] != b"SQLite format 3\x00" or header[18:20] != b"\x01\x01":
+            raise BridgeError("storage_failed")
+        try:
+            with closing(connect(path)) as db:
+                db.execute("BEGIN")
+                check_schema(db)
+                row = db.execute("SELECT payload FROM documents WHERE name='index.json'").fetchone()
+                if row is None:
+                    require(
+                        db.execute(
+                            "SELECT 1 FROM documents WHERE name LIKE 'objects/%' LIMIT 1"
+                        ).fetchone()
+                        is None
+                    )
+                    return empty_state()
+                return validate_state(decode(row[0]))
+        except sqlite3.Error:
+            raise BridgeError("storage_failed") from None
+
     def state(self):
         value = self.read_json("index.json")
         value = empty_state() if value is None else validate_state(value)

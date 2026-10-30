@@ -97,6 +97,37 @@ def test_invalid_arguments_never_echo_user_values(store, capsys, args):
     assert SECRET not in captured.out + captured.err
 
 
+@pytest.mark.parametrize(
+    "args, removed, guidance",
+    [
+        (["migrate", "--source", SECRET], "migrate", "no legacy-store migration replacement"),
+        (["sanitize-fit", "--file", SECRET], "sanitize-fit", "export analysis"),
+        (["verify-fit", "--directory", SECRET], "verify-fit", "snapshot verify"),
+        (["--legacy-store", "list"], "--legacy-store", "omit this option"),
+        (["list", "--legacy-store"], "--legacy-store", "omit this option"),
+        (["snapshot", "verify", "--legacy-store"], "--legacy-store", "omit this option"),
+        (["--legacy-store=" + SECRET, "list"], "--legacy-store", "omit this option"),
+    ],
+)
+def test_removed_arguments_are_explicit_and_do_not_touch_store(
+    store, capsys, monkeypatch, args, removed, guidance
+):
+    monkeypatch.setattr(cli, "execute", lambda _: pytest.fail("removed argument was executed"))
+    code, result, captured = command(store, capsys, *args)
+    assert code == 2 and captured.out == ""
+    assert removed in result["message"] and "removed in this version" in result["message"]
+    assert guidance in result["message"]
+    assert SECRET not in captured.err
+    assert not store.root.exists()
+
+
+def test_removed_arguments_are_hidden_and_command_names_can_be_option_values():
+    parser = cli.build_parser()
+    for removed in ("migrate", "sanitize-fit", "verify-fit", "--legacy-store"):
+        assert removed not in parser.format_help()
+    assert parser.parse_args(["--data-dir", "migrate", "status"]).data_dir == Path("migrate")
+
+
 def test_auth_requires_private_tty_and_sync_without_session_has_actionable_failure(
     store, capsys, monkeypatch
 ):

@@ -19,6 +19,30 @@ from .test_fit_fields import parse, rich_fit
 from .test_sync import INTERVAL, run
 
 
+DENIED_NAMES = (
+    "position_lat",
+    "position_long",
+    "lat",
+    "long",
+    "latitude",
+    "longitude",
+    "nec",
+    "swc",
+    "serial_number",
+    "user_profile",
+    "friendly_name",
+    "nec_lat",
+    "swc_long",
+    "start_position_lat",
+    "end_position_long",
+    "fit_serial_number_0",
+    "garmin_reported_user_profile_value",
+    "fit_friendly_name_text",
+    "fit_NEC_0",
+    "SWC_corner",
+)
+
+
 def publish(store, data=None, identity=False):
     with store.lock(write=True):
         return sync.publish_original(
@@ -149,6 +173,81 @@ def test_detail_arrays_reported_values_events_and_message_units(store, tmp_path)
         assert_safe_keys(detail)
     summary = read_table(target, "activities")[0]
     assert summary["timezone"] is None and summary["utc_offset_seconds"] == 19800
+
+
+@pytest.mark.parametrize("name", DENIED_NAMES)
+def test_denylist_blocks_columns_even_if_schema_allowlist_is_widened(
+    store, tmp_path, monkeypatch, name
+):
+    target = tmp_path / "analysis.sqlite"
+    export.export_analysis(store, target)
+    before = target.read_bytes()
+    monkeypatch.setitem(export.TABLES, "records", {**export.TABLES["records"], name: "REAL"})
+    with pytest.raises(BridgeError) as error:
+        export.export_analysis(store, target)
+    assert error.value.code == "privacy_failed"
+    assert target.read_bytes() == before
+    assert not list(tmp_path.glob(".analysis-*"))
+
+
+@pytest.mark.parametrize("table", export.TABLES)
+def test_denylist_checks_columns_in_every_table(store, tmp_path, monkeypatch, table):
+    monkeypatch.setitem(export.TABLES, table, {**export.TABLES[table], "start_lat": "REAL"})
+    with pytest.raises(BridgeError) as error:
+        export.export_analysis(store, tmp_path / "analysis.sqlite")
+    assert error.value.code == "privacy_failed"
+
+
+@pytest.mark.parametrize("name", DENIED_NAMES)
+@pytest.mark.parametrize("nested", [False, True])
+def test_denylist_blocks_detail_keys_even_if_message_contract_is_widened(
+    store, tmp_path, monkeypatch, name, nested
+):
+    publish(store)
+    target = tmp_path / "analysis.sqlite"
+    original = export.populate
+
+    def inject(db, source):
+        expected, metadata = original(db, source)
+        detail = {"message": "session", name: None}
+        if nested:
+            detail = {"message": "session", "fields": [{"nested": [[{name: None}]]}]}
+        db.execute("UPDATE messages SET detail_json=? WHERE ordinal=0", (export.json_text(detail),))
+        return expected, metadata
+
+    monkeypatch.setattr(export, "populate", inject)
+    # The denylist must work independently of the existing closed JSON contract.
+    monkeypatch.setattr(export, "valid_message", lambda *args: True)
+    with pytest.raises(BridgeError) as error:
+        export.export_analysis(store, target)
+    assert error.value.code == "privacy_failed"
+    assert not target.exists()
+    assert not list(tmp_path.glob(".analysis-*"))
+
+
+def test_denylist_allows_posture_sensor_and_every_current_export_field():
+    allowed = {
+        "left_power_position",
+        "right_power_position",
+        "fit_avg_power_position_0",
+        "fit_max_power_position_1",
+        "avg_cadence_position",
+        "fit_max_cadence_position_0",
+        "sensor_position",
+        "rider_position_change",
+        "platform",
+        "longitudinal_acceleration",
+        "connected",
+    }
+    for columns in export.TABLES.values():
+        allowed.update(columns)
+    for message in export.AUXILIARY_MESSAGES | {"session", "lap", "event"}:
+        allowed.update(
+            name for name, spec in export.specs_for(message).items() if not spec.identity
+        )
+    for name in allowed:
+        export.require_safe_name(name)
+    export.validate_detail_keys({"fields": [{name: [{"value": 0}]} for name in allowed]})
 
 
 def test_current_identity_rejected_but_identity_history_not_exported(store, tmp_path):

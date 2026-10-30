@@ -5,6 +5,7 @@ from datetime import datetime
 import fcntl
 import os
 from pathlib import Path
+import re
 import sqlite3
 import tempfile
 
@@ -18,6 +19,30 @@ from .sqlite_transfer import digest_file
 from .storage import Store, canonical, decode
 from .sync import watermark
 from .upstream import now
+
+
+# Match complete underscore-delimited names/tokens, including prefixed and
+# suffixed variants. "position" alone is legitimate for posture and sensors.
+PRIVATE_NAME = re.compile(
+    r"(?:^|_)(?:position_lat|position_long|lat|long|latitude|longitude|nec|swc|"
+    r"serial_number|user_profile|friendly_name)(?:_|$)",
+    re.IGNORECASE,
+)
+
+
+def require_safe_name(name):
+    require(PRIVATE_NAME.search(name) is None)
+
+
+def validate_detail_keys(value):
+    """Independent backstop even if the reviewed detail allowlist is widened."""
+    if isinstance(value, dict):
+        for name, item in value.items():
+            require_safe_name(name)
+            validate_detail_keys(item)
+    elif isinstance(value, list):
+        for item in value:
+            validate_detail_keys(item)
 
 
 def detail_columns(message):
@@ -299,10 +324,10 @@ def validate(db, expected, metadata):
         == {table: ddl(table) for table in TABLES}
     )
     for table, columns in TABLES.items():
-        require(
-            [(row[1], row[2]) for row in db.execute(f'PRAGMA table_info("{table}")')]
-            == list(columns.items())
-        )
+        actual = [(row[1], row[2]) for row in db.execute(f'PRAGMA table_info("{table}")')]
+        for name, _ in actual:
+            require_safe_name(name)
+        require(actual == list(columns.items()))
     require({row[0] for row in db.execute("SELECT activity_id FROM activities")} == set(expected))
     for table in ("records", "laps", "events", "messages"):
         counts = {
@@ -323,6 +348,7 @@ def validate(db, expected, metadata):
         require(c.COVERAGE(decode(coverage.encode())) and c.QUALITY(decode(flags.encode())))
     for message, detail in db.execute("SELECT message,detail_json FROM messages"):
         value = decode(detail.encode())
+        validate_detail_keys(value)
         require(valid_message(value, False, AUXILIARY_MESSAGES | {"session"}))
         require(message == value["message"])
 

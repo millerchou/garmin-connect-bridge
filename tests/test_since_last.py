@@ -1,10 +1,11 @@
 """The incremental date shortcut uses successful contiguous coverage only."""
 
 from datetime import date
+from contextlib import closing
 
 import pytest
 
-from garmin_bridge import cli, sync
+from garmin_bridge import cli, sqlite_store, sync
 from garmin_bridge.errors import BridgeError
 from garmin_bridge.storage import empty_state
 from .synthetic import Source
@@ -95,3 +96,133 @@ def test_since_last_overlap_crosses_year_boundary():
         "start": "2024-12-31",
         "end": "2025-01-03",
     }
+
+
+def guard_preview(monkeypatch):
+    def denied(*args, **kwargs):
+        pytest.fail("dry-run constructed a client, authenticated, locked or synchronized")
+
+    for name in ("GarminSource", "authenticate", "synchronize"):
+        monkeypatch.setattr(cli, name, denied)
+    monkeypatch.setattr(sqlite_store.SQLiteStore, "lock", denied)
+    monkeypatch.setattr("garmin_bridge.storage.Store.lock", denied)
+    monkeypatch.setattr("garmin_bridge.storage.fcntl.flock", denied)
+    connect = sqlite_store.connect
+
+    def read_only(path, write=False, immutable=False):
+        assert not write and not immutable
+        return connect(path, write, immutable)
+
+    monkeypatch.setattr(sqlite_store, "connect", read_only)
+
+
+def saved_files(store):
+    return {
+        p.relative_to(store.root): (p.read_bytes(), p.stat().st_mtime_ns)
+        for p in store.root.rglob("*")
+        if p.is_file()
+    }
+
+
+def test_dry_run_matches_real_window_without_client_lock_or_store_changes(
+    store, today, monkeypatch, capsys
+):
+    run(store, Source())
+    run(store, Source([]), {"start": "2025-01-08", "end": "2025-01-09"})
+    before_state = store.state()
+    store.path(".lock").unlink()
+    before_files = saved_files(store)
+    with monkeypatch.context() as guards:
+        guard_preview(guards)
+        code, preview, captured = command(store, capsys, "sync", "--since-last", "--dry-run")
+        assert code == 0 and captured.err == ""
+        assert preview == {"start": "2025-01-02", "end": today.isoformat()}
+        assert saved_files(store) == before_files
+        assert store.state() == before_state
+        assert sync.watermark(store.state()) == INTERVAL
+    monkeypatch.setattr(cli, "GarminSource", lambda _: Source())
+    code, result, _ = command(store, capsys, "sync", "--since-last")
+    assert code == 0
+    assert preview == {key: result["filter"][key] for key in ("start", "end")}
+
+
+@pytest.mark.parametrize("kind", ["absent", "empty", "pending_backfill"])
+def test_dry_run_no_watermark_is_offline_and_leaves_store_unchanged(
+    store, today, monkeypatch, capsys, kind
+):
+    if kind != "absent":
+        state = empty_state()
+        if kind == "pending_backfill":
+            state["covered_ranges"] = [INTERVAL]
+            state["pending_ranges"] = [{"start": "2024-12-01", "end": "2024-12-02"}]
+        with store.lock(write=True):
+            store.write_json("index.json", state)
+    before = saved_files(store)
+    guard_preview(monkeypatch)
+    code, result, captured = command(store, capsys, "sync", "--since-last", "--dry-run")
+    assert code == 2 and result["error"] == "no_watermark" and captured.out == ""
+    assert saved_files(store) == before
+    if kind == "absent":
+        assert not store.root.exists()
+
+
+@pytest.mark.parametrize("extra", [[], ["--full"], ["--start", "2025-01-01"]])
+def test_dry_run_requires_since_last_before_locking(store, monkeypatch, capsys, extra):
+    guard_preview(monkeypatch)
+    code, result, _ = command(store, capsys, "sync", "--dry-run", *extra)
+    assert code == 2 and result["error"] == "dry_run_requires_since_last"
+    assert "--dry-run requires --since-last" in result["message"]
+    assert not store.root.exists()
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [["--start", "2025-01-01"], ["--end", "2025-01-10"], ["--full"], ["--resume"], ["--new-scan"]],
+)
+def test_dry_run_rejects_conflicting_options_before_locking(store, monkeypatch, capsys, extra):
+    guard_preview(monkeypatch)
+    code, result, _ = command(store, capsys, "sync", "--since-last", "--dry-run", *extra)
+    assert code == 2 and result["error"] == "usage"
+    assert not store.root.exists()
+
+
+@pytest.mark.parametrize("suffix", ["-journal", "-wal", "-shm"])
+def test_dry_run_refuses_sidecars_without_attempting_recovery(
+    store, today, monkeypatch, capsys, suffix
+):
+    run(store, Source())
+    sidecar = store.path(sqlite_store.DATABASE + suffix)
+    sidecar.write_bytes(b"synthetic unfinished transaction")
+    sidecar.chmod(0o600)
+    before = saved_files(store)
+    guard_preview(monkeypatch)
+    monkeypatch.setattr(sqlite_store, "connect", lambda *a, **k: pytest.fail("opened sidecar DB"))
+    code, result, _ = command(store, capsys, "sync", "--since-last", "--dry-run")
+    assert code == 2 and result["error"] == "busy"
+    assert saved_files(store) == before
+
+
+def test_dry_run_refuses_wal_mode_before_sqlite_can_create_sidecars(
+    store, today, monkeypatch, capsys
+):
+    run(store, Source())
+    with closing(sqlite_store.connect(store.path(sqlite_store.DATABASE), write=True)) as db:
+        assert db.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+    assert not store.path(sqlite_store.DATABASE + "-wal").exists()
+    assert not store.path(sqlite_store.DATABASE + "-shm").exists()
+    before = saved_files(store)
+    guard_preview(monkeypatch)
+    monkeypatch.setattr(sqlite_store, "connect", lambda *a, **k: pytest.fail("opened WAL DB"))
+    code, result, _ = command(store, capsys, "sync", "--since-last", "--dry-run")
+    assert saved_files(store) == before
+    assert code == 2 and result["error"] == "busy"
+
+
+def test_dry_run_output_still_has_a_closed_contract(store, today, monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli,
+        "execute",
+        lambda _: {"start": "2025-01-01", "end": "2025-01-10", "unreviewed": "synthetic"},
+    )
+    code, result, captured = command(store, capsys, "sync", "--since-last", "--dry-run")
+    assert code == 2 and result["error"] == "privacy_failed" and captured.out == ""
