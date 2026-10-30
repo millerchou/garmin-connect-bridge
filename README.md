@@ -111,7 +111,8 @@ lock, or changing the store, state, or watermark. A missing watermark still retu
 committed SQLite state and refuses journal/WAL sidecars or WAL-mode databases with
 `busy` instead of performing recovery or creating sidecars. It also returns `busy`
 if the database file or header changes during the read. Coverage may change before
-a later real run.
+a later real run. A genuine `privacy_failed` error can write the private diagnostic
+report described below; a concurrent change reported as `busy` does not write it.
 
 ### Offline FIT import
 
@@ -180,6 +181,8 @@ IDs, row counts, hashes, absolute paths, or exception text. `file` identifies
 `reports/fit-blocked-fields.json`, or the logical `stdout.json` output. Nested
 fields use `[]`/`*` instead of row indices or mapping IDs; unreviewed free-text
 keys become `[unreviewed-key]`. Rule IDs are explicit at the validation sites.
+Arbitrary numeric mapping keys are unreviewed too; raw message/field numbers are
+reported only after validating their FIT field identifiers.
 
 Report replacement is atomic with a `0600` temporary file and `0700` report
 directory, with file and directory flushes. Concurrent failures leave the latest
@@ -188,6 +191,12 @@ data directory is unsafe, a snapshot, or unwritable, `report` is null and the
 original diagnostic still reaches stderr; there is no alternate write location.
 A failed restore can create a report-only data directory; use a new destination
 for a subsequent restore. Other committed store contents remain unchanged.
+These diagnostic members extend the previous `privacy_failed` error shape.
+Snapshot sidecars and detected concurrent changes now return `busy` instead of
+`privacy_failed`; both remain safe errors with exit code `2`. Consumers matching
+error names or enforcing exact error keys must account for these changes.
+Nested snapshot destinations now return `unsafe_store` (also exit `2`), rejecting
+the path before diagnostic writes can modify the input store.
 
 ### SQLite analysis export
 
@@ -258,8 +267,13 @@ that version.
 Snapshot and analysis exports pin all source reads to one SQLite read transaction
 under the bridge lock. This also prevents mixed catalog/journal/artifact versions
 when an independent SQLite connection commits in WAL mode. Rollback-mode writers
-may be blocked until the export finishes. Filesystem replacement or writes that
-bypass SQLite locking remain unsupported.
+may be blocked during source acquisition, and WAL checkpoints may be unable to
+truncate the WAL while that transaction is open. The source transaction closes
+before independent destination validation and publication, including on errors.
+An absent source database remains an empty snapshot if a first writer creates it
+during acquisition. Filesystem replacement or writes that bypass SQLite locking
+remain unsupported. The transaction fixes a reproducible mixed-commit race; it
+does not establish the cause of an unobserved failure in a private store.
 
 ### Private SQLite snapshots
 
@@ -286,7 +300,12 @@ Older streams use first/middle/last record and event spot checks, with lap/messa
 context retained.
 It does not rebuild the database or require a canonical physical byte layout.
 Snapshot verification refuses SQLite journal/WAL/SHM sidecars with `busy`, including
-sidecars appearing during verification; it never recovers them. Unexpected temporary
+sidecars appearing during verification or restore; it never recovers them. Changes
+to the database or manifest detected during a read also return `busy`, even if
+checksum or contract validation failed. Such superseded failures do not replace
+the privacy report. Snapshot files must remain immutable while being read; these
+checks cannot protect against arbitrary same-user filesystem replacement or
+writes that evade the before/after checks. Unexpected temporary
 or recovery files fail the exact snapshot-member rule. Source-store staging files
 are not scanned or copied. Directory iteration order does not select members or
 samples.

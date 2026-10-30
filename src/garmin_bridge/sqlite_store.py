@@ -14,7 +14,7 @@ import sqlite3
 
 from . import contract as c
 from .errors import BridgeError
-from .privacy import failure, diagnosed, located, require_schema
+from .privacy import failure, diagnosed, located, require_schema, deferred_report
 from .persistence import require, validate_job, validate_state, validate_summary_provenance
 from .storage import Store, canonical, check_private, decode, empty_state
 
@@ -105,16 +105,27 @@ def connect(path, write=False, immutable=False):
     require(not (write and immutable), "sqlite_store.connect.1", "connection")
     uri = path.as_uri() + ("?mode=rw" if write else "?mode=ro")
     db = sqlite3.connect(uri + ("&immutable=1" if immutable else ""), uri=True)
-    db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 128 * 1024 * 1024)
-    db.execute("PRAGMA trusted_schema=OFF")
-    db.execute("PRAGMA foreign_keys=ON")
-    db.execute("PRAGMA busy_timeout=0")
-    if not write:
-        db.execute("PRAGMA query_only=ON")
-    else:
-        page_size = db.execute("PRAGMA page_size").fetchone()[0]
-        db.execute(f"PRAGMA max_page_count={16 * 1024**3 // page_size}")
+    try:
+        db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 128 * 1024 * 1024)
+        db.execute("PRAGMA trusted_schema=OFF")
+        db.execute("PRAGMA foreign_keys=ON")
+        db.execute("PRAGMA busy_timeout=0")
+        if not write:
+            db.execute("PRAGMA query_only=ON")
+        else:
+            page_size = db.execute("PRAGMA page_size").fetchone()[0]
+            db.execute(f"PRAGMA max_page_count={16 * 1024**3 // page_size}")
+    except BaseException:
+        db.close()
+        raise
     return db
+
+
+def storage_error(error):
+    code = getattr(error, "sqlite_errorcode", 0) & 0xFF
+    return BridgeError(
+        "busy" if code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED} else "storage_failed"
+    )
 
 
 @located(DATABASE, "sqlite_schema")
@@ -204,24 +215,35 @@ class SQLiteStore(Store):
                 finally:
                     recovery.close()
             db = connect(path, write, immutable=self.path("manifest.json").exists())
-        except sqlite3.Error:
-            raise BridgeError("storage_failed") from None
+        except sqlite3.Error as error:
+            raise storage_error(error) from None
         try:
             if not write:
                 db.execute("BEGIN")
             check_schema(db)
             with db:
                 yield db
-        except sqlite3.Error:
-            raise BridgeError("storage_failed") from None
+        except sqlite3.Error as error:
+            raise storage_error(error) from None
         finally:
             db.close()
 
     @contextmanager
     def read_snapshot(self):
         """Pin all related reads, including WAL writers outside the bridge lock."""
-        if self._absent_snapshot or not self.path(DATABASE).exists():
+        if self._absent_snapshot:
             yield
+            return
+        if not self.path(DATABASE).exists():
+            if self.path("index.json").exists():
+                raise BridgeError("storage_format_conflict")
+            # An independent SQLite writer can create a first database without
+            # taking the bridge lock. Keep this acquisition consistently empty.
+            self._absent_snapshot = True
+            try:
+                yield
+            finally:
+                self._absent_snapshot = False
             return
         if getattr(self, "_transaction", None) is not None:
             yield
@@ -290,6 +312,7 @@ class SQLiteStore(Store):
 
     @diagnosed(source=True)
     @located(DATABASE, "documents")
+    @deferred_report()
     def preview_state(self):
         """Read one committed catalog without the bridge lock or journal recovery."""
         path = self._database()

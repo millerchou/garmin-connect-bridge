@@ -1,7 +1,7 @@
 """Private no-replace, self-contained SQLite snapshots."""
 
 import hashlib
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -16,7 +16,7 @@ from .persistence import (
     validate_state,
 )
 from .errors import BridgeError
-from .privacy import diagnosed, located
+from .privacy import diagnosed, located, deferred_report
 from .jobs import gaps
 from .normalize import sha256
 from .sqlite_store import (
@@ -242,14 +242,14 @@ def export_snapshot(source, destination):
     target, parent = new_destination(destination, source.root)
     with (
         source.lock(),
-        source.read_snapshot(),
         tempfile.TemporaryDirectory(prefix=".sqlite-export-", dir=parent.root) as temp,
     ):
         staging = SQLiteStore(Path(temp) / "stage")
         staging.ensure()
         clean = SQLiteStore(Path(temp) / "clean")
         clean.ensure()
-        copy_logical(source, clean)
+        with source.read_snapshot():
+            copy_logical(source, clean)
         # The SQLite backup API creates a consistent independent file, never a
         # copy of a live main file or a dependency on its journal/WAL/SHM.
         staging.write_bytes(DATABASE, b"")
@@ -286,11 +286,48 @@ def snapshot_members(store):
     )
 
 
+@contextmanager
+def snapshot_read(store):
+    """Immutable SQLite reads need filesystem guards, including on failure."""
+
+    def signature():
+        # Check sidecars before checksum/schema failures can mask a writer.
+        for suffix in ("-journal", "-wal", "-shm"):
+            path = store.root / (DATABASE + suffix)
+            if path.exists() or path.is_symlink():
+                raise BridgeError("busy") from None
+        result = []
+        for name in (DATABASE, "manifest.json"):
+            info = store.path(name).stat()
+            result.append(
+                (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+            )
+        return result
+
+    with deferred_report():
+        snapshot_members(store)
+        before = signature()
+        try:
+            yield
+        finally:
+            try:
+                after = signature()
+            except FileNotFoundError:
+                raise BridgeError("busy") from None
+            if before != after:
+                raise BridgeError("busy") from None
+            snapshot_members(store)
+
+
 @diagnosed(excluded_args=(0,))
-@located("manifest.json", "manifest")
 def verify_snapshot(directory):
     store = SQLiteStore(Path(directory))
-    snapshot_members(store)
+    with snapshot_read(store):
+        return verify_contents(store)
+
+
+@located("manifest.json", "manifest")
+def verify_contents(store):
     manifest = decode(Store.read_bytes(store, "manifest.json"))
     require(
         type(manifest) is dict and manifest.get("segment_algorithm_version") in ALGORITHMS,
@@ -346,28 +383,30 @@ def verify_snapshot(directory):
 @diagnosed(root_arg=1, excluded_args=(0,))
 def restore_snapshot(directory, destination):
     source = SQLiteStore(Path(directory))
-    source_manifest = Store.read_bytes(source, "manifest.json")
-    verify_snapshot(directory)
+    with snapshot_read(source):
+        source_manifest = Store.read_bytes(source, "manifest.json")
+        verify_contents(source)
     target, parent = new_destination(destination, source.root)
     with tempfile.TemporaryDirectory(prefix=".sqlite-restore-", dir=parent.root) as temp:
         staging = SQLiteStore(Path(temp) / "store")
         staging.ensure()
-        copy_logical(source, staging)
+        with snapshot_read(source):
+            copy_logical(source, staging)
+            require(
+                Store.read_bytes(source, "manifest.json") == source_manifest,
+                "sqlite_transfer.restore_snapshot.1",
+                "manifest",
+                file="manifest.json",
+                table="manifest",
+            )
+            require(
+                digest_file(source.path(DATABASE)) == decode(source_manifest)["sha256"],
+                "sqlite_transfer.restore_snapshot.2",
+                "sha256",
+                file="manifest.json",
+                table="manifest",
+            )
         info = inspect_store(staging, full_validation=False)
-        require(
-            Store.read_bytes(source, "manifest.json") == source_manifest,
-            "sqlite_transfer.restore_snapshot.1",
-            "manifest",
-            file="manifest.json",
-            table="manifest",
-        )
-        require(
-            digest_file(source.path(DATABASE)) == decode(source_manifest)["sha256"],
-            "sqlite_transfer.restore_snapshot.2",
-            "sha256",
-            file="manifest.json",
-            table="manifest",
-        )
         staging._fsync_dir(staging.root)
         publish_directory(staging.root, target.root)
         parent._fsync_dir(parent.root)

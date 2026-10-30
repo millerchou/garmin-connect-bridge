@@ -590,7 +590,7 @@ def export_analysis(source, destination):
     parent = Store(target.parent)
     parent.ensure()
     check_destination(parent, target.name)
-    with source.lock(), source.read_snapshot():
+    with source.lock():
         fd, name = tempfile.mkstemp(prefix=".analysis-", suffix=".sqlite", dir=parent.root)
         staging = Path(name)
         try:
@@ -599,7 +599,8 @@ def export_analysis(source, destination):
                 db.execute("PRAGMA foreign_keys=ON")
                 for table in TABLES:
                     db.execute(ddl(table))
-                expected, metadata = populate(db, source)
+                with source.read_snapshot():
+                    expected, metadata = populate(db, source)
             with closing(sqlite3.connect(staging.as_uri() + "?mode=ro", uri=True)) as db:
                 validate(db, expected, metadata)
             receipt = c.validate_output(

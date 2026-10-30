@@ -258,7 +258,7 @@ def test_dry_run_refuses_changes_during_read(store, today, monkeypatch, capsys, 
         writer_finished = False
         database_path = store.path(sqlite_store.DATABASE)
         stat = Path.stat
-        initial_mtime = stat(database_path).st_mtime_ns
+        initial_stat = stat(database_path)
 
         def changed_stat(path, *args, **kwargs):
             info = stat(path, *args, **kwargs)
@@ -267,7 +267,10 @@ def test_dry_run_refuses_changes_during_read(store, today, monkeypatch, capsys, 
                 # timestamp updates within one tick; inject the observed change
                 # instead of relying on elapsed time or sleep.
                 fields = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
-                fields["st_mtime_ns"] = initial_mtime + 1
+                fields["st_mtime_ns"] = initial_stat.st_mtime_ns + (finish == "rollback")
+                fields["st_ctime_ns"] = initial_stat.st_ctime_ns
+                # Commit/pending must be detected through actual header/size or
+                # journal changes even on filesystems with coalesced timestamps.
                 return SimpleNamespace(**fields)
             return info
 
