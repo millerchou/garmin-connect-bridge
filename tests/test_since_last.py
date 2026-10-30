@@ -2,6 +2,8 @@
 
 from datetime import date
 from contextlib import closing
+from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 
@@ -253,15 +255,35 @@ def test_dry_run_refuses_changes_during_read(store, today, monkeypatch, capsys, 
         guard_preview(monkeypatch)
         after_writer = None
         spilled = False
+        writer_finished = False
+        database_path = store.path(sqlite_store.DATABASE)
+        stat = Path.stat
+        initial_mtime = stat(database_path).st_mtime_ns
+
+        def changed_stat(path, *args, **kwargs):
+            info = stat(path, *args, **kwargs)
+            if path == database_path and writer_finished:
+                # A rollback restores identical bytes. Filesystems may coalesce
+                # timestamp updates within one tick; inject the observed change
+                # instead of relying on elapsed time or sleep.
+                fields = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
+                fields["st_mtime_ns"] = initial_mtime + 1
+                return SimpleNamespace(**fields)
+            return info
+
+        monkeypatch.setattr(Path, "stat", changed_stat)
 
         def change_state(db):
-            nonlocal after_writer, spilled
+            nonlocal after_writer, spilled, writer_finished
             check_schema(db)
             writer.execute("BEGIN IMMEDIATE")
             writer.execute("UPDATE documents SET payload=zeroblob(131072) WHERE name='index.json'")
             spilled = store.path(sqlite_store.DATABASE).read_bytes() != original
             if finish != "pending":
                 getattr(writer, finish)()
+            if finish == "rollback":
+                assert database_path.read_bytes() == original
+            writer_finished = True
             after_writer = saved_files(store)
 
         monkeypatch.setattr(sqlite_store, "check_schema", change_state)
