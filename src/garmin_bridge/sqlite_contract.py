@@ -36,14 +36,22 @@ def window_contract(units):
             "units": c.obj({k: c.literal(v) for k, v in units.items()}),
             "coverage": c.coverage_for(units),
             "quality_flags": c.QUALITY,
-            "records": c.sequence(c.obj({"ordinal": c.count, "sample": c.obj(sample)}), 200),
+            "records": c.sequence(
+                c.obj(
+                    {"ordinal": c.count, "sample": c.record_check(sample, units == c.STREAM_UNITS)}
+                ),
+                200,
+            ),
             "next_offset": c.nullable(c.count),
         }
     )
 
 
 def WINDOW(value):
-    return window_contract(c.STREAM_UNITS)(value) or window_contract(c.LEGACY_STREAM_UNITS)(value)
+    return any(
+        window_contract(units)(value)
+        for units in (c.STREAM_UNITS, c.V1_STREAM_UNITS, c.LEGACY_STREAM_UNITS)
+    )
 
 
 HISTORY_ROW = c.obj(

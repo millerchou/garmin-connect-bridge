@@ -73,6 +73,7 @@ def build_parser():
         action="store_true",
         help="Explicitly verify/refresh the saved session without a password",
     )
+    commands.add_parser("fit-blocked", help="List private blocked FIT field counts (no values)")
     commands.add_parser("status", help="Offline authentication state, coverage and freshness")
     importing = commands.add_parser(
         "import-fit", help="Offline import of one private FIT or single-FIT ZIP; no authentication"
@@ -317,6 +318,10 @@ def execute(args):
     write = args.command in {"auth", "sync", "import-fit"}
     write = write or (args.command == "segment" and args.segment_action != "history")
     with store.lock(write=write):
+        if args.command == "fit-blocked":
+            from .fit_unknown import REPORT_PATH, read_report
+
+            return {"report": REPORT_PATH, "blocked": read_report(store)}
         if args.command == "window":
             from .sqlite_query import window
 

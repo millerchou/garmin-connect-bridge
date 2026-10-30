@@ -179,10 +179,11 @@ This is a query artifact, not a restorable store or snapshot.
 | Table | Contents |
 | --- | --- |
 | `activities` | One row per activity, flattened summary metrics and `garmin_reported_*` estimates, metric `*_source` columns, normalizer/schema/FIT-field versions, UTC/local activity time, timezone and UTC offset, provenance, counts, coverage and quality JSON. |
-| `records` | `activity_id`, zero-based `ordinal`, `timestamp`, and one numeric/text column per existing record whitelist field. Duplicates and input order are preserved. |
-| `laps` | Base `start`, `end`, `duration`, `distance`; detailed `fit_*` and `garmin_reported_*` columns. Two-element FIT arrays use `_0` and `_1` in original order. |
+| `records` | `activity_id`, zero-based `ordinal`, `timestamp`, typed measurement columns including `fractional_cadence`, and `unknown_json` with raw `unknown_N` keys. Duplicates and input order are preserved. |
+| `laps` | Base `start`, `end`, `duration`, `distance`; detailed `fit_*` and `garmin_reported_*` columns, including `fit_event` and `fit_event_type`; raw fields in `unknown_json`. Two-element FIT arrays use `_0` and `_1` in original order. |
 | `events` | Detailed `fit_*` columns, including `fit_timestamp`. Historical streams without detailed events retain their timer rows in `timer_type`; unavailable numeric event codes remain NULL. |
-| `messages` | The detailed session at ordinal zero, followed by auxiliary messages in source order; `message` and validated `detail_json` retain field units and `garmin_reported` labels. Historical streams without details have no message rows. |
+| `messages` | The detailed session at ordinal zero, followed by auxiliary messages in source order, including `segment_lap` and `timestamp_correlation`; `message` and validated `detail_json` retain units, `garmin_reported` labels and separate raw `unknown` objects. Historical streams without details have no message rows. |
+| `raw_messages` | Undocumented messages in source order: `activity_id TEXT`, `ordinal INTEGER`, `mesg_num INTEGER`, `fields_json TEXT` containing decimal field-number keys and raw integers/arrays/nulls. No timestamp alignment or semantic names are inferred. |
 | `meta` | One row: export format version, generated UTC time, CLI version, current activity UTC range, contiguous successful coverage dates, all covered/pending ranges, gap count, per-table counts, and `units_json`. No content hashes determine these counts. |
 
 Column units follow the existing normalized contract and are recorded explicitly
@@ -193,6 +194,17 @@ IDs remain text to avoid integer overflow. SQL NULL means
 missing or invalid; no values are interpolated. `garmin_reported_*` values remain
 Garmin estimates. The existing approved rider-posture fields such as
 `avg_power_position` describe riding posture, not geographic position.
+
+Analysis format **2** adds the raw-message table and JSON columns. All child tables
+have primary key `(activity_id, ordinal)` and a foreign key to `activities`.
+`records.fractional_cadence`, `laps.fit_event`, and `laps.fit_event_type` use REAL,
+consistent with the existing numeric measurement/code columns. `unknown_json`,
+`detail_json` and `fields_json` are validated JSON stored as TEXT; these map directly
+to PostgreSQL JSONB alongside the typed keys. Raw integers retain their JSON integer
+representation, including values outside SQLite's signed INTEGER range. Consumers
+must avoid conversion to floating point if exact large integers matter. Missing
+unknown fields are absent keys; invalid FIT values are JSON null. Raw quantities
+have no inferred units, scale or offset and are excluded from measurement coverage.
 
 Identity-enabled **current** revisions are refused with `analysis_identity`, even
 if no serial/profile value was present. Reimport/recheck with identity retention
@@ -205,7 +217,8 @@ Export builds a fresh temporary SQLite file in the destination directory, valida
 the full current source contracts, then checks `PRAGMA integrity_check`, foreign
 keys, the exact table/column whitelist, JSON contracts with identity disabled, and
 per-activity row counts and ordinals before atomic rename. An independent denylist
-also checks every column name and every nested `detail_json` key for location and
+also checks every column name and every nested `detail_json`, `unknown_json`, and
+`fields_json` key for location and
 identity names, including prefixed/suffixed tokens, camelCase and separator
 variants; approved power/cadence posture and sensor-position fields remain allowed.
 The file and destination directory are flushed before success; a directory-flush failure restores the prior
@@ -252,7 +265,7 @@ incomplete API history: consult status and gaps.
 ## Data and privacy boundaries
 
 The primary store is `activities.sqlite`, storage/user version **1**, activity
-schema **1.0**, normalizer **1.3.0**. Existing SQLite stores remain directly usable
+schema **1.0**, normalizer **1.4.0**. Existing SQLite stores remain directly usable
 without migration or schema changes. Historical stream shapes and immutable
 revisions remain readable. The four tables are `documents`, `samples`, `segments`,
 and `efforts`; JSON payloads preserve numeric types, signed zero, nulls, and precision.
@@ -266,9 +279,10 @@ checks. Writes and exports validate full contracts; CLI output remains independe
 validated. The catalog and each requested stream are materialized in memory. The
 database limit is 16 GiB; this is not an unbounded-history performance guarantee.
 
-The normalized field allowlist is [fit_fields.py](src/garmin_bridge/fit_fields.py).
+The documented field contract is [fit_fields.py](src/garmin_bridge/fit_fields.py),
+checked against the public [Garmin FIT Profile 21.218.0](https://github.com/garmin/fit-python-sdk/blob/main/garmin_fit_sdk/profile.py).
 Summary metrics, units, sources, and fallback behavior are fixed. Detailed session,
-lap, event, and auxiliary fields have `fit_fields_version: "1.0"`. Absent fields
+lap, event, and auxiliary fields have `fit_fields_version: "1.1"`. Absent fields
 stay absent; FIT invalid values become null; arrays retain order and null slots.
 There is no resampling, interpolation, clamping, or invented sensor data. Garmin
 estimates and historical settings remain labelled `garmin_reported`, not independent
@@ -277,11 +291,103 @@ measurements. Cadence consistency flags do not correct or discard observations.
 Local time uses only unambiguous historical file evidence when API time is absent.
 No IANA timezone is inferred; `utc_offset` alone is not a timezone. Compressed FIT
 timestamps require an approved standard anchor. Unknown/developer fields cannot
-supply it. Unreviewed fields and arbitrary nested/free-text payloads are excluded.
+supply it. Standard developer-field payloads and documented fields outside the
+explicit contract remain excluded; undocumented numeric data follows the separate
+interception rules below.
+
+Version 1.1 adds all documented non-coordinate `segment_lap` fields, including
+names, UUIDs, time, distance, power, HR, cadence, elevation, work, balance and status;
+split-referenced `time_in_zone` rows with unique matching indices; generic event
+codes; session `first_lap_index`, `trigger`, `event`, `event_type`; lap event headers;
+split `message_index`; `device_info.ant_network`; remaining documented device
+settings; and `timestamp_correlation`. Unknown event codes retain headers; opaque
+event payloads still require the existing event-specific permission. Sport/profile
+names and segment names/UUIDs retain printable free text up to 254 characters.
+`record.fractional_cadence` is also stored separately in rpm; the existing combined
+`cadence` calculation is unchanged. Garmin estimates retain `garmin_reported` labels.
+`timestamp_correlation.system_timestamp` preserves device-clock seconds, including
+relative values; it does not assert an independently known UTC time.
+
+Undocumented physical fields retain raw integer values or arrays, with invalid
+slots represented by null. Record keys are `unknown_N`; session, lap, split,
+split_summary, sport, training_settings, device_settings, zones_target, device_info,
+segment_lap and timestamp_correlation use a separate `unknown` object. Documented
+fields absent from fitdecode's older profile still use the explicit contract when
+available; they are never duplicated as raw fields. Entire undocumented messages
+use `raw_messages` rows with `mesg_num` and decimal field-number keys. Their raw
+timestamp fields, if present, stay integers and never seed the compressed clock.
+
+The primary store reuses `samples(name TEXT, kind TEXT, ordinal INTEGER, payload
+BLOB)` with primary key `(name, kind, ordinal)`; payload is canonical JSON. The new
+`kind='raw_messages'` partition separates high-frequency rows from ordinary detail
+messages. Analysis exports give it a dedicated table. This avoids sparse dynamic
+columns and preserves duplicate/missing timestamps without an inferred record
+join. Documented messages remain in the existing `messages` partition. No physical
+table migration is necessary. New detail shapes are identified by FIT field version
+1.1; field version 1.0 and pre-detail streams remain readable. The snapshot manifest
+stays at format 2, with an additional `fit_counts.raw_messages` count only when 1.1
+streams exist. Analysis format changes to 2 because its SQL schema changes.
+
+Re-sync API activities or re-import offline activities to obtain normalizer 1.4.0
+revisions. Original FIT inputs are required. Old immutable revisions remain intact;
+no watermark, authentication or segment-matching algorithm change is involved.
+As before, offline import of identical API-derived content preserves its API
+revision; use sync to upgrade that revision. Older software cannot read 1.1 streams.
+
+### Undocumented-field interception and report
+
+[fit_unknown.py](src/garmin_bridge/fit_unknown.py) applies conservative rules before
+raw values enter structured storage:
+
+- The entire `user_profile` message, including unknown fields, is excluded by
+  default. Message 79 is always excluded. Identity opt-in still allows only the
+  existing reviewed serial/profile subset; it never allows message 79 or unknown
+  profile fields.
+- Every undocumented `sint32` is blocked as `possible_semicircle`. All valid signed
+  32-bit magnitudes can encode semicircle coordinates, even zero/small values.
+  Blocking the entire type also catches fields correlated with positions, including
+  short or constant streams; no position samples or correlation statistics are saved.
+  This deliberately withholds some harmless counters/measurements.
+- Strings and byte blobs are blocked as `possible_identity`, as are uint8/uint8z
+  arrays of at least four elements containing only printable ASCII, zero or null.
+  This avoids retaining possible device names or serial strings. Other non-integer
+  types, including floats, are blocked as `non_integer_raw`; no scaling is guessed.
+
+The local private report is
+`$GARMIN_BRIDGE_DATA_DIR/reports/fit-blocked-fields.json` (under the effective
+`--data-dir` when supplied). Inspect it offline with:
+
+```sh
+garmin-bridge fit-blocked
+```
+
+Each report row contains **only** `field` (`mesg_num.field_num`), a fixed `reason`,
+and `row_count`. It contains no blocked values, timestamps, activity IDs, source
+hashes, names or paths. Counts accumulate across successfully normalized attempts,
+once per physical message row, not per array element. Cache hits do not increment
+them; retries after publication failure or skipped publication can increment them.
+They are audit counts, not current-revision totals. Writes are atomic and private
+(`0600` file, `0700` directory). A malformed report fails closed. Reports are local
+sidecars, excluded from analysis exports and snapshots; restore does not recreate
+them. The command supports review only; it does not enable any blocked fields.
+
+These heuristics cannot identify every numeric encoding of identity or geography.
+Explicitly retained names/UUIDs may themselves contain personal or place text.
+The export denylist is a key-name backstop, not a semantic anonymizer; keep all
+outputs private. No live files were used to tune the heuristics.
+
+Size scales with field and row counts. An entirely synthetic 3,600-record example,
+adding one raw integer per record plus one four-integer message 534 per record,
+and populating fractional cadence, added **647,168 bytes** to the primary SQLite
+store and **344,064 bytes** to the analysis export (about 0.62/0.33 MiB). This compares
+two current-version stores and excludes originals. A four-field raw-message JSON
+row was 55 bytes before SQLite keys/page overhead. Arrays and longer text increase
+this; these are synthetic estimates, not measurements of personal activity data.
 
 Identity retention is default-off. `sync` and `import-fit` accept
 `--include-fit-identity` for reviewed serial/profile fields only. Positions remain
-excluded. Sport labels use a closed vocabulary; opt-in friendly names are bounded.
+excluded. Sport/profile labels now allow bounded free text; opt-in friendly names
+remain bounded.
 Changing this option creates/reuses an immutable revision and requeues affected
 work on resume. Turning it off does not erase older revisions; snapshots explicitly
 declare identity retained anywhere in their history. Such data must remain private.
@@ -289,7 +395,10 @@ declare identity retained anywhere in their history. Such data must remain priva
 Original archives are read in memory without extracting supplied paths. Ambiguous
 archives, unsafe paths, bad FIT framing/CRC, multi-session/non-cycling inputs,
 inputs above 64 MiB, and excessive expansion are rejected. Parser limits are
-500,000 records, 10,000 laps, 100,000 events, and 100,000 auxiliary messages.
+500,000 records, 10,000 laps, 100,000 events, 100,000 auxiliary messages, and 500,000
+undocumented message rows. SQLite permits up to 512 KiB per stream row to accommodate
+physical FIT arrays after JSON expansion. These limits do not guarantee bounded
+memory suitable for every device/file combination.
 
 After raw deduplication, new originals are stored as the decompressed FIT file at
 `raw/<sha256>.bin`, named by the SHA-256 of those FIT bytes. Garmin's ZIP wrapper
@@ -322,11 +431,14 @@ Default tests are offline and generate FIT/SQLite inputs in code. They must cove
 - Two-pass catalog consistency, pagination, delayed uploads, partial failures,
   interruption/resume, gaps, and failure-does-not-advance-watermark.
 - Atomic SQLite publication/recovery, locking, permissions, missing data, bounded
-  offline queries, and continued use of storage version 1 with normalizer 1.3.0.
+  offline queries, and continued use of storage version 1 with normalizer 1.4.0.
 - Snapshot checksum/integrity/schema checks, contract spot checks, full validation
   on export/restore, revision/progress preservation, and incremental sync after restore.
 - Current-only typed analysis export, identity/location exclusion, atomic overwrite
   and failure preservation, SQL units/provenance, and legacy stream support.
+- Segment-lap location stripping, split zone references, generic event headers,
+  raw undocumented fields/messages, conservative coordinate/identity interception,
+  value-free blocked-field reports, and version 1.0/1.1 detail compatibility.
 - `--since-last` overlap and no-watermark errors, a dry-run without clients, bridge
   locks or writes, successful watermark preservation on failure, decompressed raw
   deduplication, and existing ZIP reference readability.

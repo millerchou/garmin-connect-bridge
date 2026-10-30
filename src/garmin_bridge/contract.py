@@ -7,9 +7,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .errors import BridgeError, MESSAGES
 from .fit_fields import AUXILIARY_MESSAGES, FIT_FIELDS_VERSION, RECORD_UNITS
+from .fit_unknown import validate_report, REPORT_PATH
 
 SCHEMA_VERSION = "1.0"
-NORMALIZER_VERSION = "1.3.0"
+NORMALIZER_VERSION = "1.4.0"
 LEGACY_STREAM_UNITS = {
     "timestamp": "UTC",
     "heart_rate": "bpm",
@@ -25,6 +26,7 @@ LEGACY_STREAM_UNITS = {
 }
 
 STREAM_UNITS = {**LEGACY_STREAM_UNITS, **RECORD_UNITS}
+V1_STREAM_UNITS = {k: v for k, v in STREAM_UNITS.items() if k != "fractional_cadence"}
 
 METRIC_UNITS = {
     "duration": "s",
@@ -163,7 +165,9 @@ def coverage_for(units):
 
 
 def COVERAGE(value):
-    return coverage_for(STREAM_UNITS)(value) or coverage_for(LEGACY_STREAM_UNITS)(value)
+    return any(
+        coverage_for(units)(value) for units in (STREAM_UNITS, V1_STREAM_UNITS, LEGACY_STREAM_UNITS)
+    )
 
 
 FILES = obj(
@@ -308,7 +312,17 @@ SYNC_REPORT = obj(
     }
 )
 
+
+def blocked_report(value):
+    try:
+        validate_report(value)
+        return True
+    except BridgeError:
+        return False
+
+
 OUTPUTS = {
+    "fit-blocked": obj({"report": literal(REPORT_PATH), "blocked": blocked_report}),
     "export": obj(
         {
             "schema_version": literal(SCHEMA_VERSION),
@@ -414,11 +428,27 @@ def project_activity(value):
     return projected
 
 
+def record_check(fields, allow_unknown=False):
+    def check(row):
+        if type(row) is not dict:
+            return False
+        base = {k: v for k, v in row.items() if k in fields}
+        unknown = {k: v for k, v in row.items() if k not in fields}
+        from .fit_unknown import valid_unknown
+
+        return obj(fields)(base) and (
+            valid_unknown(unknown, "record") if allow_unknown else not unknown
+        )
+
+    return check
+
+
 def validate_streams(value):
     from .fit_details import filter_message_context, valid_message
 
     extended = type(value) is dict and "fit_fields_version" in value
-    units = STREAM_UNITS if extended else LEGACY_STREAM_UNITS
+    full = extended and value.get("fit_fields_version") == FIT_FIELDS_VERSION
+    units = STREAM_UNITS if full else V1_STREAM_UNITS if extended else LEGACY_STREAM_UNITS
     identity = value.get("include_identity", False) if type(value) is dict else False
     fields = {key: nullable(numeric) for key in units}
     fields["timestamp"] = nullable(lambda x: iso_time(x, True))
@@ -433,12 +463,16 @@ def validate_streams(value):
     if extended:
         lap["fit"] = lambda x: valid_message(x, identity, {"lap"})
         extra = {
-            "fit_fields_version": literal(FIT_FIELDS_VERSION),
+            "fit_fields_version": literal("1.0", FIT_FIELDS_VERSION),
             "include_identity": lambda x: type(x) is bool,
             "session": lambda x: valid_message(x, identity, {"session"}),
             "events": sequence(lambda x: valid_message(x, identity, {"event"}), 100_000),
             "messages": sequence(lambda x: valid_message(x, identity, AUXILIARY_MESSAGES), 100_000),
         }
+    if full:
+        from .fit_unknown import valid_raw_message
+
+        extra["raw_messages"] = sequence(valid_raw_message, 500_000)
     check = obj(
         {
             "schema_version": literal(SCHEMA_VERSION),
@@ -455,7 +489,7 @@ def validate_streams(value):
                     "distance": literal("m"),
                 }
             ),
-            "records": sequence(obj(fields), 500_000),
+            "records": sequence(record_check(fields, full), 500_000),
             "laps": sequence(obj(lap), 10_000),
             "timer_events": sequence(
                 obj(

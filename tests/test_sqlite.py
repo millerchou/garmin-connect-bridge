@@ -327,7 +327,7 @@ def test_backup_cli_uses_sqlite_and_preserves_revisions(database, tmp_path, caps
     assert cli.main(["--data-dir", str(target), "list"]) == 0
     listing = json.loads(capsys.readouterr().out)
     assert listing["storage_version"] == 1
-    assert listing["activities"][0]["normalizer_version"] == "1.3.0"
+    assert listing["activities"][0]["normalizer_version"] == "1.4.0"
     assert listing["activities"][0]["coverage"]["power"]["missing"] == 1
 
 
@@ -421,7 +421,7 @@ def test_normal_reads_keep_row_order_and_size_limits(database, tmp_path, monkeyp
             else:
                 db.execute(
                     "UPDATE samples SET payload=? WHERE kind='records' AND ordinal=1",
-                    (canonical({"synthetic": "x" * 32768}),),
+                    (canonical({"synthetic": "x" * (512 * 1024)}),),
                 )
     with pytest.raises(BridgeError):
         database.read_bytes(ref, limit=1 if damage == "read_limit" else None)

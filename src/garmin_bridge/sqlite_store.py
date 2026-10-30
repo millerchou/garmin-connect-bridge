@@ -27,12 +27,15 @@ ARRAY_LIMITS = {
     "timer_events": 100_000,
     "events": 100_000,
     "messages": 100_000,
+    "raw_messages": 500_000,
 }
 
 
 def stream_arrays(value):
     return (
-        tuple(ARRAY_LIMITS)
+        tuple(
+            k for k in ARRAY_LIMITS if k != "raw_messages" or value["fit_fields_version"] == "1.1"
+        )
         if "fit_fields_version" in value
         else ("records", "laps", "timer_events")
     )
@@ -336,7 +339,9 @@ class SQLiteStore(Store):
                         (relative, array),
                     ).fetchone()
                     require(count <= ARRAY_LIMITS[array])
-                    require(size is None or size <= 32_768)
+                    # FIT permits up to 255 physical fields of 255 bytes each;
+                    # integer arrays can expand beyond the old 32 KiB row cap.
+                    require(size is None or size <= 512 * 1024)
                     rows = db.execute(
                         "SELECT ordinal,payload FROM samples WHERE name=? AND kind=? ORDER BY ordinal",
                         (relative, array),

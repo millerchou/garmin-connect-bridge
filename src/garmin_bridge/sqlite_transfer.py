@@ -62,7 +62,7 @@ def inspect_store(store, *, full_validation=True):
                 # Sample records/events; keep lap/message context for zone references.
                 # Export validates every row.
                 sample = dict(value)
-                for key in ("records", "timer_events", "events"):
+                for key in ("records", "timer_events", "events", "raw_messages"):
                     if key in sample:
                         rows = sample[key]
                         sample[key] = [
@@ -93,6 +93,8 @@ def inspect_store(store, *, full_validation=True):
                     field_versions.add(value["fit_fields_version"])
                     detail_counts["sessions"] += 1
                     detail_counts["identity_revisions"] += value["include_identity"]
+                if value.get("fit_fields_version") == "1.1":
+                    detail_counts.setdefault("raw_messages", 0)
                 for key in stream_arrays(value):
                     target = counts if key in counts else detail_counts
                     target[key] += len(value[key])

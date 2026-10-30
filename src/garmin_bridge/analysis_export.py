@@ -13,6 +13,7 @@ from . import __version__, contract as c
 from .errors import BridgeError
 from .fit_details import specs_for, valid_message
 from .fit_fields import AUXILIARY_MESSAGES
+from .fit_unknown import valid_raw_message, valid_unknown
 from .jobs import gaps, load_job
 from .persistence import artifact_files, identity_enabled, require
 from .sqlite_transfer import digest_file
@@ -105,6 +106,7 @@ TABLES = {
         },
     },
     "records": {
+        "unknown_json": "TEXT",
         "activity_id": "TEXT",
         "ordinal": "INTEGER",
         **{
@@ -113,6 +115,7 @@ TABLES = {
         },
     },
     "laps": {
+        "unknown_json": "TEXT",
         "activity_id": "TEXT",
         "ordinal": "INTEGER",
         "start": "TEXT",
@@ -133,6 +136,12 @@ TABLES = {
         "message": "TEXT",
         "detail_json": "TEXT",
     },
+    "raw_messages": {
+        "activity_id": "TEXT",
+        "ordinal": "INTEGER",
+        "mesg_num": "INTEGER",
+        "fields_json": "TEXT",
+    },
     "meta": {
         "format_version": "INTEGER",
         "generated_at": "TEXT",
@@ -146,7 +155,7 @@ TABLES = {
         "gap_count": "INTEGER",
         **{
             table + "_count": "INTEGER"
-            for table in ("activities", "records", "laps", "events", "messages")
+            for table in ("activities", "records", "laps", "events", "messages", "raw_messages")
         },
         "units_json": "TEXT",
     },
@@ -161,7 +170,8 @@ UNITS = {
         "acquired_at": "UTC",
         "utc_offset_seconds": "s",
     },
-    "records": c.STREAM_UNITS,
+    "records": {**c.STREAM_UNITS, "unknown_json": "raw FIT integers; no scale/offset"},
+    "raw_messages": {"fields_json": "raw FIT integers; no scale/offset"},
     "laps": {"start": "UTC", "end": "UTC", "duration": "s", "distance": "m"},
     "events": {},
 }
@@ -197,7 +207,11 @@ def json_text(value):
 
 
 def flatten_detail(message):
-    result = {}
+    result = (
+        {"unknown_json": json_text(message.get("unknown", {}))}
+        if message["message"] == "lap"
+        else {}
+    )
     for group, prefix in (("fields", "fit_"), ("garmin_reported", "garmin_reported_")):
         for name, quantity in message[group].items():
             value = quantity["value"]
@@ -273,15 +287,34 @@ def populate(db, source):
             "laps": len(streams["laps"]),
             "events": len(events),
             "messages": len(messages),
+            "raw_messages": len(streams.get("raw_messages", [])),
         }
         for table, rows in (
-            ("records", streams["records"]),
+            (
+                "records",
+                (
+                    {
+                        **{k: v for k, v in row.items() if k in c.STREAM_UNITS},
+                        "unknown_json": json_text(
+                            {k: v for k, v in row.items() if k not in c.STREAM_UNITS}
+                        ),
+                    }
+                    for row in streams["records"]
+                ),
+            ),
+            (
+                "raw_messages",
+                (
+                    {"mesg_num": row["mesg_num"], "fields_json": json_text(row["fields"])}
+                    for row in streams.get("raw_messages", [])
+                ),
+            ),
             (
                 "laps",
                 (
                     {
                         **{k: row[k] for k in ("start", "end", "duration", "distance")},
-                        **(flatten_detail(row["fit"]) if "fit" in row else {}),
+                        **(flatten_detail(row["fit"]) if "fit" in row else {"unknown_json": "{}"}),
                     }
                     for row in streams["laps"]
                 ),
@@ -301,7 +334,7 @@ def populate(db, source):
     ]
     mark = watermark(state)
     metadata = {
-        "format_version": 1,
+        "format_version": 2,
         "generated_at": now(),
         "cli_version": __version__,
         "activity_start_utc": min(times, key=datetime.fromisoformat) if times else None,
@@ -314,7 +347,7 @@ def populate(db, source):
         "activities_count": len(expected),
         **{
             table + "_count": sum(counts[table] for counts in expected.values())
-            for table in ("records", "laps", "events", "messages")
+            for table in ("records", "laps", "events", "messages", "raw_messages")
         },
         "units_json": json_text(UNITS),
     }
@@ -336,7 +369,7 @@ def validate(db, expected, metadata):
             require_safe_name(name)
         require(actual == list(columns.items()))
     require({row[0] for row in db.execute("SELECT activity_id FROM activities")} == set(expected))
-    for table in ("records", "laps", "events", "messages"):
+    for table in ("records", "laps", "events", "messages", "raw_messages"):
         counts = {
             ident: (count, low, high)
             for ident, count, low, high in db.execute(
@@ -358,6 +391,16 @@ def validate(db, expected, metadata):
         validate_detail_keys(value)
         require(valid_message(value, False, AUXILIARY_MESSAGES | {"session"}))
         require(message == value["message"])
+
+    for table, message in (("records", "record"), ("laps", "lap")):
+        for (payload,) in db.execute(f'SELECT unknown_json FROM "{table}"'):
+            value = decode(payload.encode())
+            validate_detail_keys(value)
+            require(valid_unknown(value, message))
+    for number, payload in db.execute("SELECT mesg_num,fields_json FROM raw_messages"):
+        value = decode(payload.encode())
+        validate_detail_keys(value)
+        require(valid_raw_message({"mesg_num": number, "fields": value}))
 
 
 def check_destination(parent, name):
