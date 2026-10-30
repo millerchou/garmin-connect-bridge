@@ -11,6 +11,7 @@ import warnings
 
 from .contract import SCHEMA_VERSION, day, identifier, project_activity, validate_output
 from .errors import BridgeError, MESSAGES
+from .privacy import diagnostic_scope
 from .sync import choose_range, files_available, freshness, since_last_range, synchronize
 from .upstream import GarminSource, authenticate, auth_status
 
@@ -73,6 +74,7 @@ def build_parser():
         action="store_true",
         help="Explicitly verify/refresh the saved session without a password",
     )
+    commands.add_parser("fit-blocked", help="List private blocked FIT field counts (no values)")
     commands.add_parser("status", help="Offline authentication state, coverage and freshness")
     importing = commands.add_parser(
         "import-fit", help="Offline import of one private FIT or single-FIT ZIP; no authentication"
@@ -317,6 +319,10 @@ def execute(args):
     write = args.command in {"auth", "sync", "import-fit"}
     write = write or (args.command == "segment" and args.segment_action != "history")
     with store.lock(write=write):
+        if args.command == "fit-blocked":
+            from .fit_unknown import REPORT_PATH, read_report
+
+            return {"report": REPORT_PATH, "blocked": read_report(store)}
         if args.command == "window":
             from .sqlite_query import window
 
@@ -380,10 +386,18 @@ def execute(args):
 
 def main(argv=None):
     logging.disable(logging.CRITICAL)
+    diagnostic = None
+    report = None
     try:
         args = build_parser().parse_args(argv)
         preview = args.command == "sync" and args.dry_run
-        result = validate_output("sync-preview" if preview else args.command, execute(args))
+        excluded = ()
+        if args.command in {"snapshot", "backup"}:
+            excluded = (args.directory if args.command == "snapshot" else args.file,)
+        elif args.command == "export":
+            excluded = (args.file,)
+        with diagnostic_scope(args.data_dir, exclude=excluded):
+            result = validate_output("sync-preview" if preview else args.command, execute(args))
         serialized = json.dumps(result, allow_nan=False, separators=(",", ":"))
         print(serialized)
         return 1 if args.command == "sync" and not preview and not result["complete"] else 0
@@ -391,11 +405,15 @@ def main(argv=None):
         code = "interrupted"
     except BridgeError as error:
         code = error.code
+        diagnostic = getattr(error, "diagnostic", None)
+        report = getattr(error, "report", None)
     except OSError:
         code = "storage_failed"
     except Exception:
         # No repr, traceback, dynamic exception message or provider response.
         code = "internal_error"
     result = {"schema_version": SCHEMA_VERSION, "error": code, "message": MESSAGES[code]}
+    if diagnostic is not None:
+        result.update({"diagnostic": diagnostic, "report": report})
     print(json.dumps(validate_output("error", result)), file=sys.stderr)
     return 130 if code == "interrupted" else 2

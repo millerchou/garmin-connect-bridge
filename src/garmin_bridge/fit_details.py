@@ -6,9 +6,7 @@ from collections import Counter
 from .errors import BridgeError
 from .fit_fields import (
     ARRAY_LIMITS,
-    EVENT_NAMES,
     FIELDS,
-    SPORT_LABELS,
     STROKES_MESSAGES,
     event_payload_allowed,
 )
@@ -41,6 +39,11 @@ class TimestampContext:
             if f.field_def is not None and not f.field_def.is_dev and f.field_def.def_num == 253
         ]
         if frame.time_offset is not None:
+            if frame.global_mesg_num not in TIMESTAMP_MESSAGES:
+                # An unreviewed compressed header cannot advance the trusted
+                # clock used by later documented messages.
+                self.anchor = None
+                return None
             if self.anchor is None or physical:
                 raise BridgeError("invalid_fit")
             offset = frame.time_offset
@@ -57,12 +60,13 @@ class TimestampContext:
             ) != (0x86, 4):
                 self.anchor = None
             else:
-                timestamp = self.anchor = field.raw_value
+                timestamp = field.raw_value
+                self.anchor = timestamp if timestamp_value(timestamp) is not None else None
         return timestamp
 
 
 def text_value(value):
-    return type(value) is str and len(value) <= 64 and value.isprintable()
+    return type(value) is str and len(value) <= 254 and value.isprintable()
 
 
 def field_value(raw, spec):
@@ -71,12 +75,8 @@ def field_value(raw, spec):
     def scalar(value):
         if value is None:
             return None
-        if spec.kind in {"text", "label"}:
-            return (
-                value
-                if (text_value(value) and (spec.kind == "text" or value in SPORT_LABELS))
-                else None
-            )
+        if spec.kind == "text":
+            return value if text_value(value) else None
         if not numeric(value):
             return None
         if spec.kind in {"utc", "local"}:
@@ -120,13 +120,13 @@ def project_message(frame, include_identity=False, *, timestamp_raw=None):
         size = definition.size
         width = definition.base_type.size
         low, high = ARRAY_LIMITS.get(spec.shape, (1, 1))
-        if spec.kind in {"text", "label"}:
-            low, high = 1, 65
+        if spec.kind == "text":
+            low, high = 1, 255
         if size % width or not low <= size // width <= high:
             continue
         value = field_value(field.raw_value, spec)
-        # Reject unreviewed free text entirely, rather than retaining its presence.
-        if spec.kind in {"text", "label"} and value is None:
+        # Keep bounded printable text only in explicitly permitted fields.
+        if spec.kind == "text" and value is None:
             continue
         target = reported if spec.reported else fields
         target[name] = {"value": value, "unit": spec.unit}
@@ -143,7 +143,7 @@ def project_message(frame, include_identity=False, *, timestamp_raw=None):
         fields["total_strokes"] = {**fields.pop("total_cycles"), "unit": "strokes"}
     if frame.name == "event":
         event, kind = get(fields, "event"), get(fields, "event_type")
-        if event not in EVENT_NAMES or kind is not None and not 0 <= kind <= 9:
+        if type(event) is not int or not 0 <= event < 255:
             return None
         for name in ("data", "data16"):
             if name in fields and not event_payload_allowed(
@@ -172,9 +172,13 @@ def get(fields, name):
 
 
 def filter_message_context(session, laps, messages):
-    """Zone references require a unique surviving session/lap index."""
+    """Zone references require a unique surviving session/lap/split index."""
     targets = Counter()
-    for number, row in [(18, session), *((19, lap["fit"]) for lap in laps)]:
+    for number, row in [
+        (18, session),
+        *((19, lap["fit"]) for lap in laps),
+        *((312, row) for row in messages if row["message"] == "split"),
+    ]:
         index = get(row["fields"], "message_index")
         if type(index) is int and not index & 0x7000:
             targets[(number, index & 0xFFF)] += 1
@@ -192,11 +196,15 @@ def filter_message_context(session, laps, messages):
     return result
 
 
-def valid_message(value, include_identity=False, allowed=None):
+def message_problem(value, include_identity=False, allowed=None):
     from . import contract as c
+    from .privacy import safe_key
 
-    if type(value) is not dict or value.keys() != {"message", "fields", "garmin_reported"}:
-        return False
+    if type(value) is not dict or value.keys() not in (
+        {"message", "fields", "garmin_reported"},
+        {"message", "fields", "garmin_reported", "unknown"},
+    ):
+        return "$"
     message = value["message"]
     if (
         type(message) is not str
@@ -204,14 +212,19 @@ def valid_message(value, include_identity=False, allowed=None):
         or allowed is not None
         and message not in allowed
     ):
-        return False
+        return "message"
     if message == "user_profile" and not include_identity:
-        return False
+        return "message"
+    if "unknown" in value:
+        from .fit_unknown import valid_unknown
+
+        if not valid_unknown(value["unknown"], message):
+            return "unknown"
     specs = specs_for(message)
     for group in ("fields", "garmin_reported"):
         fields = value[group]
         if type(fields) is not dict or not fields.keys() <= specs.keys():
-            return False
+            return group
         for name, quantity in fields.items():
             spec = specs[name]
             if (
@@ -219,13 +232,18 @@ def valid_message(value, include_identity=False, allowed=None):
                 and not include_identity
                 or spec.reported != (group == "garmin_reported")
             ):
-                return False
+                return group + "." + safe_key(name)
             unit = "strokes" if name == "total_strokes" else spec.unit
             if not c.obj({"unit": c.literal(unit), "value": lambda _: True})(quantity):
-                return False
+                return group + "." + safe_key(name) + ".unit"
             item = quantity["value"]
             check = c.numeric
-            if spec.kind in {"utc", "local"}:
+            if spec.unit in {"FIT:event", "FIT:event_type"}:
+
+                def check(x):
+                    return type(x) is int and 0 <= x < 255
+
+            elif spec.kind in {"utc", "local"}:
 
                 def check(x):
                     return c.iso_time(x, spec.kind == "utc") and (
@@ -233,10 +251,6 @@ def valid_message(value, include_identity=False, allowed=None):
                     )
             elif spec.kind == "text":
                 check = text_value
-            elif spec.kind == "label":
-
-                def check(x):
-                    return type(x) is str and x in SPORT_LABELS
 
             if spec.shape != "scalar":
                 low, high = ARRAY_LIMITS[spec.shape]
@@ -246,26 +260,26 @@ def valid_message(value, include_identity=False, allowed=None):
                     and low <= len(item) <= high
                     and all(c.nullable(check)(x) for x in item)
                 ):
-                    return False
+                    return group + "." + safe_key(name) + ".value"
             elif not c.nullable(check)(item):
-                return False
+                return group + "." + safe_key(name) + ".value"
     fields = value["fields"]
     if "total_strokes" in fields and get(fields, "sport") != 2:
-        return False
+        return "fields.total_strokes"
     if message == "event":
         event, kind = get(fields, "event"), get(fields, "event_type")
         if (
             type(event) is not int
-            or event not in EVENT_NAMES
+            or not 0 <= event < 255
             or kind is not None
-            and (type(kind) is not int or not 0 <= kind <= 9)
+            and (type(kind) is not int or not 0 <= kind < 255)
         ):
-            return False
+            return "fields.event,event_type"
         for name in ("data", "data16"):
             if name in fields and not event_payload_allowed(
                 event, kind, get(fields, name), short=name == "data16"
             ):
-                return False
+                return "fields." + name
         if any(
             n in fields
             for n in (
@@ -277,10 +291,22 @@ def valid_message(value, include_identity=False, allowed=None):
             )
         ):
             if event not in (42, 43) or kind is None:
-                return False
+                return "fields.gear_change_data"
         if "gear_change_data" in fields and fields["gear_change_data"] != fields.get("data"):
-            return False
-    return True
+            return "fields.gear_change_data"
+    return None
+
+
+def valid_message(value, include_identity=False, allowed=None):
+    return message_problem(value, include_identity, allowed) is None
+
+
+def message_check(include_identity, allowed):
+    def check(value):
+        return valid_message(value, include_identity, allowed)
+
+    check.diagnose = lambda value: message_problem(value, include_identity, allowed) or "$"
+    return check
 
 
 def fill_local_time(activity_time, messages):

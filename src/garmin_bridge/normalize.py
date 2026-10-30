@@ -1,5 +1,6 @@
 """Pure, reviewed projection of metadata and original FIT bytes."""
 
+from collections import Counter
 from datetime import datetime, timezone
 import hashlib
 import io
@@ -30,6 +31,7 @@ from .fit_details import (
 )
 from .fit_fields import AUXILIARY_MESSAGES, FIT_FIELDS_VERSION, RECORD_UNITS
 from .storage import canonical
+from .fit_unknown import FIT_PRIVACY_VERSION, RawPrivacy, project_unknown
 
 MAX_ARCHIVE = 64 * 1024 * 1024
 MAX_FIT = 64 * 1024 * 1024
@@ -280,6 +282,7 @@ def normalize(
     *,
     local_import=False,
     include_identity=False,
+    blocked_fields=None,
 ):
     if type(include_identity) is not bool:
         raise BridgeError("usage")
@@ -293,11 +296,13 @@ def normalize(
             raise BridgeError("import_conflict")
         flags.update(LOCAL_FLAGS)
     records, laps, events, sessions = [], [], [], []
-    detailed_events, messages = [], []
+    detailed_events, messages, raw_messages = [], [], []
+    blocked = Counter() if blocked_fields is None else blocked_fields
     session_detail = None
     device_count = 0
     cadence_integers = []
     clock = TimestampContext()
+    raw_privacy = RawPrivacy()
 
     def clean(value):
         if value is not None and not numeric(value):
@@ -311,6 +316,12 @@ def normalize(
             error_handling=fitdecode.ErrorHandling.RAISE,
         ) as reader:
             for frame in reader:
+                if isinstance(frame, fitdecode.FitDefinitionMessage):
+                    # A keyed projection cannot represent duplicate physical
+                    # fields safely (including conflicting wire types).
+                    numbers = [field.def_num for field in frame.field_defs]
+                    if len(set(numbers)) != len(numbers):
+                        raise BridgeError("invalid_fit")
                 if not isinstance(frame, fitdecode.FitDataMessage):
                     continue
                 timestamp_raw = clock.read(frame)
@@ -318,6 +329,15 @@ def normalize(
                 if timestamp_raw is not None and "timestamp" in MESSAGE_FIELDS.get(frame.name, ()):
                     values["timestamp"] = timestamp_value(timestamp_raw)
                 detail = project_message(frame, include_identity, timestamp_raw=timestamp_raw)
+                unknown, raw_message = project_unknown(frame, blocked, include_identity)
+                raw_privacy.observe(frame, unknown)
+                if raw_message is not None:
+                    raw_messages.append(raw_message)
+                    if len(raw_messages) > MAX_RECORDS:
+                        raise BridgeError("invalid_fit")
+                if unknown and frame.name != "record":
+                    detail = detail or {"message": frame.name, "fields": {}, "garmin_reported": {}}
+                    detail["unknown"] = unknown
                 if frame.name == "record":
                     balance = values.get("left_right_balance")
                     balance_value = (balance & 0x7F) if type(balance) is int else None
@@ -351,6 +371,7 @@ def normalize(
                             for key in RECORD_UNITS
                         }
                     )
+                    row.update(unknown)
                     records.append(row)
                     if len(records) > MAX_RECORDS:
                         raise BridgeError("invalid_fit")
@@ -456,7 +477,9 @@ def normalize(
         "session": session_detail,
         "events": detailed_events,
         "messages": messages,
+        "raw_messages": raw_messages,
     }
+    raw_privacy.filter(streams, blocked)
     summary = {
         "schema_version": SCHEMA_VERSION,
         "normalizer_version": NORMALIZER_VERSION,
@@ -529,8 +552,10 @@ def _cadence_quality(metrics, session, records, integers):
     return flags
 
 
-def input_digest(meta, fit_hash, *, local_import=False, include_identity=False):
+def input_digest(meta, fit_hash, *, local_import=False, include_identity=False, legacy=False):
     value = {"provider": "garmin", "metadata": meta, "fit_sha256": fit_hash}
+    if not legacy:
+        value["fit_privacy_version"] = FIT_PRIVACY_VERSION
     if local_import:
         # Do not let a later API acquisition reuse an unverified local result,
         # even when the API happens to supply no optional metadata either.
@@ -538,3 +563,18 @@ def input_digest(meta, fit_hash, *, local_import=False, include_identity=False):
     if include_identity:
         value["include_fit_identity"] = True
     return sha256(canonical(value))
+
+
+def input_digest_matches(digest, meta, fit_hash, *, local_import=False, include_identity=False):
+    """Validate historical provenance without making old revisions cache hits."""
+    return any(
+        digest
+        == input_digest(
+            meta,
+            fit_hash,
+            local_import=local_import,
+            include_identity=include_identity,
+            legacy=legacy,
+        )
+        for legacy in (False, True)
+    )

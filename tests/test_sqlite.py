@@ -327,7 +327,7 @@ def test_backup_cli_uses_sqlite_and_preserves_revisions(database, tmp_path, caps
     assert cli.main(["--data-dir", str(target), "list"]) == 0
     listing = json.loads(capsys.readouterr().out)
     assert listing["storage_version"] == 1
-    assert listing["activities"][0]["normalizer_version"] == "1.3.0"
+    assert listing["activities"][0]["normalizer_version"] == "1.4.0"
     assert listing["activities"][0]["coverage"]["power"]["missing"] == 1
 
 
@@ -421,7 +421,7 @@ def test_normal_reads_keep_row_order_and_size_limits(database, tmp_path, monkeyp
             else:
                 db.execute(
                     "UPDATE samples SET payload=? WHERE kind='records' AND ordinal=1",
-                    (canonical({"synthetic": "x" * 32768}),),
+                    (canonical({"synthetic": "x" * (512 * 1024)}),),
                 )
     with pytest.raises(BridgeError):
         database.read_bytes(ref, limit=1 if damage == "read_limit" else None)
@@ -455,7 +455,24 @@ def test_format_one_manifest_is_rejected(database, tmp_path):
         transfer.verify_snapshot(path)
 
 
-def test_verify_samples_contracts_but_restore_validates_every_row(database, tmp_path):
+@pytest.mark.parametrize("field_version", ["1.0", "1.1"])
+def test_verify_full_raw_streams_and_spot_check_legacy_streams(
+    database, tmp_path, monkeypatch, field_version
+):
+    original = normalize.normalize
+
+    def historical(*args, **kwargs):
+        summary, streams = original(*args, **kwargs)
+        if field_version == "1.0":
+            streams["fit_fields_version"] = "1.0"
+            del streams["raw_messages"]
+            del streams["units"]["fractional_cadence"]
+            del summary["coverage"]["fractional_cadence"]
+            for row in streams["records"]:
+                del row["fractional_cadence"]
+        return summary, streams
+
+    monkeypatch.setattr(normalize, "normalize", historical)
     put(database, tmp_path, count=8)
     path = tmp_path / "snapshot"
     transfer.export_snapshot(database, path)
@@ -473,11 +490,19 @@ def test_verify_samples_contracts_but_restore_validates_every_row(database, tmp_
     manifest["sha256"] = transfer.digest_file(path / DATABASE)
     manifest["size"] = (path / DATABASE).stat().st_size
     (path / "manifest.json").write_bytes(canonical(manifest))
-    # A private checksum receipt is deliberately not a full privacy certification.
-    assert transfer.verify_snapshot(path)["verified"]
+    if field_version == "1.0":
+        # Legacy streams retain spot checking; raw streams need full evidence.
+        assert transfer.verify_snapshot(path)["verified"]
+    else:
+        with pytest.raises(BridgeError):
+            transfer.verify_snapshot(path)
     with pytest.raises(BridgeError):
         transfer.restore_snapshot(path, tmp_path / "rejected")
-    assert not (tmp_path / "rejected").exists()
+    assert {
+        str(p.relative_to(tmp_path / "rejected"))
+        for p in (tmp_path / "rejected").rglob("*")
+        if p.is_file()
+    } == {"reports/privacy-failure.json"}
 
 
 @pytest.mark.parametrize("command", ["sanitize-fit", "verify-fit", "migrate"])

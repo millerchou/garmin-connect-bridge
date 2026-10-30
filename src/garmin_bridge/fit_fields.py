@@ -7,7 +7,7 @@ Only serial numbers and the reviewed user_profile subset allow identity opt-in.
 
 from dataclasses import dataclass
 
-FIT_FIELDS_VERSION = "1.0"
+FIT_FIELDS_VERSION = "1.1"
 
 
 @dataclass(frozen=True)
@@ -23,23 +23,8 @@ class Field:
     identity: bool = False
 
 
-SPORT_LABELS = frozenset(
-    {
-        "Cycling",
-        "Road",
-        "Road Cycling",
-        "Road Biking",
-        "Mountain Biking",
-        "Gravel Cycling",
-        "Indoor Cycling",
-        "Virtual Ride",
-        "Bike",
-        "Biking",
-    }
-)
-
-# No arbitrary product_name, descriptor, sport/name or profile-name text.
-# Only the exact sport labels above are accepted for the two approved label fields.
+# Sport/profile labels and segment names/UUIDs are explicitly requested text.
+# Device names and other identity text remain excluded.
 FIELDS = {
     "file_id": {
         "type": Field(0, 0x0, "FIT:file"),
@@ -49,6 +34,25 @@ FIELDS = {
         "time_created": Field(4, 0x86, "UTC", kind="utc"),
     },
     "device_settings": {
+        "backlight_mode": Field(12, 0x0, "FIT:backlight_mode"),
+        "activity_tracker_enabled": Field(36, 0x0, "FIT:bool"),
+        "clock_time": Field(39, 0x86, "UTC", kind="utc"),
+        "pages_enabled": Field(40, 0x84, "count", shape="array"),
+        "move_alert_enabled": Field(46, 0x0, "FIT:bool"),
+        "date_mode": Field(47, 0x0, "FIT:date_mode"),
+        "display_orientation": Field(55, 0x0, "FIT:display_orientation"),
+        "mounting_side": Field(56, 0x0, "FIT:side"),
+        "default_page": Field(57, 0x84, "count", shape="array"),
+        "autosync_min_steps": Field(58, 0x84, "steps"),
+        "autosync_min_time": Field(59, 0x84, "min"),
+        "lactate_threshold_autodetect_enabled": Field(80, 0x0, "FIT:bool"),
+        "ble_auto_upload_enabled": Field(86, 0x0, "FIT:bool"),
+        "auto_sync_frequency": Field(89, 0x0, "FIT:auto_sync_frequency"),
+        "auto_activity_detect": Field(90, 0x86, "FIT:auto_activity_detect"),
+        "number_of_screens": Field(94, 0x2, "count"),
+        "smart_notification_display_orientation": Field(95, 0x0, "FIT:display_orientation"),
+        "tap_interface": Field(134, 0x0, "FIT:switch"),
+        "tap_sensitivity": Field(174, 0x0, "FIT:tap_sensitivity"),
         "active_time_zone": Field(0, 0x2, "count"),
         "utc_offset": Field(1, 0x86, "s"),
         "time_offset": Field(2, 0x86, "s", shape="offsets"),
@@ -91,7 +95,7 @@ FIELDS = {
     "sport": {
         "sport": Field(0, 0x0, "FIT:sport"),
         "sub_sport": Field(1, 0x0, "FIT:sub_sport"),
-        "name": Field(3, 0x7, "text", kind="label"),
+        "name": Field(3, 0x7, "text", kind="text"),
     },
     "training_settings": {
         "target_distance": Field(31, 0x86, "m", scale=100),
@@ -100,6 +104,8 @@ FIELDS = {
         "precise_target_speed": Field(153, 0x86, "m/s", scale=1000000),
     },
     "session": {
+        "event": Field(0, 0x0, "FIT:event"),
+        "event_type": Field(1, 0x0, "FIT:event_type"),
         "message_index": Field(254, 0x84, "FIT:message_index"),
         "timestamp": Field(253, 0x86, "UTC", kind="utc"),
         "start_time": Field(2, 0x86, "UTC", kind="utc"),
@@ -121,6 +127,8 @@ FIELDS = {
         "total_ascent": Field(22, 0x84, "m"),
         "total_descent": Field(23, 0x84, "m"),
         "total_training_effect": Field(24, 0x2, "score", scale=10, reported=True),
+        "first_lap_index": Field(25, 0x84, "count"),
+        "trigger": Field(28, 0x0, "FIT:session_trigger"),
         "num_laps": Field(26, 0x84, "count"),
         "normalized_power": Field(34, 0x84, "W", reported=True),
         "training_stress_score": Field(35, 0x84, "score", scale=10, reported=True),
@@ -137,7 +145,7 @@ FIELDS = {
         "avg_left_pedal_smoothness": Field(103, 0x2, "%", scale=2),
         "avg_right_pedal_smoothness": Field(104, 0x2, "%", scale=2),
         "avg_combined_pedal_smoothness": Field(105, 0x2, "%", scale=2),
-        "sport_profile_name": Field(110, 0x7, "text", kind="label"),
+        "sport_profile_name": Field(110, 0x7, "text", kind="text"),
         "avg_left_power_phase": Field(116, 0x2, "degrees", scale=0.7111111, shape="pair"),
         "avg_left_power_phase_peak": Field(117, 0x2, "degrees", scale=0.7111111, shape="pair"),
         "avg_right_power_phase": Field(118, 0x2, "degrees", scale=0.7111111, shape="pair"),
@@ -157,6 +165,8 @@ FIELDS = {
         "enhanced_min_respiration_rate": Field(180, 0x84, "breaths/min", scale=100),
     },
     "lap": {
+        "event": Field(0, 0x0, "FIT:event"),
+        "event_type": Field(1, 0x0, "FIT:event_type"),
         "message_index": Field(254, 0x84, "FIT:message_index"),
         "timestamp": Field(253, 0x86, "UTC", kind="utc"),
         "start_time": Field(2, 0x86, "UTC", kind="utc"),
@@ -206,6 +216,7 @@ FIELDS = {
         "enhanced_max_respiration_rate": Field(137, 0x84, "breaths/min", scale=100),
     },
     "record": {
+        "fractional_cadence": Field(53, 0x2, "rpm", scale=128),
         "accumulated_power": Field(29, 0x86, "W"),
         "left_torque_effectiveness": Field(43, 0x2, "%", scale=2),
         "right_torque_effectiveness": Field(44, 0x2, "%", scale=2),
@@ -238,6 +249,7 @@ FIELDS = {
         "battery_voltage": Field(10, 0x84, "V", scale=256),
         "battery_status": Field(11, 0x2, "FIT:battery_status"),
         "sensor_position": Field(18, 0x0, "FIT:body_location"),
+        "ant_network": Field(22, 0x0, "FIT:ant_network"),
         "source_type": Field(25, 0x0, "FIT:source_type"),
         "battery_level": Field(32, 0x2, "%"),
     },
@@ -275,6 +287,7 @@ FIELDS = {
         "timestamp": Field(253, 0x86, "UTC", kind="utc"),
     },
     "split": {
+        "message_index": Field(254, 0x84, "FIT:message_index"),
         "split_type": Field(0, 0x0, "FIT:split_type"),
         "total_elapsed_time": Field(1, 0x86, "s", scale=1000),
         "total_timer_time": Field(2, 0x86, "s", scale=1000),
@@ -372,6 +385,110 @@ FIELDS = {
     },
 }
 
+# Public Profile 21.218.0; segment geography is deliberately absent.
+FIELDS["segment_lap"] = {
+    "event": Field(0, 0x0, "FIT:event"),
+    "event_type": Field(1, 0x0, "FIT:event_type"),
+    "start_time": Field(2, 0x86, "UTC", kind="utc"),
+    "total_elapsed_time": Field(7, 0x86, "s", scale=1000),
+    "total_timer_time": Field(8, 0x86, "s", scale=1000),
+    "total_distance": Field(9, 0x86, "m", scale=100),
+    "total_cycles": Field(10, 0x86, "cycles"),
+    "total_calories": Field(11, 0x84, "kcal"),
+    "total_fat_calories": Field(12, 0x84, "kcal"),
+    "avg_speed": Field(13, 0x84, "m/s", scale=1000),
+    "max_speed": Field(14, 0x84, "m/s", scale=1000),
+    "avg_heart_rate": Field(15, 0x2, "bpm"),
+    "max_heart_rate": Field(16, 0x2, "bpm"),
+    "avg_cadence": Field(17, 0x2, "rpm"),
+    "max_cadence": Field(18, 0x2, "rpm"),
+    "avg_power": Field(19, 0x84, "W"),
+    "max_power": Field(20, 0x84, "W"),
+    "total_ascent": Field(21, 0x84, "m"),
+    "total_descent": Field(22, 0x84, "m"),
+    "sport": Field(23, 0x0, "FIT:sport"),
+    "event_group": Field(24, 0x2, "count"),
+    "name": Field(29, 0x7, "text", kind="text"),
+    "normalized_power": Field(30, 0x84, "W", reported=True),
+    "left_right_balance": Field(31, 0x84, "FIT:left_right_balance_100"),
+    "sub_sport": Field(32, 0x0, "FIT:sub_sport"),
+    "total_work": Field(33, 0x86, "J"),
+    "avg_altitude": Field(34, 0x84, "m", scale=5, offset=500),
+    "max_altitude": Field(35, 0x84, "m", scale=5, offset=500),
+    "gps_accuracy": Field(36, 0x2, "m"),
+    "avg_grade": Field(37, 0x83, "%", scale=100),
+    "avg_pos_grade": Field(38, 0x83, "%", scale=100),
+    "avg_neg_grade": Field(39, 0x83, "%", scale=100),
+    "max_pos_grade": Field(40, 0x83, "%", scale=100),
+    "max_neg_grade": Field(41, 0x83, "%", scale=100),
+    "avg_temperature": Field(42, 0x1, "degC"),
+    "max_temperature": Field(43, 0x1, "degC"),
+    "total_moving_time": Field(44, 0x86, "s", scale=1000),
+    "avg_pos_vertical_speed": Field(45, 0x83, "m/s", scale=1000),
+    "avg_neg_vertical_speed": Field(46, 0x83, "m/s", scale=1000),
+    "max_pos_vertical_speed": Field(47, 0x83, "m/s", scale=1000),
+    "max_neg_vertical_speed": Field(48, 0x83, "m/s", scale=1000),
+    "time_in_hr_zone": Field(49, 0x86, "s", scale=1000, shape="zones"),
+    "time_in_speed_zone": Field(50, 0x86, "s", scale=1000, shape="zones"),
+    "time_in_cadence_zone": Field(51, 0x86, "s", scale=1000, shape="zones"),
+    "time_in_power_zone": Field(52, 0x86, "s", scale=1000, shape="zones"),
+    "repetition_num": Field(53, 0x84, "count"),
+    "min_altitude": Field(54, 0x84, "m", scale=5, offset=500),
+    "min_heart_rate": Field(55, 0x2, "bpm"),
+    "active_time": Field(56, 0x86, "s", scale=1000),
+    "wkt_step_index": Field(57, 0x84, "FIT:message_index"),
+    "sport_event": Field(58, 0x0, "FIT:sport_event"),
+    "avg_left_torque_effectiveness": Field(59, 0x2, "%", scale=2),
+    "avg_right_torque_effectiveness": Field(60, 0x2, "%", scale=2),
+    "avg_left_pedal_smoothness": Field(61, 0x2, "%", scale=2),
+    "avg_right_pedal_smoothness": Field(62, 0x2, "%", scale=2),
+    "avg_combined_pedal_smoothness": Field(63, 0x2, "%", scale=2),
+    "status": Field(64, 0x0, "FIT:segment_lap_status"),
+    "uuid": Field(65, 0x7, "text", kind="text"),
+    "avg_fractional_cadence": Field(66, 0x2, "rpm", scale=128),
+    "max_fractional_cadence": Field(67, 0x2, "rpm", scale=128),
+    "total_fractional_cycles": Field(68, 0x2, "cycles", scale=128),
+    "front_gear_shift_count": Field(69, 0x84, "count"),
+    "rear_gear_shift_count": Field(70, 0x84, "count"),
+    "time_standing": Field(71, 0x86, "s", scale=1000),
+    "stand_count": Field(72, 0x84, "count"),
+    "avg_left_pco": Field(73, 0x1, "mm"),
+    "avg_right_pco": Field(74, 0x1, "mm"),
+    "avg_left_power_phase": Field(75, 0x2, "degrees", scale=0.7111111, shape="pair"),
+    "avg_left_power_phase_peak": Field(76, 0x2, "degrees", scale=0.7111111, shape="pair"),
+    "avg_right_power_phase": Field(77, 0x2, "degrees", scale=0.7111111, shape="pair"),
+    "avg_right_power_phase_peak": Field(78, 0x2, "degrees", scale=0.7111111, shape="pair"),
+    "avg_power_position": Field(79, 0x84, "W", shape="pair"),
+    "max_power_position": Field(80, 0x84, "W", shape="pair"),
+    "avg_cadence_position": Field(81, 0x2, "rpm", shape="pair"),
+    "max_cadence_position": Field(82, 0x2, "rpm", shape="pair"),
+    "manufacturer": Field(83, 0x84, "FIT:manufacturer"),
+    "total_grit": Field(84, 0x88, "kGrit", reported=True),
+    "total_flow": Field(85, 0x88, "Flow", reported=True),
+    "avg_grit": Field(86, 0x88, "kGrit", reported=True),
+    "avg_flow": Field(87, 0x88, "Flow", reported=True),
+    "metabolic_calories": Field(88, 0x84, "kcal", reported=True),
+    "total_fractional_ascent": Field(89, 0x2, "m", scale=100),
+    "total_fractional_descent": Field(90, 0x2, "m", scale=100),
+    "enhanced_avg_altitude": Field(91, 0x86, "m", scale=5, offset=500),
+    "enhanced_max_altitude": Field(92, 0x86, "m", scale=5, offset=500),
+    "enhanced_min_altitude": Field(93, 0x86, "m", scale=5, offset=500),
+    "timestamp": Field(253, 0x86, "UTC", kind="utc"),
+    "message_index": Field(254, 0x84, "FIT:message_index"),
+}
+
+# Public Profile 21.218.0 clock correlation, without inferring a local offset.
+FIELDS["timestamp_correlation"] = {
+    "fractional_timestamp": Field(0, 0x84, "s", scale=32768),
+    # System-clock seconds can be relative; the correlation supplies their UTC anchor.
+    "system_timestamp": Field(1, 0x86, "s"),
+    "fractional_system_timestamp": Field(2, 0x84, "s", scale=32768),
+    "local_timestamp": Field(3, 0x86, "local", kind="local"),
+    "timestamp_ms": Field(4, 0x84, "ms"),
+    "system_timestamp_ms": Field(5, 0x84, "ms"),
+    "timestamp": Field(253, 0x86, "UTC", kind="utc"),
+}
+
 MESSAGE_NUMBERS = {
     "file_id": 0,
     "device_settings": 2,
@@ -386,69 +503,21 @@ MESSAGE_NUMBERS = {
     "device_info": 23,
     "activity": 34,
     "file_creator": 49,
+    "segment_lap": 142,
+    "timestamp_correlation": 162,
     "time_in_zone": 216,
     "split": 312,
     "split_summary": 313,
     "device_aux_battery_info": 375,
 }
 
-ARRAY_LIMITS = {"pair": (2, 2), "zones": (1, 32), "offsets": (1, 8)}
+ARRAY_LIMITS = {"pair": (2, 2), "zones": (1, 32), "offsets": (1, 8), "array": (1, 127)}
 AUXILIARY_MESSAGES = frozenset(FIELDS) - {"record", "session", "lap", "event"}
 RECORD_UNITS = {name: spec.unit for name, spec in FIELDS["record"].items()}
 # Cycling total_cycles has the documented total_strokes subfield. Never infer it
 # for another sport or from an unknown field number.
-STROKES_MESSAGES = {"session", "lap", "split", "split_summary"}
+STROKES_MESSAGES = {"session", "lap", "split", "split_summary", "segment_lap"}
 
-# Closed documented event headers. Course-point indices and opaque payloads
-# remain excluded; a header alone carries no position or identity.
-EVENT_NAMES = {
-    0: "timer",
-    3: "workout",
-    4: "workout_step",
-    5: "power_down",
-    6: "power_up",
-    7: "off_course",
-    8: "session",
-    9: "lap",
-    10: "course_point",
-    11: "battery",
-    12: "virtual_partner_pace",
-    13: "hr_high_alert",
-    14: "hr_low_alert",
-    15: "speed_high_alert",
-    16: "speed_low_alert",
-    17: "cad_high_alert",
-    18: "cad_low_alert",
-    19: "power_high_alert",
-    20: "power_low_alert",
-    21: "recovery_hr",
-    22: "battery_low",
-    23: "time_duration_alert",
-    24: "distance_duration_alert",
-    25: "calorie_duration_alert",
-    26: "activity",
-    27: "fitness_equipment",
-    28: "length",
-    32: "user_marker",
-    33: "sport_point",
-    36: "calibration",
-    42: "front_gear_change",
-    43: "rear_gear_change",
-    44: "rider_position_change",
-    45: "elev_high_alert",
-    46: "elev_low_alert",
-    47: "comm_timeout",
-    54: "auto_activity_detect",
-    56: "dive_alert",
-    57: "dive_gas_switched",
-    71: "tank_pressure_reserve",
-    72: "tank_pressure_critical",
-    73: "tank_lost",
-    75: "radar_threat_alert",
-    76: "tank_battery_low",
-    81: "tank_pod_connected",
-    82: "tank_pod_disconnected",
-}
 # Payload maximums from documented subfield widths/enums. All payloads remain
 # explicitly labelled raw FIT event_data; no silent scaling to physical units.
 EVENT_DATA_MAX = {

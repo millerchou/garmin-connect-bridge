@@ -11,8 +11,10 @@ import tempfile
 
 from . import __version__, contract as c
 from .errors import BridgeError
+from .privacy import diagnosed, failure, located, location, safe_key
 from .fit_details import specs_for, valid_message
-from .fit_fields import AUXILIARY_MESSAGES
+from .fit_fields import AUXILIARY_MESSAGES, FIELDS, MESSAGE_NUMBERS
+from .fit_unknown import RawIdentityCheck, valid_raw_message, valid_unknown
 from .jobs import gaps, load_job
 from .persistence import artifact_files, identity_enabled, require
 from .sqlite_transfer import digest_file
@@ -28,28 +30,44 @@ NAME_BOUNDARY = re.compile(
     r"(?<=[A-Za-z])(?=[0-9])|(?<=[0-9])(?=[A-Za-z])"
 )
 PRIVATE_NAME = re.compile(
-    r"(?:^|_)(?:position_lat|position_long|lat|long|latitude|longitude|nec|swc|"
-    r"serial_number|user_profile|friendly_name)(?:_|$)",
+    r"(?:^|_)(?:position_lat|position_long|lat|lon|lng|long|latitude|longitude|nec|swc|"
+    r"coordinates?|location|serial(?:_number)?|user_profile|friendly_name|"
+    r"device_id|device_identifier|device_number|local_id|global_id|"
+    r"ant_device_number|ant_transmission_type|"
+    r"descriptor|product_name|user_id|mac_address|device_address)(?:_|$)",
     re.IGNORECASE,
 )
 
 
-def require_safe_name(name):
+def require_safe_name(name, field=None):
+    field = field or safe_key(name)
     separated = re.sub(r"[^A-Za-z0-9]+", "_", name)
     # Retain case-insensitive whole-name checks before splitting mixed case.
-    require(PRIVATE_NAME.search(separated) is None)
-    require(PRIVATE_NAME.search(NAME_BOUNDARY.sub("_", separated)) is None)
+    require(PRIVATE_NAME.search(separated) is None, "analysis.name.1", field)
+    separated = NAME_BOUNDARY.sub("_", separated)
+    require(PRIVATE_NAME.search(separated) is None, "analysis.name.2", field)
+    tokens = separated.lower().split("_")
+    require(
+        all(
+            token != "position"
+            or i > 0
+            and tokens[i - 1] in {"power", "cadence", "sensor", "rider"}
+            for i, token in enumerate(tokens)
+        ),
+        "analysis.name.3",
+        field,
+    )
 
 
-def validate_detail_keys(value):
+def validate_detail_keys(value, field=""):
     """Independent backstop even if the reviewed detail allowlist is widened."""
     if isinstance(value, dict):
         for name, item in value.items():
-            require_safe_name(name)
-            validate_detail_keys(item)
+            require_safe_name(name, field + safe_key(name))
+            validate_detail_keys(item, field + safe_key(name) + ".")
     elif isinstance(value, list):
         for item in value:
-            validate_detail_keys(item)
+            validate_detail_keys(item, field + "[].")
 
 
 def detail_columns(message):
@@ -63,7 +81,10 @@ def detail_columns(message):
         if spec.shape == "pair":
             names = [f"{prefix}{name}_{i}" for i in range(2)]
         for column in names:
-            columns[column] = "TEXT" if spec.kind != "number" else "REAL"
+            if message == "lap" and name in {"event", "event_type"}:
+                columns[column] = "INTEGER"
+            else:
+                columns[column] = "TEXT" if spec.kind != "number" else "REAL"
     return columns
 
 
@@ -105,6 +126,7 @@ TABLES = {
         },
     },
     "records": {
+        "unknown_json": "TEXT",
         "activity_id": "TEXT",
         "ordinal": "INTEGER",
         **{
@@ -113,6 +135,7 @@ TABLES = {
         },
     },
     "laps": {
+        "unknown_json": "TEXT",
         "activity_id": "TEXT",
         "ordinal": "INTEGER",
         "start": "TEXT",
@@ -133,6 +156,12 @@ TABLES = {
         "message": "TEXT",
         "detail_json": "TEXT",
     },
+    "raw_messages": {
+        "activity_id": "TEXT",
+        "ordinal": "INTEGER",
+        "mesg_num": "INTEGER",
+        "fields_json": "TEXT",
+    },
     "meta": {
         "format_version": "INTEGER",
         "generated_at": "TEXT",
@@ -146,7 +175,7 @@ TABLES = {
         "gap_count": "INTEGER",
         **{
             table + "_count": "INTEGER"
-            for table in ("activities", "records", "laps", "events", "messages")
+            for table in ("activities", "records", "laps", "events", "messages", "raw_messages")
         },
         "units_json": "TEXT",
     },
@@ -161,7 +190,8 @@ UNITS = {
         "acquired_at": "UTC",
         "utc_offset_seconds": "s",
     },
-    "records": c.STREAM_UNITS,
+    "records": {**c.STREAM_UNITS, "unknown_json": "raw FIT integers; no scale/offset"},
+    "raw_messages": {"fields_json": "raw FIT integers; no scale/offset"},
     "laps": {"start": "UTC", "end": "UTC", "duration": "s", "distance": "m"},
     "events": {},
 }
@@ -184,8 +214,9 @@ def ddl(table):
     return f'CREATE TABLE "{table}" ({",".join(columns)}) STRICT'
 
 
+@located("analysis.sqlite", "sqlite_schema")
 def insert(db, table, row):
-    require(row.keys() <= TABLES[table].keys())
+    require(row.keys() <= TABLES[table].keys(), "analysis_export.insert.1", "columns", table=table)
     db.execute(
         f'INSERT INTO "{table}" VALUES ({",".join("?" for _ in TABLES[table])})',
         [row.get(name) for name in TABLES[table]],
@@ -197,7 +228,11 @@ def json_text(value):
 
 
 def flatten_detail(message):
-    result = {}
+    result = (
+        {"unknown_json": json_text(message.get("unknown", {}))}
+        if message["message"] == "lap"
+        else {}
+    )
     for group, prefix in (("fields", "fit_"), ("garmin_reported", "garmin_reported_")):
         for name, quantity in message[group].items():
             value = quantity["value"]
@@ -273,15 +308,34 @@ def populate(db, source):
             "laps": len(streams["laps"]),
             "events": len(events),
             "messages": len(messages),
+            "raw_messages": len(streams.get("raw_messages", [])),
         }
         for table, rows in (
-            ("records", streams["records"]),
+            (
+                "records",
+                (
+                    {
+                        **{k: v for k, v in row.items() if k in c.STREAM_UNITS},
+                        "unknown_json": json_text(
+                            {k: v for k, v in row.items() if k not in c.STREAM_UNITS}
+                        ),
+                    }
+                    for row in streams["records"]
+                ),
+            ),
+            (
+                "raw_messages",
+                (
+                    {"mesg_num": row["mesg_num"], "fields_json": json_text(row["fields"])}
+                    for row in streams.get("raw_messages", [])
+                ),
+            ),
             (
                 "laps",
                 (
                     {
                         **{k: row[k] for k in ("start", "end", "duration", "distance")},
-                        **(flatten_detail(row["fit"]) if "fit" in row else {}),
+                        **(flatten_detail(row["fit"]) if "fit" in row else {"unknown_json": "{}"}),
                     }
                     for row in streams["laps"]
                 ),
@@ -301,7 +355,7 @@ def populate(db, source):
     ]
     mark = watermark(state)
     metadata = {
-        "format_version": 1,
+        "format_version": 2,
         "generated_at": now(),
         "cli_version": __version__,
         "activity_start_utc": min(times, key=datetime.fromisoformat) if times else None,
@@ -314,7 +368,7 @@ def populate(db, source):
         "activities_count": len(expected),
         **{
             table + "_count": sum(counts[table] for counts in expected.values())
-            for table in ("records", "laps", "events", "messages")
+            for table in ("records", "laps", "events", "messages", "raw_messages")
         },
         "units_json": json_text(UNITS),
     }
@@ -322,21 +376,40 @@ def populate(db, source):
     return expected, metadata
 
 
+@located("analysis.sqlite", "sqlite_schema")
 def validate(db, expected, metadata):
-    require(db.execute("PRAGMA integrity_check").fetchall() == [("ok",)])
-    require(db.execute("PRAGMA foreign_key_check").fetchall() == [])
+    require(
+        db.execute("PRAGMA integrity_check").fetchall() == [("ok",)],
+        "analysis_export.validate.1",
+        "integrity_check",
+    )
+    require(
+        db.execute("PRAGMA foreign_key_check").fetchall() == [],
+        "analysis_export.validate.2",
+        "foreign_key_check",
+    )
     # Exact SQL rules out extra columns, views, triggers and unreviewed JSON carriers.
     require(
         dict(db.execute("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL"))
-        == {table: ddl(table) for table in TABLES}
+        == {table: ddl(table) for table in TABLES},
+        "analysis_export.validate.3",
+        "sql",
     )
     for table, columns in TABLES.items():
         actual = [(row[1], row[2]) for row in db.execute(f'PRAGMA table_info("{table}")')]
         for name, _ in actual:
-            require_safe_name(name)
-        require(actual == list(columns.items()))
-    require({row[0] for row in db.execute("SELECT activity_id FROM activities")} == set(expected))
-    for table in ("records", "laps", "events", "messages"):
+            with location("analysis.sqlite", table):
+                require_safe_name(name)
+        require(
+            actual == list(columns.items()), "analysis_export.validate.4", "columns", table=table
+        )
+    require(
+        {row[0] for row in db.execute("SELECT activity_id FROM activities")} == set(expected),
+        "analysis_export.validate.5",
+        "activity_id",
+        table="activities",
+    )
+    for table in ("records", "laps", "events", "messages", "raw_messages"):
         counts = {
             ident: (count, low, high)
             for ident, count, low, high in db.execute(
@@ -345,19 +418,121 @@ def validate(db, expected, metadata):
         }
         require(
             counts
-            == {ident: (n[table], 0, n[table] - 1) for ident, n in expected.items() if n[table]}
+            == {ident: (n[table], 0, n[table] - 1) for ident, n in expected.items() if n[table]},
+            "analysis_export.validate.6",
+            "activity_id,ordinal",
+            table=table,
         )
     require(
         db.execute("SELECT * FROM meta").fetchall()
-        == [tuple(metadata[name] for name in TABLES["meta"])]
+        == [tuple(metadata[name] for name in TABLES["meta"])],
+        "analysis_export.validate.7",
+        "meta",
+        table="meta",
     )
     for coverage, flags in db.execute("SELECT coverage_json,quality_flags_json FROM activities"):
-        require(c.COVERAGE(decode(coverage.encode())) and c.QUALITY(decode(flags.encode())))
-    for message, detail in db.execute("SELECT message,detail_json FROM messages"):
+        require(
+            c.COVERAGE(decode(coverage.encode())) and c.QUALITY(decode(flags.encode())),
+            "analysis_export.validate.8",
+            "coverage_json,quality_flags_json",
+            table="activities",
+        )
+    for ident in expected:
+        validate_activity_details(db, ident)
+
+
+@located("analysis.sqlite", "messages")
+def validate_activity_details(db, ident):
+    # Keep cross-row evidence scoped to one activity and release it before the
+    # next. Combining activities can disguise a constant ID as a varying counter.
+    from .fit_details import message_problem
+
+    raw_check = RawIdentityCheck()
+    for message, detail in db.execute(
+        "SELECT message,detail_json FROM messages WHERE activity_id=? ORDER BY ordinal", (ident,)
+    ):
         value = decode(detail.encode())
-        validate_detail_keys(value)
-        require(valid_message(value, False, AUXILIARY_MESSAGES | {"session"}))
-        require(message == value["message"])
+        validate_detail_keys(value, "detail_json.")
+        if not valid_message(value, False, AUXILIARY_MESSAGES | {"session"}):
+            raise failure(
+                "analysis.message_contract",
+                "detail_json." + message_problem(value, False, AUXILIARY_MESSAGES | {"session"}),
+            )
+        require(message == value["message"], "analysis.message_kind", "message")
+        raw_check.observe_detail(value)
+        raw_check.observe_raw(MESSAGE_NUMBERS[message], value.get("unknown", {}), "unknown_")
+
+    for table, message in (("records", "record"), ("laps", "lap")):
+        with location("analysis.sqlite", table):
+            for (payload,) in db.execute(
+                f'SELECT unknown_json FROM "{table}" WHERE activity_id=? ORDER BY ordinal', (ident,)
+            ):
+                value = decode(payload.encode())
+                validate_detail_keys(value, "unknown_json.")
+                require(valid_unknown(value, message), "analysis.unknown_contract", "unknown_json")
+                raw_check.observe_raw(MESSAGE_NUMBERS[message], value, "unknown_")
+    for (stamp,) in db.execute("SELECT timestamp FROM records WHERE activity_id=?", (ident,)):
+        require(
+            stamp is None or c.iso_time(stamp, True),
+            "analysis.record_time",
+            "timestamp",
+            table="records",
+        )
+        raw_check.observe_timestamp(stamp)
+    for table, message in (("laps", "lap"), ("events", "event")):
+        names = [f"fit_{name}" for name, spec in FIELDS[message].items() if spec.kind == "utc"]
+        columns = ",".join(f'"{name}"' for name in names)
+        for stamps in db.execute(f'SELECT {columns} FROM "{table}" WHERE activity_id=?', (ident,)):
+            for name, stamp in zip(names, stamps):
+                require(
+                    stamp is None or c.iso_time(stamp, True),
+                    "analysis.detail_time",
+                    name,
+                    table=table,
+                )
+                raw_check.observe_timestamp(stamp)
+    for event, kind in db.execute(
+        "SELECT fit_event,fit_event_type FROM laps WHERE activity_id=?", (ident,)
+    ):
+        for name, value in (("fit_event", event), ("fit_event_type", kind)):
+            require(
+                value is None or type(value) is int and 0 <= value < 255,
+                "analysis.lap_event",
+                name,
+                table="laps",
+            )
+    with location("analysis.sqlite", "raw_messages"):
+        for number, payload in db.execute(
+            "SELECT mesg_num,fields_json FROM raw_messages WHERE activity_id=? ORDER BY ordinal",
+            (ident,),
+        ):
+            value = decode(payload.encode())
+            validate_detail_keys(value, "fields_json.")
+            require(
+                valid_raw_message({"mesg_num": number, "fields": value}),
+                "analysis.raw_contract",
+                "mesg_num,fields_json",
+            )
+            raw_check.observe_raw(number, value)
+    if blocked := raw_check.blocked_fields():
+        number, field = min(blocked)
+        table = (
+            "records"
+            if number == 20
+            else "laps"
+            if number == 19
+            else "messages"
+            if number in MESSAGE_NUMBERS.values()
+            else "raw_messages"
+        )
+        column = (
+            "unknown_json"
+            if table in {"records", "laps"}
+            else "detail_json.unknown"
+            if table == "messages"
+            else "fields_json"
+        )
+        raise failure("analysis.raw.suspected_identity", f"{column}.{number}.{field}", table=table)
 
 
 def check_destination(parent, name):
@@ -407,6 +582,7 @@ def publish(staging, parent, target):
             os.close(fd)
 
 
+@diagnosed(source=True, excluded_args=(1,))
 def export_analysis(source, destination):
     target = Store(Path(destination)).root
     if target.is_relative_to(source.root):
@@ -423,7 +599,8 @@ def export_analysis(source, destination):
                 db.execute("PRAGMA foreign_keys=ON")
                 for table in TABLES:
                     db.execute(ddl(table))
-                expected, metadata = populate(db, source)
+                with source.read_snapshot():
+                    expected, metadata = populate(db, source)
             with closing(sqlite3.connect(staging.as_uri() + "?mode=ro", uri=True)) as db:
                 validate(db, expected, metadata)
             receipt = c.validate_output(

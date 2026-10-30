@@ -7,9 +7,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .errors import BridgeError, MESSAGES
 from .fit_fields import AUXILIARY_MESSAGES, FIT_FIELDS_VERSION, RECORD_UNITS
+from .fit_unknown import validate_report, REPORT_PATH
+from .privacy import failure, register_keys, require_schema, schema_field, safe_key, located
 
 SCHEMA_VERSION = "1.0"
-NORMALIZER_VERSION = "1.3.0"
+NORMALIZER_VERSION = "1.4.0"
 LEGACY_STREAM_UNITS = {
     "timestamp": "UTC",
     "heart_rate": "bpm",
@@ -25,6 +27,7 @@ LEGACY_STREAM_UNITS = {
 }
 
 STREAM_UNITS = {**LEGACY_STREAM_UNITS, **RECORD_UNITS}
+V1_STREAM_UNITS = {k: v for k, v in STREAM_UNITS.items() if k != "fractional_cadence"}
 
 METRIC_UNITS = {
     "duration": "s",
@@ -110,7 +113,11 @@ def timezone_name(value):
 
 
 def nullable(check):
-    return lambda x: x is None or check(x)
+    def wrapped(x):
+        return x is None or check(x)
+
+    wrapped.inner = check
+    return wrapped
 
 
 def literal(*values):
@@ -118,15 +125,25 @@ def literal(*values):
 
 
 def obj(fields):
-    return lambda x: (
-        type(x) is dict
-        and x.keys() == fields.keys()
-        and all(check(x[key]) for key, check in fields.items())
-    )
+    register_keys(fields)
+
+    def check(x):
+        return (
+            type(x) is dict
+            and x.keys() == fields.keys()
+            and all(child(x[key]) for key, child in fields.items())
+        )
+
+    check.fields = fields
+    return check
 
 
 def sequence(check, maximum=100):
-    return lambda x: type(x) is list and len(x) <= maximum and all(check(v) for v in x)
+    def wrapped(x):
+        return type(x) is list and len(x) <= maximum and all(check(v) for v in x)
+
+    wrapped.item = check
+    return wrapped
 
 
 def count(x):
@@ -163,7 +180,9 @@ def coverage_for(units):
 
 
 def COVERAGE(value):
-    return coverage_for(STREAM_UNITS)(value) or coverage_for(LEGACY_STREAM_UNITS)(value)
+    return any(
+        coverage_for(units)(value) for units in (STREAM_UNITS, V1_STREAM_UNITS, LEGACY_STREAM_UNITS)
+    )
 
 
 FILES = obj(
@@ -308,7 +327,17 @@ SYNC_REPORT = obj(
     }
 )
 
+
+def blocked_report(value):
+    try:
+        validate_report(value)
+        return True
+    except BridgeError:
+        return False
+
+
 OUTPUTS = {
+    "fit-blocked": obj({"report": literal(REPORT_PATH), "blocked": blocked_report}),
     "export": obj(
         {
             "schema_version": literal(SCHEMA_VERSION),
@@ -380,6 +409,28 @@ OUTPUTS = {
 }
 
 
+ERROR_BASE = OUTPUTS["error"]
+DIAGNOSTIC = obj(
+    {
+        key: lambda x: type(x) is str and 0 < len(x) <= 256
+        for key in ("rule", "file", "table", "field")
+    }
+)
+
+
+def error_output(value):
+    if type(value) is dict and value.get("error") == "privacy_failed":
+        from .privacy import REPORT
+
+        return obj(
+            {**ERROR_BASE.fields, "diagnostic": DIAGNOSTIC, "report": nullable(literal(REPORT))}
+        )(value)
+    return ERROR_BASE(value)
+
+
+OUTPUTS["error"] = error_output
+
+
 def validate_output(kind, payload):
     try:
         if kind in {"list", "activity", "status"} and "storage_version" in payload:
@@ -395,7 +446,17 @@ def validate_output(kind, payload):
     except (TypeError, ValueError, KeyError, OverflowError):
         valid = False
     if not valid:
-        raise BridgeError("privacy_failed")
+        if kind in {"snapshot", "backup", "window", "segment"} or (
+            kind in {"list", "activity", "status"}
+            and type(payload) is dict
+            and "storage_version" in payload
+        ):
+            from .sqlite_contract import output_problem
+
+            field = output_problem(kind, payload)
+        else:
+            field = schema_field(OUTPUTS.get(kind), payload)
+        raise failure("output.contract", field, file="stdout.json", table="output")
     return payload
 
 
@@ -404,21 +465,53 @@ def project_activity(value):
     try:
         projected = {key: value[key] for key in ACTIVITY_FIELDS}
         valid = ACTIVITY(projected)
-        valid = valid and all(
-            f"/{projected['source_activity_id']}/" in ref for ref in projected["files"].values()
-        )
     except (KeyError, TypeError, ValueError):
         valid = False
     if not valid:
-        raise BridgeError("privacy_failed")
+        raise failure("summary.contract", schema_field(ACTIVITY, value))
+    if not all(
+        f"/{projected['source_activity_id']}/" in ref for ref in projected["files"].values()
+    ):
+        raise failure("summary.activity_reference", "files")
     return projected
 
 
+def record_check(fields, allow_unknown=False):
+    def check(row):
+        if type(row) is not dict:
+            return False
+        base = {k: v for k, v in row.items() if k in fields}
+        unknown = {k: v for k, v in row.items() if k not in fields}
+        from .fit_unknown import valid_unknown
+
+        return obj(fields)(base) and (
+            valid_unknown(unknown, "record") if allow_unknown else not unknown
+        )
+
+    def diagnose(row):
+        if type(row) is not dict:
+            return "$"
+        base = {k: v for k, v in row.items() if k in fields}
+        if not obj(fields)(base):
+            return schema_field(obj(fields), base)
+        from .fit_unknown import valid_unknown
+
+        for key in sorted(row.keys() - fields.keys()):
+            if not allow_unknown or not valid_unknown({key: row[key]}, "record"):
+                return safe_key(key)
+        return "$"
+
+    check.diagnose = diagnose
+    return check
+
+
+@located("activities.sqlite", "samples")
 def validate_streams(value):
-    from .fit_details import filter_message_context, valid_message
+    from .fit_details import filter_message_context, message_check
 
     extended = type(value) is dict and "fit_fields_version" in value
-    units = STREAM_UNITS if extended else LEGACY_STREAM_UNITS
+    full = extended and value.get("fit_fields_version") == FIT_FIELDS_VERSION
+    units = STREAM_UNITS if full else V1_STREAM_UNITS if extended else LEGACY_STREAM_UNITS
     identity = value.get("include_identity", False) if type(value) is dict else False
     fields = {key: nullable(numeric) for key in units}
     fields["timestamp"] = nullable(lambda x: iso_time(x, True))
@@ -431,14 +524,18 @@ def validate_streams(value):
     }
     extra = {}
     if extended:
-        lap["fit"] = lambda x: valid_message(x, identity, {"lap"})
+        lap["fit"] = message_check(identity, {"lap"})
         extra = {
-            "fit_fields_version": literal(FIT_FIELDS_VERSION),
+            "fit_fields_version": literal("1.0", FIT_FIELDS_VERSION),
             "include_identity": lambda x: type(x) is bool,
-            "session": lambda x: valid_message(x, identity, {"session"}),
-            "events": sequence(lambda x: valid_message(x, identity, {"event"}), 100_000),
-            "messages": sequence(lambda x: valid_message(x, identity, AUXILIARY_MESSAGES), 100_000),
+            "session": message_check(identity, {"session"}),
+            "events": sequence(message_check(identity, {"event"}), 100_000),
+            "messages": sequence(message_check(identity, AUXILIARY_MESSAGES), 100_000),
         }
+    if full:
+        from .fit_unknown import valid_raw_message
+
+        extra["raw_messages"] = sequence(valid_raw_message, 500_000)
     check = obj(
         {
             "schema_version": literal(SCHEMA_VERSION),
@@ -455,7 +552,7 @@ def validate_streams(value):
                     "distance": literal("m"),
                 }
             ),
-            "records": sequence(obj(fields), 500_000),
+            "records": sequence(record_check(fields, full), 500_000),
             "laps": sequence(obj(lap), 10_000),
             "timer_events": sequence(
                 obj(
@@ -471,14 +568,19 @@ def validate_streams(value):
             **extra,
         }
     )
-    if not check(value):
-        raise BridgeError("privacy_failed")
+    require_schema(check, value, "streams.contract")
+    if full:
+        from .fit_unknown import suspected_identity_fields
+
+        if blocked := suspected_identity_fields(value):
+            number, field = min(blocked)
+            raise failure("raw.suspected_identity", f"{number}.{field}", table="samples")
     if (
         extended
         and filter_message_context(value["session"], value["laps"], value["messages"])
         != value["messages"]
     ):
-        raise BridgeError("privacy_failed")
+        raise failure("streams.message_context", "messages", table="samples")
     return value
 
 
@@ -491,6 +593,5 @@ def validate_gap_report(value):
             "gaps": sequence(GAP, 1_000_000),
         }
     )
-    if not check(value):
-        raise BridgeError("privacy_failed")
+    require_schema(check, value, "gaps.contract")
     return value

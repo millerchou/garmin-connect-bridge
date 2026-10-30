@@ -68,6 +68,7 @@ def case(message, name):
         "file_id": {0: (0, 4)},
         "sport": {0: (0, 2)},
         "split": {11: (0, 2)},
+        "segment_lap": {23: (0, 2)},
         "split_summary": {1: (0, 2)},
         "activity": {1: (0x84, 1), 3: (0, 26), 4: (0, 0)},
     }.get(message, {})
@@ -218,7 +219,7 @@ def test_combined_metrics_units_estimates_arrays_and_timezone():
 
 
 @pytest.mark.parametrize("identity", [False, True])
-def test_identity_is_explicit_and_positions_unknowns_text_are_always_excluded(identity):
+def test_identity_is_explicit_and_positions_device_text_are_excluded(identity):
     summary, streams = parse(rich_fit(), identity)
     encoded = json.dumps([summary, streams])
     for forbidden in (
@@ -228,10 +229,9 @@ def test_identity_is_explicit_and_positions_unknowns_text_are_always_excluded(id
         "nec_lat",
         "swc_long",
         "123456",
-        "unknown_250",
-        "98765",
     ):
         assert forbidden not in encoded
+    assert detail(streams, "split")["unknown"] == {"unknown_250": 98765}
     assert ("serial_number" in encoded) is identity
     assert ("Synthetic Person" in encoded) is identity
     assert ("user_profile" in encoded) is identity
@@ -356,7 +356,7 @@ def test_recursive_contract_rejects_new_detail_injections(target):
     elif target == "array":
         streams["laps"][0]["fit"]["fields"]["avg_power_position"]["value"] = [1, 2, 3]
     elif target == "text":
-        fields["sport_profile_name"]["value"] = "PRIVATE_SYNTHETIC_LABEL"
+        fields["sport_profile_name"]["value"] = "\x00INVALID_SYNTHETIC_LABEL"
     elif target == "event":
         streams["events"][0]["fields"]["event"]["value"] = 250
     with pytest.raises(BridgeError):
@@ -379,12 +379,14 @@ def test_sqlite_snapshot_identity_policy_revisions_and_restore(tmp_path):
         "lap",
         "session",
         "event",
+        "segment_lap",
+        "timestamp_correlation",
     }
     snapshot = tmp_path / "snapshot"
     transfer.export_snapshot(store, snapshot)
     manifest = json.loads((snapshot / "manifest.json").read_bytes())
     assert manifest["format_version"] == 2
-    assert manifest["fit_fields_versions"] == ["1.0"]
+    assert manifest["fit_fields_versions"] == ["1.1"]
     assert manifest["identity_included"] is True
     assert manifest["fit_counts"]["identity_revisions"] == 1
     assert transfer.verify_snapshot(snapshot)["revision_count"] == 2
@@ -407,7 +409,7 @@ def test_range_sync_version_revision_idempotence_and_failed_watermark(tmp_path, 
     old_files = prior["activities"]["1001"]["summary"]["files"]
     assert run(store, Source())["updated"] == 1
     current = store.state()["activities"]["1001"]["summary"]
-    assert current["normalizer_version"] == "1.3.0" and current["files"] != old_files
+    assert current["normalizer_version"] == "1.4.0" and current["files"] != old_files
     assert store.read_json(old_files["summary"])["normalizer_version"] == "1.2.1"
     assert run(store, Source())["unchanged"] == 1
     before = copy.deepcopy(store.state())
@@ -421,7 +423,14 @@ def test_range_sync_version_revision_idempotence_and_failed_watermark(tmp_path, 
 
 def test_legacy_stream_contract_and_sqlite_schema_remain_readable(tmp_path):
     summary, streams = parse(fit_bytes())
-    for key in ("fit_fields_version", "include_identity", "session", "events", "messages"):
+    for key in (
+        "fit_fields_version",
+        "include_identity",
+        "session",
+        "events",
+        "messages",
+        "raw_messages",
+    ):
         del streams[key]
     streams["units"] = dict(c.LEGACY_STREAM_UNITS)
     for row in streams["records"]:
@@ -508,7 +517,7 @@ def test_sdk_documented_fields_do_not_leak_fitdecode_unknown_names():
     _, streams = parse(rich_fit())
     fields = detail(streams, "split_summary")["fields"]
     assert fields["sport"]["value"] == 2 and fields["avg_power"]["value"] == 200
-    assert "unknown_" not in json.dumps(streams)
+    assert "unknown" not in detail(streams, "split_summary")
 
 
 @pytest.mark.parametrize("event", [10, 47, 54, 56, 75, 82])
@@ -620,13 +629,15 @@ def test_identity_cli_setting_and_receipt_excludes_values(tmp_path, capsys, argu
     )
 
 
-def test_sport_labels_are_closed_and_custom_text_stays_private():
+def test_sport_labels_retain_custom_text():
     session = frame(18, [raw(5, 0, 2), raw(110, 7, b"PRIVATE_SYNTHETIC_LABEL\0")])
     data = minimal(
         frame(12, [raw(0, 0, 2), raw(3, 7, b"PRIVATE_SYNTHETIC_LABEL\0")]), session=session
     )
     summary, streams = parse(data, identity=True)
-    assert "PRIVATE_SYNTHETIC_LABEL" not in json.dumps([summary, streams])
+    assert streams["session"]["fields"]["sport_profile_name"]["value"] == "PRIVATE_SYNTHETIC_LABEL"
+    assert detail(streams, "sport")["fields"]["name"]["value"] == "PRIVATE_SYNTHETIC_LABEL"
+    assert "PRIVATE_SYNTHETIC_LABEL" not in json.dumps(summary)
 
 
 @pytest.mark.parametrize("fields", [[raw(116, 2, [1, 2, 3])], [raw(101, 0x84, 1)]])

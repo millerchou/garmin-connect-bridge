@@ -1,10 +1,13 @@
 """Incremental acquisition with explicit coverage and crash-safe checkpoints."""
 
+from collections import Counter
 from datetime import date, datetime, timedelta
 
 from . import normalize as parser
 from .contract import NORMALIZER_VERSION, SCHEMA_VERSION, project_activity, validate_streams
+from .fit_unknown import save_report
 from .errors import BridgeError
+from .privacy import diagnosed
 from .storage import canonical
 from .upstream import now
 
@@ -121,6 +124,7 @@ def acquire(store, source, meta, state, cutoff_at=None, *, include_identity=Fals
     )
 
 
+@diagnosed(source=True)
 def publish_original(
     store, original, meta, state, cutoff_at=None, *, local_import=False, include_identity=False
 ):
@@ -174,10 +178,18 @@ def publish_original(
                 state.update(committed)
             return False
     cached = store.revision_artifacts(source_id, digest, fit_hash)
+    blocked = Counter()
     summary, streams = cached or parser.normalize(
-        fit, meta, now(), digest, local_import=local_import, include_identity=include_identity
+        fit,
+        meta,
+        now(),
+        digest,
+        local_import=local_import,
+        include_identity=include_identity,
+        blocked_fields=blocked,
     )
     validate_streams(streams)
+    save_report(store, blocked)
     if (
         cutoff_at
         and summary["activity_time"]["utc"]
@@ -213,6 +225,7 @@ def publish_original(
     return True
 
 
+@diagnosed(source=True)
 def synchronize(store, source_factory, interval=None, **options):
     """Caller holds the exclusive store lock, including authentication/refresh."""
     from .jobs import run_job

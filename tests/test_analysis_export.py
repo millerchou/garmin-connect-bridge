@@ -55,6 +55,26 @@ DENIED_NAMES = (
     "LaTiTuDe",
     "SERIAL_nUmber",
     "fit-USER__PrOfIlE-value",
+    "fitAntDeviceNumber",
+    "ant_transmission_type",
+    "nested.deviceId",
+    "product_name",
+    "descriptor",
+    "deviceSerial",
+    "macAddress",
+    "coordinates",
+    "gpsPosition",
+    "positionLng",
+    "startLon",
+    "position",
+    "startPosition",
+    "end_position",
+    "homeLocation",
+    "device_number",
+    "fitDeviceNumber0",
+    "nested-device.number",
+    "localId",
+    "global_id",
 )
 
 
@@ -154,7 +174,7 @@ def test_analysis_current_revisions_typed_values_privacy_and_receipt(
     assert (first["avg_power"], second["avg_power"]) == (230, 200)
     assert first["avg_power_source"] == "fit_session"
     assert first["garmin_reported_normalized_power"] == 215
-    assert first["normalizer_version"] == "1.3.0"
+    assert first["normalizer_version"] == "1.4.0"
     assert first["activity_time_local"] == "2025-01-02T08:00:00"
     assert first["timezone"] == "Asia/Shanghai" and first["utc_offset_seconds"] == 28800
     metadata = read_table(target, "meta")[0]
@@ -429,7 +449,14 @@ def test_built_in_validation_blocks_schema_counts_and_private_json(
 
 def test_legacy_current_revision_exports_without_rewriting_store(store, tmp_path):
     summary, streams = parse(fit_bytes())
-    for key in ("fit_fields_version", "include_identity", "session", "events", "messages"):
+    for key in (
+        "fit_fields_version",
+        "include_identity",
+        "session",
+        "events",
+        "messages",
+        "raw_messages",
+    ):
         del streams[key]
     streams["units"] = dict(c.LEGACY_STREAM_UNITS)
     streams["records"] = [{k: row[k] for k in c.LEGACY_STREAM_UNITS} for row in streams["records"]]
