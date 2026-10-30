@@ -19,7 +19,7 @@ from itertools import chain
 
 from fitdecode import profile
 
-from .errors import BridgeError
+from .privacy import failure, located, diagnosed
 from .fit_fields import FIELDS, MESSAGE_NUMBERS
 
 UNKNOWN_MESSAGES = frozenset(
@@ -385,9 +385,10 @@ class RawPrivacy:
         streams["raw_messages"][:] = [row for row in streams["raw_messages"] if row["fields"]]
 
 
+@located(REPORT_PATH, "blocked_fields")
 def validate_report(value):
     if type(value) is not list or len(value) > 100_000:
-        raise BridgeError("privacy_failed")
+        raise failure("blocked_report.shape", "rows")
     seen = set()
     for row in value:
         if not (
@@ -402,19 +403,21 @@ def validate_report(value):
             and type(row["row_count"]) is int
             and 0 < row["row_count"] <= 10**12
         ):
-            raise BridgeError("privacy_failed")
+            raise failure("blocked_report.row", "field,reason,row_count")
         key = row["field"], row["reason"]
         if key in seen:
-            raise BridgeError("privacy_failed")
+            raise failure("blocked_report.duplicate", "field,reason")
         seen.add(key)
     return value
 
 
+@diagnosed(source=True)
 def read_report(store):
     value = store.read_json(REPORT_PATH)
     return validate_report([] if value is None else value)
 
 
+@diagnosed(source=True)
 def save_report(store, blocked):
     """Cumulative normalization-attempt counts; cache hits do not increment them."""
     if not blocked:

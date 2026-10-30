@@ -5,6 +5,7 @@ from pathlib import Path
 from . import normalize
 from .contract import SCHEMA_VERSION, project_activity
 from .errors import BridgeError
+from .privacy import diagnosed
 from .jobs import load_job
 from .storage import Store
 from .sync import publish_original
@@ -24,6 +25,7 @@ def read_input(store, filename):
     return original
 
 
+@diagnosed(source=True)
 def import_file(store, filename, source_id, *, include_identity=False):
     """Caller holds the exclusive lock. Never checkpoint/resolve an API job."""
     meta = normalize.local_metadata(source_id)

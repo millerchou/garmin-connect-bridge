@@ -14,6 +14,7 @@ import sqlite3
 
 from . import contract as c
 from .errors import BridgeError
+from .privacy import failure, diagnosed, located, require_schema
 from .persistence import require, validate_job, validate_state, validate_summary_provenance
 from .storage import Store, canonical, check_private, decode, empty_state
 
@@ -62,31 +63,46 @@ def document_kind(name):
     return match[1] if match else None
 
 
+@located(DATABASE, "documents")
 def validate_document(name, value):
     kind = document_kind(name)
     if kind == "state":
         validate_state(value)
     elif kind == "job":
         validate_job(value)
-        require(name == "sync-job.json" or name == f"jobs/{value['id']}.json")
+        require(
+            name == "sync-job.json" or name == f"jobs/{value['id']}.json",
+            "sqlite_store.validate_document.1",
+            "id",
+        )
     elif kind == "gaps":
         c.validate_gap_report(value)
-        require(name == f"reports/{value['job_id']}/gaps.json")
+        require(
+            name == f"reports/{value['job_id']}/gaps.json",
+            "sqlite_store.validate_document.2",
+            "job_id",
+        )
     elif kind == "summary":
-        require(c.ACTIVITY(value))
+        require_schema(c.ACTIVITY, value, "summary.contract")
         c.project_activity(value)
         validate_summary_provenance(value)
-        require(value["files"]["summary"] == name)
+        require(
+            value["files"]["summary"] == name, "sqlite_store.validate_document.4", "summary,files"
+        )
     elif kind == "streams":
         c.validate_streams(value)
-        require(name.split("/")[1] == value["source_activity_id"])
+        require(
+            name.split("/")[1] == value["source_activity_id"],
+            "sqlite_store.validate_document.5",
+            "source_activity_id",
+        )
     else:
-        raise BridgeError("privacy_failed")
+        raise failure("document.name", "name")
     return value
 
 
 def connect(path, write=False, immutable=False):
-    require(not (write and immutable))
+    require(not (write and immutable), "sqlite_store.connect.1", "connection")
     uri = path.as_uri() + ("?mode=rw" if write else "?mode=ro")
     db = sqlite3.connect(uri + ("&immutable=1" if immutable else ""), uri=True)
     db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 128 * 1024 * 1024)
@@ -101,10 +117,19 @@ def connect(path, write=False, immutable=False):
     return db
 
 
+@located(DATABASE, "sqlite_schema")
 def check_schema(db):
     rows = db.execute("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY name").fetchall()
-    require(rows == sorted(("table", sql.split()[2], sql.split()[2], sql) for sql in DDL))
-    require(db.execute("PRAGMA user_version").fetchone()[0] == STORAGE_VERSION)
+    require(
+        rows == sorted(("table", sql.split()[2], sql.split()[2], sql) for sql in DDL),
+        "sqlite_store.check_schema.1",
+        "sqlite_schema",
+    )
+    require(
+        db.execute("PRAGMA user_version").fetchone()[0] == STORAGE_VERSION,
+        "sqlite_store.check_schema.2",
+        "user_version",
+    )
 
 
 class SQLiteStore(Store):
@@ -133,7 +158,7 @@ class SQLiteStore(Store):
         if path.exists() and self.path("index.json").exists():
             raise BridgeError("storage_format_conflict")
         portable = self.path("manifest.json").exists()
-        require(not (portable and create))
+        require(not (portable and create), "sqlite_store._database.1", "file")
         if create and not path.exists():
             # Never mix a file catalog with SQLite documents.
             if super().read_bytes("index.json") is not None:
@@ -157,9 +182,10 @@ class SQLiteStore(Store):
                     os.unlink(name)
         for suffix in ("-journal", "-wal", "-shm"):
             sidecar = self.path(DATABASE + suffix)
-            require(not (portable and sidecar.exists()))
+            if portable and sidecar.exists():
+                raise BridgeError("busy")
         if path.exists():
-            require(0 < path.stat().st_size <= 16 * 1024**3)
+            require(0 < path.stat().st_size <= 16 * 1024**3, "sqlite_store._database.3", "file")
         return path
 
     @contextmanager
@@ -181,6 +207,8 @@ class SQLiteStore(Store):
         except sqlite3.Error:
             raise BridgeError("storage_failed") from None
         try:
+            if not write:
+                db.execute("BEGIN")
             check_schema(db)
             with db:
                 yield db
@@ -188,6 +216,24 @@ class SQLiteStore(Store):
             raise BridgeError("storage_failed") from None
         finally:
             db.close()
+
+    @contextmanager
+    def read_snapshot(self):
+        """Pin all related reads, including WAL writers outside the bridge lock."""
+        if self._absent_snapshot or not self.path(DATABASE).exists():
+            yield
+            return
+        if getattr(self, "_transaction", None) is not None:
+            yield
+            return
+        with self.database() as db:
+            # database() starts a read transaction; establish its snapshot now.
+            db.execute("SELECT count(*) FROM sqlite_schema").fetchone()
+            self._transaction = db
+            try:
+                yield
+            finally:
+                self._transaction = None
 
     @contextmanager
     def atomic(self):
@@ -199,12 +245,14 @@ class SQLiteStore(Store):
             finally:
                 self._transaction = None
 
+    @diagnosed(source=True)
     def publish_activity(self, streams, summary, committed):
         with self.atomic():
             self.write_json(summary["files"]["streams"], streams)
             self.write_json(summary["files"]["summary"], summary)
             self.write_json("index.json", committed)
 
+    @diagnosed(source=True)
     def revision_artifacts(self, source_id, digest, fit_hash):
         """Reuse an existing immutable revision when a source correction is reverted."""
         from .persistence import artifact_files
@@ -216,10 +264,18 @@ class SQLiteStore(Store):
         if summary_data is None:
             return None
         stream_data = self.read_bytes(f"{prefix}/streams.json")
-        require(stream_data is not None)
+        require(stream_data is not None, "sqlite_store.revision_artifacts.1", "files.streams")
         summary = decode(summary_data)
-        require(summary["fit_sha256"] == fit_hash and summary["source_digest"] == digest)
-        require(summary["normalizer_version"] == c.NORMALIZER_VERSION)
+        require(
+            summary["fit_sha256"] == fit_hash and summary["source_digest"] == digest,
+            "sqlite_store.revision_artifacts.2",
+            "fit_sha256,source_digest",
+        )
+        require(
+            summary["normalizer_version"] == c.NORMALIZER_VERSION,
+            "sqlite_store.revision_artifacts.3",
+            "normalizer_version",
+        )
         artifact_files(
             {
                 "summary": summary,
@@ -232,6 +288,8 @@ class SQLiteStore(Store):
         )
         return summary, decode(stream_data)
 
+    @diagnosed(source=True)
+    @located(DATABASE, "documents")
     def preview_state(self):
         """Read one committed catalog without the bridge lock or journal recovery."""
         path = self._database()
@@ -278,7 +336,9 @@ class SQLiteStore(Store):
                         db.execute(
                             "SELECT 1 FROM documents WHERE name LIKE 'objects/%' LIMIT 1"
                         ).fetchone()
-                        is None
+                        is None,
+                        "sqlite_store.preview_state.1",
+                        "name",
                     )
                     return empty_state()
                 return validate_state(decode(row[0]))
@@ -292,6 +352,8 @@ class SQLiteStore(Store):
             if after != before:
                 raise BridgeError("busy")
 
+    @diagnosed(source=True)
+    @located(DATABASE, "documents")
     def state(self):
         value = self.read_json("index.json")
         value = empty_state() if value is None else validate_state(value)
@@ -305,10 +367,14 @@ class SQLiteStore(Store):
                         db.execute(
                             "SELECT 1 FROM documents WHERE name LIKE 'objects/%' LIMIT 1"
                         ).fetchone()
-                        is None
+                        is None,
+                        "sqlite_store.state.1",
+                        "name",
                     )
         return value
 
+    @diagnosed(source=True)
+    @located(DATABASE, "documents")
     def read_bytes(self, relative, limit=None):
         kind = document_kind(relative)
         if not kind:
@@ -322,9 +388,11 @@ class SQLiteStore(Store):
             if row is None:
                 return None
             value = decode(row[0])
-            require(type(value) is dict)
+            require(type(value) is dict, "sqlite_store.read_bytes.1", "payload")
             if kind == "streams":
-                require(not (ARRAY_LIMITS.keys() & value.keys()))
+                require(
+                    not (ARRAY_LIMITS.keys() & value.keys()), "sqlite_store.read_bytes.2", "payload"
+                )
                 arrays = stream_arrays(value)
                 require(
                     all(
@@ -332,28 +400,48 @@ class SQLiteStore(Store):
                         for row in db.execute(
                             "SELECT DISTINCT kind FROM samples WHERE name=?", (relative,)
                         )
-                    )
+                    ),
+                    "sqlite_store.read_bytes.3",
+                    "kind",
+                    table="samples",
                 )
                 for array in arrays:
                     count, size = db.execute(
                         "SELECT count(*),max(length(payload)) FROM samples WHERE name=? AND kind=?",
                         (relative, array),
                     ).fetchone()
-                    require(count <= ARRAY_LIMITS[array])
+                    require(
+                        count <= ARRAY_LIMITS[array],
+                        "sqlite_store.read_bytes.4",
+                        array,
+                        table="samples",
+                    )
                     # FIT permits up to 255 physical fields of 255 bytes each;
                     # integer arrays can expand beyond the old 32 KiB row cap.
-                    require(size is None or size <= MAX_SAMPLE_BYTES)
+                    require(
+                        size is None or size <= MAX_SAMPLE_BYTES,
+                        "sqlite_store.read_bytes.5",
+                        array + ".payload",
+                        table="samples",
+                    )
                     rows = db.execute(
                         "SELECT ordinal,payload FROM samples WHERE name=? AND kind=? ORDER BY ordinal",
                         (relative, array),
                     ).fetchall()
-                    require(all(type(r[0]) is int and r[0] == i for i, r in enumerate(rows)))
+                    require(
+                        all(type(r[0]) is int and r[0] == i for i, r in enumerate(rows)),
+                        "sqlite_store.read_bytes.6",
+                        array + ".ordinal",
+                        table="samples",
+                    )
                     value[array] = [decode(r[1]) for r in rows]
             content = canonical(value)
             if limit is not None and len(content) > limit:
                 raise BridgeError("storage_failed")
             return content
 
+    @diagnosed(source=True)
+    @located(DATABASE, "documents")
     def write_bytes(self, relative, content):
         kind = document_kind(relative)
         if not kind:
@@ -365,7 +453,11 @@ class SQLiteStore(Store):
                     "SELECT payload FROM documents WHERE name=?", (relative,)
                 ).fetchone()
                 if existing is not None:
-                    require(self.read_bytes(relative) == content)
+                    require(
+                        self.read_bytes(relative) == content,
+                        "sqlite_store.write_bytes.1",
+                        "payload",
+                    )
                     return
             if kind == "streams":
                 metadata = {k: v for k, v in value.items() if k not in ARRAY_LIMITS}
@@ -374,7 +466,12 @@ class SQLiteStore(Store):
                     def encoded_rows():
                         for i, row in enumerate(value[array]):
                             payload = canonical(row)
-                            require(len(payload) <= MAX_SAMPLE_BYTES)
+                            require(
+                                len(payload) <= MAX_SAMPLE_BYTES,
+                                "sqlite_store.encoded_rows.1",
+                                array + ".payload",
+                                table="samples",
+                            )
                             yield relative, array, i, payload
 
                     db.executemany(

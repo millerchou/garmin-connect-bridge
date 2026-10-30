@@ -170,6 +170,25 @@ Commands return bounded, closed-schema JSON. Exit codes are `0` for success, `1`
 for an incomplete scan, `2` for safe errors, and `130` for interruption. Errors do
 not echo arguments, credentials, upstream bodies, or raw input.
 
+`privacy_failed` errors additionally include `diagnostic` with `rule`, `file`,
+`table`, and `field`, plus `report: "reports/privacy-failure.json"`. The latest
+failure is saved under the effective data directory, including for snapshot
+verification; it is never added to a snapshot or analysis artifact. Reports
+contain only those labels and a report version, never offending values, activity
+IDs, row counts, hashes, absolute paths, or exception text. `file` identifies
+`activities.sqlite`, `manifest.json`, the logical `analysis.sqlite` artifact,
+`reports/fit-blocked-fields.json`, or the logical `stdout.json` output. Nested
+fields use `[]`/`*` instead of row indices or mapping IDs; unreviewed free-text
+keys become `[unreviewed-key]`. Rule IDs are explicit at the validation sites.
+
+Report replacement is atomic with a `0600` temporary file and `0700` report
+directory, with file and directory flushes. Concurrent failures leave the latest
+completed report; each error JSON retains its own diagnostic. If the effective
+data directory is unsafe, a snapshot, or unwritable, `report` is null and the
+original diagnostic still reaches stderr; there is no alternate write location.
+A failed restore can create a report-only data directory; use a new destination
+for a subsequent restore. Other committed store contents remain unchanged.
+
 ### SQLite analysis export
 
 ```sh
@@ -236,6 +255,12 @@ recovery links; remove those only after all exporters have exited. It never
 publishes a partial target. Readers with the previous file open can finish reading
 that version.
 
+Snapshot and analysis exports pin all source reads to one SQLite read transaction
+under the bridge lock. This also prevents mixed catalog/journal/artifact versions
+when an independent SQLite connection commits in WAL mode. Rollback-mode writers
+may be blocked until the export finishes. Filesystem replacement or writes that
+bypass SQLite locking remain unsupported.
+
 ### Private SQLite snapshots
 
 ```sh
@@ -260,6 +285,11 @@ the identity checks need all rows to distinguish constants from varying counters
 Older streams use first/middle/last record and event spot checks, with lap/message
 context retained.
 It does not rebuild the database or require a canonical physical byte layout.
+Snapshot verification refuses SQLite journal/WAL/SHM sidecars with `busy`, including
+sidecars appearing during verification; it never recovers them. Unexpected temporary
+or recovery files fail the exact snapshot-member rule. Source-store staging files
+are not scanned or copied. Directory iteration order does not select members or
+samples.
 Checksums detect corruption; these checks do not authenticate an untrusted sender
 or certify unused pages/trailing bytes as free of private content. Keep backups private.
 

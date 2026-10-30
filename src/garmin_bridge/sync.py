@@ -7,6 +7,7 @@ from . import normalize as parser
 from .contract import NORMALIZER_VERSION, SCHEMA_VERSION, project_activity, validate_streams
 from .fit_unknown import save_report
 from .errors import BridgeError
+from .privacy import diagnosed
 from .storage import canonical
 from .upstream import now
 
@@ -123,6 +124,7 @@ def acquire(store, source, meta, state, cutoff_at=None, *, include_identity=Fals
     )
 
 
+@diagnosed(source=True)
 def publish_original(
     store, original, meta, state, cutoff_at=None, *, local_import=False, include_identity=False
 ):
@@ -223,6 +225,7 @@ def publish_original(
     return True
 
 
+@diagnosed(source=True)
 def synchronize(store, source_factory, interval=None, **options):
     """Caller holds the exclusive store lock, including authentication/refresh."""
     from .jobs import run_job

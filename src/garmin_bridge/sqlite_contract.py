@@ -107,3 +107,41 @@ def validate_query(kind, value):
             return False
         base["activities"] = [{k: v for k, v in row.items() if k not in fields} for row in rows]
     return c.OUTPUTS[kind](base)
+
+
+def output_problem(kind, value):
+    """Describe a failed output check using schema keys, never row identifiers."""
+    if kind in {"snapshot", "backup"}:
+        check = TRANSFER
+    elif kind == "window":
+        units = value.get("units", {}) if type(value) is dict else {}
+        selected = next(
+            (u for u in (c.STREAM_UNITS, c.V1_STREAM_UNITS, c.LEGACY_STREAM_UNITS) if u == units),
+            c.STREAM_UNITS,
+        )
+        check = window_contract(selected)
+    elif kind == "segment":
+        check = HISTORY
+        if type(value) is dict and "results" not in value:
+            check = (
+                c.obj({"updated": c.count})
+                if "updated" in value
+                else c.obj({"definition": DEFINITION})
+            )
+    else:
+        fields = {**c.OUTPUTS[kind].fields, "storage_version": c.literal(1)}
+        if kind == "list":
+            fields["activities"] = c.sequence(
+                c.obj(
+                    {
+                        **c.CARD_FIELDS,
+                        "coverage": c.COVERAGE,
+                        "normalizer_version": c.ACTIVITY_FIELDS["normalizer_version"],
+                        "sample_count": c.count,
+                        "revision": c.digest,
+                    }
+                ),
+                50,
+            )
+        check = c.obj(fields)
+    return c.schema_field(check, value)

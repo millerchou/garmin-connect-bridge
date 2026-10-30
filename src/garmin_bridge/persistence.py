@@ -7,15 +7,20 @@ privacy or consistency. Unknown keys and free text fail closed.
 import copy
 
 from . import contract as c
-from .errors import BridgeError, MESSAGES
+from .errors import MESSAGES
+from .privacy import require, require_schema, located
 
 
 def mapping(key_check, value_check, maximum=1_000_000):
-    return lambda x: (
-        type(x) is dict
-        and len(x) <= maximum
-        and all(key_check(k) and value_check(v) for k, v in x.items())
-    )
+    def check(x):
+        return (
+            type(x) is dict
+            and len(x) <= maximum
+            and all(key_check(k) and value_check(v) for k, v in x.items())
+        )
+
+    check.mapped = value_check
+    return check
 
 
 def BOOLEAN(x):
@@ -112,25 +117,28 @@ def JOB(value):
     )
 
 
+JOB.diagnose = lambda value: c.schema_field(LEGACY_JOB, value)
+
+
 def identity_enabled(summary):
     return summary["provenance"]["unique_identifiers_retained"] == "explicit_opt_in"
 
 
-def require(condition):
-    if not condition:
-        raise BridgeError("privacy_failed")
-
-
+@located("activities.sqlite", "documents")
 def validate_summary_provenance(summary, metadata_digest=None):
     """Apply the same source guarantees to current and historical revisions."""
     from .normalize import LOCAL_FLAGS, input_digest_matches, local_metadata, sha256
     from .storage import canonical
 
-    require(c.ACTIVITY(summary))
+    require_schema(c.ACTIVITY, summary, "summary.contract")
     if summary["provenance"]["input"] == "local_fit_file":
         meta = local_metadata(summary["source_activity_id"])
         if metadata_digest is not None:
-            require(metadata_digest == sha256(canonical(meta)))
+            require(
+                metadata_digest == sha256(canonical(meta)),
+                "persistence.validate_summary_provenance.2",
+                "metadata_digest",
+            )
         require(
             input_digest_matches(
                 summary["source_digest"],
@@ -138,69 +146,134 @@ def validate_summary_provenance(summary, metadata_digest=None):
                 summary["fit_sha256"],
                 local_import=True,
                 include_identity=identity_enabled(summary),
-            )
+            ),
+            "persistence.validate_summary_provenance.3",
+            "source_digest,fit_sha256",
         )
-        require(LOCAL_FLAGS <= set(summary["quality_flags"]))
-        require(summary["activity_time"]["timezone"] is None)
+        require(
+            LOCAL_FLAGS <= set(summary["quality_flags"]),
+            "persistence.validate_summary_provenance.4",
+            "quality_flags",
+        )
+        require(
+            summary["activity_time"]["timezone"] is None,
+            "persistence.validate_summary_provenance.5",
+            "timezone,activity_time",
+        )
         if tuple(map(int, summary["normalizer_version"].split("."))) < (1, 3, 0):
             require(
-                all(summary["activity_time"][k] is None for k in ("local", "utc_offset_seconds"))
+                all(summary["activity_time"][k] is None for k in ("local", "utc_offset_seconds")),
+                "persistence.validate_summary_provenance.6",
+                "activity_time",
             )
         require(
             all(
                 q["source"] != "garmin_activity"
                 for group in ("metrics", "garmin_reported")
                 for q in summary[group].values()
-            )
+            ),
+            "persistence.validate_summary_provenance.7",
+            "source",
         )
     return summary
 
 
+@located("activities.sqlite", "documents")
 def validate_state(value, portable=False):
-    require(STATE(value))
+    require_schema(STATE, value, "state.contract")
     for interval in value["covered_ranges"] + value["pending_ranges"]:
-        require(interval["start"] <= interval["end"])
-    require(value["history_initialized"] == (value["full_completed_at"] is not None))
+        require(interval["start"] <= interval["end"], "persistence.validate_state.2", "start,end")
+    require(
+        value["history_initialized"] == (value["full_completed_at"] is not None),
+        "persistence.validate_state.3",
+        "history_initialized,full_completed_at",
+    )
     for source_id, entry in value["activities"].items():
         summary = c.project_activity(entry["summary"])
-        require(summary["source_activity_id"] == source_id)
+        require(
+            summary["source_activity_id"] == source_id,
+            "persistence.validate_state.4",
+            "source_activity_id",
+        )
         validate_summary_provenance(summary, entry["metadata_digest"])
         if portable or entry["raw_ref"] is None:
-            require(entry["raw_ref"] is None and entry["raw_sha256"] is None)
+            require(
+                entry["raw_ref"] is None and entry["raw_sha256"] is None,
+                "persistence.validate_state.5",
+                "raw_ref,raw_sha256",
+            )
         else:
-            require(entry["raw_ref"] == f"raw/{entry['raw_sha256']}.bin")
+            require(
+                entry["raw_ref"] == f"raw/{entry['raw_sha256']}.bin",
+                "persistence.validate_state.6",
+                "raw_ref,raw_sha256",
+            )
     return value
 
 
+@located("activities.sqlite", "documents")
 def validate_job(value):
-    require(JOB(value))
+    require_schema(JOB, value, "job.contract")
     interval = value["filter"]
     if value["mode"] == "range":
-        require(interval["start"] is not None and interval["end"] is not None)
-        require(interval["start"] <= interval["end"])
+        require(
+            interval["start"] is not None and interval["end"] is not None,
+            "persistence.validate_job.2",
+            "start,end",
+        )
+        require(interval["start"] <= interval["end"], "persistence.validate_job.3", "start,end")
     else:
-        require(interval == {"start": None, "end": None})
-    require(set(value["seen"]) <= set(value["items"]))
+        require(
+            interval == {"start": None, "end": None}, "persistence.validate_job.4", "sync-job.json"
+        )
+    require(set(value["seen"]) <= set(value["items"]), "persistence.validate_job.5", "seen,items")
     for source_id, item in value["items"].items():
         if item["metadata"] is not None:
-            require(item["metadata"]["source_activity_id"] == source_id)
+            require(
+                item["metadata"]["source_activity_id"] == source_id,
+                "persistence.validate_job.6",
+                "source_activity_id,metadata",
+            )
         if item["state"] == "completed":
-            require(item["metadata"] is not None and item["reason"] is None)
-            require(item["outcome"] in {"updated", "unchanged"})
+            require(
+                item["metadata"] is not None and item["reason"] is None,
+                "persistence.validate_job.7",
+                "metadata,reason",
+            )
+            require(
+                item["outcome"] in {"updated", "unchanged"}, "persistence.validate_job.8", "outcome"
+            )
         else:
-            require(item["outcome"] is None)
+            require(item["outcome"] is None, "persistence.validate_job.9", "outcome")
         if item["state"] == "skipped":
-            require(item["reason"] in {"outside_scope", "after_cutoff", "outside_recheck_window"})
+            require(
+                item["reason"] in {"outside_scope", "after_cutoff", "outside_recheck_window"},
+                "persistence.validate_job.10",
+                "reason",
+            )
         if item["state"] == "discovered":
-            require(item["metadata"] is not None and item["reason"] is None)
+            require(
+                item["metadata"] is not None and item["reason"] is None,
+                "persistence.validate_job.11",
+                "metadata,reason",
+            )
         if item["state"] in {"retry", "unavailable"}:
-            require(item["reason"] in MESSAGES)
+            require(item["reason"] in MESSAGES, "persistence.validate_job.12", "reason")
     if value["status"] == "complete":
-        require(value["enumeration_complete"] and value["last_failure"] is None)
-        require(all(i["state"] in {"completed", "skipped"} for i in value["items"].values()))
+        require(
+            value["enumeration_complete"] and value["last_failure"] is None,
+            "persistence.validate_job.13",
+            "enumeration_complete,last_failure",
+        )
+        require(
+            all(i["state"] in {"completed", "skipped"} for i in value["items"].values()),
+            "persistence.validate_job.14",
+            "state,items",
+        )
     return value
 
 
+@located("activities.sqlite", "documents")
 def validate_pair(state, job):
     """A portable snapshot must not claim completed items whose results are absent."""
     from .normalize import input_digest_matches, sha256
@@ -214,29 +287,47 @@ def validate_pair(state, job):
             all(
                 s["summary"]["provenance"]["input"] == "local_fit_file"
                 for s in state["activities"].values()
-            )
+            ),
+            "persistence.validate_pair.1",
+            "input,provenance,summary,activities",
         )
-        require({**state, "activities": {}} == empty_state())
+        require(
+            {**state, "activities": {}} == empty_state(),
+            "persistence.validate_pair.2",
+            "index.json",
+        )
         return
     validate_job(job)
     for source_id, item in job["items"].items():
         if item["state"] == "completed" or item["reason"] == "outside_recheck_window":
-            require(source_id in state["activities"])
+            require(source_id in state["activities"], "persistence.validate_pair.3", "activities")
             entry = state["activities"][source_id]
-            require(item["metadata"] is not None)
-            require(entry["metadata_digest"] == sha256(canonical(item["metadata"])))
+            require(item["metadata"] is not None, "persistence.validate_pair.4", "metadata")
+            require(
+                entry["metadata_digest"] == sha256(canonical(item["metadata"])),
+                "persistence.validate_pair.5",
+                "metadata_digest,metadata",
+            )
             require(
                 input_digest_matches(
                     entry["summary"]["source_digest"],
                     item["metadata"],
                     entry["summary"]["fit_sha256"],
                     include_identity=identity_enabled(entry["summary"]),
-                )
+                ),
+                "persistence.validate_pair.6",
+                "source_digest,metadata,fit_sha256,summary",
             )
     if job["status"] == "complete":
-        require(state["last_success_at"] is not None and state["last_failure"] is None)
+        require(
+            state["last_success_at"] is not None and state["last_failure"] is None,
+            "persistence.validate_pair.7",
+            "last_success_at,last_failure",
+        )
         if job["mode"] == "full":
-            require(state["history_initialized"])
+            require(
+                state["history_initialized"], "persistence.validate_pair.8", "history_initialized"
+            )
 
 
 def snapshot(store):
@@ -269,6 +360,7 @@ def control_files(state, job):
     return values
 
 
+@located("activities.sqlite", "documents")
 def validate_artifact_paths(summary):
     from .normalize import sha256
     from .storage import canonical
@@ -283,21 +375,36 @@ def validate_artifact_paths(summary):
         == {
             kind: f"objects/{summary['source_activity_id']}/{revision}/{kind}.json"
             for kind in ("summary", "streams")
-        }
+        },
+        "persistence.validate_artifact_paths.1",
+        "files,source_activity_id",
     )
 
 
+@located("activities.sqlite", "documents")
 def validate_artifact_relation(summary, streams):
     """Cheap revision/metadata/count checks, independent of per-sample validation."""
     validate_artifact_paths(summary)
     from .fit_details import fill_local_time
 
-    require(identity_enabled(summary) == streams.get("include_identity", False))
-    require(summary["coverage"].keys() == streams["units"].keys())
+    require(
+        identity_enabled(summary) == streams.get("include_identity", False),
+        "persistence.validate_artifact_relation.1",
+        "include_identity",
+    )
+    require(
+        summary["coverage"].keys() == streams["units"].keys(),
+        "persistence.validate_artifact_relation.2",
+        "coverage,units",
+    )
     if summary["provenance"]["input"] == "local_fit_file" and "fit_fields_version" in streams:
         expected_time = {**summary["activity_time"], "local": None, "utc_offset_seconds": None}
         fill_local_time(expected_time, streams["messages"])
-        require(summary["activity_time"] == expected_time)
+        require(
+            summary["activity_time"] == expected_time,
+            "persistence.validate_artifact_relation.3",
+            "activity_time",
+        )
     for key in (
         "schema_version",
         "normalizer_version",
@@ -305,15 +412,20 @@ def validate_artifact_relation(summary, streams):
         "source_activity_id",
         "source_digest",
     ):
-        require(streams[key] == summary[key])
+        require(streams[key] == summary[key], "persistence.validate_artifact_relation.4", key)
     for array, field in (
         ("records", "sample_count"),
         ("laps", "lap_count"),
         ("timer_events", "timer_event_count"),
     ):
-        require(len(streams[array]) == summary[field])
+        require(
+            len(streams[array]) == summary[field],
+            "persistence.validate_artifact_relation.5",
+            field,
+        )
 
 
+@located("activities.sqlite", "documents")
 def artifact_files(entry, read):
     from .normalize import sha256
     from .storage import decode
@@ -323,9 +435,13 @@ def artifact_files(entry, read):
     contents = {}
     for kind, path in summary["files"].items():
         data = read(path)
-        require(data is not None and sha256(data) == entry["file_hashes"][kind])
+        require(
+            data is not None and sha256(data) == entry["file_hashes"][kind],
+            "persistence.artifact_files.1",
+            "file_hashes",
+        )
         contents[kind] = (path, data, decode(data))
-    require(contents["summary"][2] == summary)
+    require(contents["summary"][2] == summary, "persistence.artifact_files.2", "summary")
     c.project_activity(summary)
     streams = c.validate_streams(contents["streams"][2])
     validate_artifact_relation(summary, streams)
@@ -337,6 +453,8 @@ def artifact_files(entry, read):
                 "present": present,
                 "missing": len(streams["records"]) - present,
                 "total": len(streams["records"]),
-            }
+            },
+            "persistence.artifact_files.3",
+            "records",
         )
     return [(path, data) for path, data, _ in contents.values()]

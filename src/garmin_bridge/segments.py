@@ -16,6 +16,7 @@ from . import contract as c
 from .errors import BridgeError
 from .normalize import extract_fit, sha256, timestamp
 from .persistence import require
+from .privacy import diagnosed, located, require_schema
 from .storage import canonical, decode
 
 ALGORITHM = "1.0.1"
@@ -70,27 +71,62 @@ def seconds(stamp):
     return datetime.fromisoformat(stamp).timestamp()
 
 
+@located("activities.sqlite", "segments")
 def definition_valid(value):
-    require(DEFINITION(value) and value["version"] >= 1)
-    require(0 < seconds(value["end"]) - seconds(value["start"]) <= 7200)
+    require_schema(DEFINITION, value, "segment.definition_contract")
+    require(value["version"] >= 1, "segments.definition_valid.1", "version")
+    require(
+        0 < seconds(value["end"]) - seconds(value["start"]) <= 7200,
+        "segments.definition_valid.2",
+        "end,start",
+    )
     return value
 
 
+@located("activities.sqlite", "efforts")
 def result_valid(value):
-    require(RESULT(value))
-    require((value["status"] == "matched") == bool(value["efforts"]))
+    require_schema(RESULT, value, "segment.result_contract")
+    require(
+        (value["status"] == "matched") == bool(value["efforts"]),
+        "segments.result_valid.2",
+        "status,efforts",
+    )
     prior_end = None
     for i, effort in enumerate(value["efforts"]):
-        require(effort["ordinal"] == i + 1)
-        require(effort["elapsed_seconds"] == seconds(effort["end"]) - seconds(effort["start"]) > 0)
-        require(effort["elapsed_seconds"] <= 7200)
-        require(prior_end is None or seconds(effort["start"]) > prior_end)
+        require(effort["ordinal"] == i + 1, "segments.result_valid.3", "ordinal")
+        require(
+            effort["elapsed_seconds"] == seconds(effort["end"]) - seconds(effort["start"]) > 0,
+            "segments.result_valid.4",
+            "elapsed_seconds,end,start",
+        )
+        require(effort["elapsed_seconds"] <= 7200, "segments.result_valid.5", "elapsed_seconds")
+        require(
+            prior_end is None or seconds(effort["start"]) > prior_end,
+            "segments.result_valid.6",
+            "start",
+        )
         prior_end = seconds(effort["end"])
-        require(effort["distance_m"] >= 85 and effort["sample_count"] >= 1)
-        require(0 <= effort["boundary_sampling_interval_seconds"] <= 30)
+        require(
+            effort["distance_m"] >= 85 and effort["sample_count"] >= 1,
+            "segments.result_valid.7",
+            "distance_m,sample_count",
+        )
+        require(
+            0 <= effort["boundary_sampling_interval_seconds"] <= 30,
+            "segments.result_valid.8",
+            "boundary_sampling_interval_seconds",
+        )
         for metric in ("heart_rate", "power"):
-            require(effort[f"{metric}_present"] <= effort["sample_count"])
-            require((effort[f"{metric}_mean"] is None) == (effort[f"{metric}_present"] == 0))
+            require(
+                effort[f"{metric}_present"] <= effort["sample_count"],
+                "segments.result_valid.9",
+                "sample_count",
+            )
+            require(
+                (effort[f"{metric}_mean"] is None) == (effort[f"{metric}_present"] == 0),
+                "segments.result_valid.10",
+                metric + "_mean," + metric + "_present",
+            )
     return value
 
 
@@ -103,6 +139,7 @@ def observed_statistics(rows):
     return result
 
 
+@located("activities.sqlite", "efforts")
 def validate_result_context(store, definition, value):
     """Check reproducible non-location evidence; this cannot re-prove GPS matching."""
     result_valid(value)
@@ -112,19 +149,39 @@ def validate_result_context(store, definition, value):
         f"objects/{definition['reference_activity']}/{value['reference_revision']}/streams.json"
     )
     ref = store.read_json(ref_name)
-    require(ref is not None)
-    require(all(r["timestamp"] is not None for r in ref["records"]))
+    require(ref is not None, "segments.validate_result_context.1", "reference_revision")
+    require(
+        all(r["timestamp"] is not None for r in ref["records"]),
+        "segments.validate_result_context.2",
+        "timestamp,records",
+    )
     ref_times = [seconds(r["timestamp"]) for r in ref["records"]]
     start, end = seconds(definition["start"]), seconds(definition["end"])
     ref_times = [t for t in ref_times if start <= t <= end]
-    require(len(ref_times) >= 10 and ref_times[0] == start and ref_times[-1] == end)
-    require(all(0 < b - a <= 15 for a, b in zip(ref_times, ref_times[1:])))
+    require(
+        len(ref_times) >= 10 and ref_times[0] == start and ref_times[-1] == end,
+        "segments.validate_result_context.3",
+        "start,end",
+    )
+    require(
+        all(0 < b - a <= 15 for a, b in zip(ref_times, ref_times[1:])),
+        "segments.validate_result_context.4",
+        "records.timestamp",
+    )
     name = f"objects/{value['activity_id']}/{value['revision']}/streams.json"
     stream = store.read_json(name)
-    require(stream is not None)
-    require(all(r["timestamp"] is not None for r in stream["records"]))
+    require(stream is not None, "segments.validate_result_context.5", "revision")
+    require(
+        all(r["timestamp"] is not None for r in stream["records"]),
+        "segments.validate_result_context.6",
+        "timestamp,records",
+    )
     all_times = [seconds(r["timestamp"]) for r in stream["records"]]
-    require(all(0 < b - a <= 15 for a, b in zip(all_times, all_times[1:])))
+    require(
+        all(0 < b - a <= 15 for a, b in zip(all_times, all_times[1:])),
+        "segments.validate_result_context.7",
+        "records.timestamp",
+    )
     for effort in value["efforts"]:
         start, end = seconds(effort["start"]), seconds(effort["end"])
         rows = [
@@ -132,41 +189,71 @@ def validate_result_context(store, definition, value):
             for r in stream["records"]
             if r["timestamp"] is not None and start <= seconds(r["timestamp"]) <= end
         ]
-        require(len(rows) >= 2)
+        require(len(rows) >= 2, "segments.validate_result_context.8", "records")
         times = [seconds(r["timestamp"]) for r in rows]
-        require(times[0] == start and times[-1] == end)
-        require(all(0 < b - a <= 15 for a, b in zip(times, times[1:])))
+        require(
+            times[0] == start and times[-1] == end,
+            "segments.validate_result_context.9",
+            "start,end",
+        )
+        require(
+            all(0 < b - a <= 15 for a, b in zip(times, times[1:])),
+            "segments.validate_result_context.10",
+            "records.timestamp",
+        )
         stats = observed_statistics(rows)
-        require(canonical({k: effort[k] for k in stats}) == canonical(stats))
+        require(
+            canonical({k: effort[k] for k in stats}) == canonical(stats),
+            "segments.validate_result_context.11",
+            "heart_rate_mean,power_mean,heart_rate_present,power_present,sample_count",
+        )
         require(
             effort["boundary_sampling_interval_seconds"]
-            == 2 * max(b - a for a, b in zip(times, times[1:]))
+            == 2 * max(b - a for a, b in zip(times, times[1:])),
+            "segments.validate_result_context.12",
+            "boundary_sampling_interval_seconds",
         )
 
 
+@located("activities.sqlite", "segments")
 def validate_segments(db, store):
     definitions = {}
     state = store.state()
     for ident, payload in db.execute("SELECT * FROM segments"):
         value = definition_valid(decode(payload))
-        require(ident == value["id"])
-        require(value["reference_activity"] in state["activities"])
+        require(ident == value["id"], "segments.validate_segments.1", "id")
+        require(
+            value["reference_activity"] in state["activities"],
+            "segments.validate_segments.2",
+            "reference_activity,activities",
+        )
         definitions[ident] = value
     for segment, activity, payload in db.execute("SELECT * FROM efforts"):
         value = result_valid(decode(payload))
         require(
             segment in definitions
             and segment == value["segment_id"]
-            and activity == value["activity_id"]
+            and activity == value["activity_id"],
+            "segments.validate_segments.3",
+            "segment_id,activity_id",
+            table="efforts",
         )
-        require(value["definition_version"] == definitions[segment]["version"])
+        require(
+            value["definition_version"] == definitions[segment]["version"],
+            "segments.validate_segments.4",
+            "definition_version,version",
+            table="efforts",
+        )
         # Cached historical activity revisions are allowed but must exist.
         require(
             db.execute(
                 "SELECT 1 FROM documents WHERE name=?",
                 (f"objects/{activity}/{value['revision']}/summary.json",),
             ).fetchone()
-            is not None
+            is not None,
+            "segments.validate_segments.5",
+            "revision",
+            table="efforts",
         )
         validate_result_context(store, definitions[segment], value)
         ref = definitions[segment]["reference_activity"]
@@ -175,15 +262,20 @@ def validate_segments(db, store):
                 "SELECT 1 FROM documents WHERE name=?",
                 (f"objects/{ref}/{value['reference_revision']}/summary.json",),
             ).fetchone()
-            is not None
+            is not None,
+            "segments.validate_segments.6",
+            "reference_revision",
+            table="efforts",
         )
 
 
+@located("activities.sqlite", "segments")
+@diagnosed(source=True)
 def define(store, reference, start, end, ident=None):
     state = store.state()
-    require(reference in state["activities"])
+    require(reference in state["activities"], "segments.define.1", "activities")
     ident = ident or uuid.uuid4().hex
-    require(c.JOB_ID(ident))
+    require(c.JOB_ID(ident), "segments.define.2", "id")
     with store.database(write=True) as db:
         old = db.execute("SELECT payload FROM segments WHERE id=?", (ident,)).fetchone()
         previous = definition_valid(decode(old[0])) if old else None
@@ -434,15 +526,17 @@ def calculate(store, definition, entry, reference_entry):
     return result_valid(base)
 
 
+@located("activities.sqlite", "segments")
+@diagnosed(source=True)
 def refresh(store, ident):
-    require(c.JOB_ID(ident))
+    require(c.JOB_ID(ident), "segments.refresh.1", "id")
     state = store.state()
     with store.database() as db:
         row = db.execute("SELECT payload FROM segments WHERE id=?", (ident,)).fetchone()
     if row is None:
         raise BridgeError("not_found")
     definition = definition_valid(decode(row[0]))
-    require(definition["id"] == ident)
+    require(definition["id"] == ident, "segments.refresh.2", "id")
     if definition["algorithm_version"] != ALGORITHM:
         definition = {**definition, "algorithm_version": ALGORITHM}
         with store.database(write=True) as db:
@@ -456,8 +550,18 @@ def refresh(store, ident):
             ).fetchone()
         if row:
             prior = result_valid(decode(row[0]))
-            require(prior["segment_id"] == ident and prior["activity_id"] == activity)
-            require(prior["definition_version"] == definition["version"])
+            require(
+                prior["segment_id"] == ident and prior["activity_id"] == activity,
+                "segments.refresh.3",
+                "segment_id,activity_id",
+                table="efforts",
+            )
+            require(
+                prior["definition_version"] == definition["version"],
+                "segments.refresh.4",
+                "definition_version,version",
+                table="efforts",
+            )
             if (
                 prior["revision"] == revision(entry)
                 and prior["reference_revision"] == revision(reference)
@@ -476,13 +580,17 @@ def refresh(store, ident):
     return changed
 
 
+@located("activities.sqlite", "segments")
+@diagnosed(source=True)
 def history(store, ident, offset=0, limit=20):
     require(
         c.JOB_ID(ident)
         and type(offset) is int
         and offset >= 0
         and type(limit) is int
-        and 1 <= limit <= 50
+        and 1 <= limit <= 50,
+        "segments.history.1",
+        "id,offset,limit",
     )
     state = store.state()
     with store.database() as db:
@@ -490,15 +598,25 @@ def history(store, ident, offset=0, limit=20):
         if row is None:
             raise BridgeError("not_found")
         definition = definition_valid(decode(row[0]))
-        require(definition["id"] == ident)
+        require(definition["id"] == ident, "segments.history.2", "id")
         reference = state["activities"][definition["reference_activity"]]
         results = []
         for activity, payload in db.execute(
             "SELECT activity,payload FROM efforts WHERE segment=? ORDER BY activity", (ident,)
         ):
             value = result_valid(decode(payload))
-            require(value["segment_id"] == ident and value["activity_id"] == activity)
-            require(value["definition_version"] == definition["version"])
+            require(
+                value["segment_id"] == ident and value["activity_id"] == activity,
+                "segments.history.3",
+                "segment_id,activity_id",
+                table="efforts",
+            )
+            require(
+                value["definition_version"] == definition["version"],
+                "segments.history.4",
+                "definition_version,version",
+                table="efforts",
+            )
             if (
                 activity in state["activities"]
                 and value["revision"] == revision(state["activities"][activity])

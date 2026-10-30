@@ -6,7 +6,10 @@ from garmin_bridge.sqlite_store import SQLiteStore as Store
 
 
 @pytest.fixture(autouse=True)
-def offline(monkeypatch):
+def offline(monkeypatch, tmp_path):
+    # Pure validators have no Store argument; keep their diagnostic fallback synthetic.
+    monkeypatch.setenv("GARMIN_BRIDGE_DATA_DIR", str(tmp_path / "diagnostics"))
+
     def denied(*args, **kwargs):
         raise AssertionError("Network calls are forbidden in offline tests")
 

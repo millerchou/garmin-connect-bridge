@@ -13,6 +13,7 @@ from garmin_bridge import cli, jobs, normalize, sync
 from garmin_bridge import sqlite_transfer as backup
 from garmin_bridge.sqlite_store import DATABASE, ARRAY_LIMITS
 from garmin_bridge.errors import BridgeError
+from garmin_bridge.privacy import REPORT
 from garmin_bridge.sqlite_store import SQLiteStore as Store
 from garmin_bridge.storage import canonical
 from .synthetic import SECRET, Source, activity
@@ -170,9 +171,13 @@ def test_checksum_failure_does_not_touch_existing_or_new_target(store, bundle, t
     for target in (store, Store(tmp_path / "new")):
         code, result, captured = command(target, capsys, "backup", "restore", "--file", str(bundle))
         assert code == 2 and result["error"] == "privacy_failed" and not captured.out
-    assert not (tmp_path / "new").exists()
+    assert {
+        str(p.relative_to(tmp_path / "new")) for p in (tmp_path / "new").rglob("*") if p.is_file()
+    } == {REPORT}
     assert previous == {
-        p.relative_to(store.root): p.read_bytes() for p in store.root.rglob("*") if p.is_file()
+        p.relative_to(store.root): p.read_bytes()
+        for p in store.root.rglob("*")
+        if p.is_file() and str(p.relative_to(store.root)) != REPORT
     }
 
 
@@ -249,7 +254,11 @@ def test_rehashed_malicious_packages_fail_closed(store, bundle, tmp_path, capsys
     code, result, captured = command(restored, capsys, "backup", "restore", "--file", str(bundle))
     assert code == 2 and result["error"] in {"storage_failed", "privacy_failed"}
     assert SECRET not in captured.out + captured.err and captured.out == ""
-    assert not restored.root.exists() and not (tmp_path / "escape.json").exists()
+    expected = {REPORT} if result["error"] == "privacy_failed" else set()
+    assert {
+        str(p.relative_to(restored.root)) for p in restored.root.rglob("*") if p.is_file()
+    } == expected
+    assert not (tmp_path / "escape.json").exists()
 
 
 def test_valid_bundle_cannot_overwrite_store_or_existing_package(store, bundle):

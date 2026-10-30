@@ -196,14 +196,15 @@ def filter_message_context(session, laps, messages):
     return result
 
 
-def valid_message(value, include_identity=False, allowed=None):
+def message_problem(value, include_identity=False, allowed=None):
     from . import contract as c
+    from .privacy import safe_key
 
     if type(value) is not dict or value.keys() not in (
         {"message", "fields", "garmin_reported"},
         {"message", "fields", "garmin_reported", "unknown"},
     ):
-        return False
+        return "$"
     message = value["message"]
     if (
         type(message) is not str
@@ -211,19 +212,19 @@ def valid_message(value, include_identity=False, allowed=None):
         or allowed is not None
         and message not in allowed
     ):
-        return False
+        return "message"
     if message == "user_profile" and not include_identity:
-        return False
+        return "message"
     if "unknown" in value:
         from .fit_unknown import valid_unknown
 
         if not valid_unknown(value["unknown"], message):
-            return False
+            return "unknown"
     specs = specs_for(message)
     for group in ("fields", "garmin_reported"):
         fields = value[group]
         if type(fields) is not dict or not fields.keys() <= specs.keys():
-            return False
+            return group
         for name, quantity in fields.items():
             spec = specs[name]
             if (
@@ -231,10 +232,10 @@ def valid_message(value, include_identity=False, allowed=None):
                 and not include_identity
                 or spec.reported != (group == "garmin_reported")
             ):
-                return False
+                return group + "." + safe_key(name)
             unit = "strokes" if name == "total_strokes" else spec.unit
             if not c.obj({"unit": c.literal(unit), "value": lambda _: True})(quantity):
-                return False
+                return group + "." + safe_key(name) + ".unit"
             item = quantity["value"]
             check = c.numeric
             if spec.unit in {"FIT:event", "FIT:event_type"}:
@@ -259,12 +260,12 @@ def valid_message(value, include_identity=False, allowed=None):
                     and low <= len(item) <= high
                     and all(c.nullable(check)(x) for x in item)
                 ):
-                    return False
+                    return group + "." + safe_key(name) + ".value"
             elif not c.nullable(check)(item):
-                return False
+                return group + "." + safe_key(name) + ".value"
     fields = value["fields"]
     if "total_strokes" in fields and get(fields, "sport") != 2:
-        return False
+        return "fields.total_strokes"
     if message == "event":
         event, kind = get(fields, "event"), get(fields, "event_type")
         if (
@@ -273,12 +274,12 @@ def valid_message(value, include_identity=False, allowed=None):
             or kind is not None
             and (type(kind) is not int or not 0 <= kind < 255)
         ):
-            return False
+            return "fields.event,event_type"
         for name in ("data", "data16"):
             if name in fields and not event_payload_allowed(
                 event, kind, get(fields, name), short=name == "data16"
             ):
-                return False
+                return "fields." + name
         if any(
             n in fields
             for n in (
@@ -290,10 +291,22 @@ def valid_message(value, include_identity=False, allowed=None):
             )
         ):
             if event not in (42, 43) or kind is None:
-                return False
+                return "fields.gear_change_data"
         if "gear_change_data" in fields and fields["gear_change_data"] != fields.get("data"):
-            return False
-    return True
+            return "fields.gear_change_data"
+    return None
+
+
+def valid_message(value, include_identity=False, allowed=None):
+    return message_problem(value, include_identity, allowed) is None
+
+
+def message_check(include_identity, allowed):
+    def check(value):
+        return valid_message(value, include_identity, allowed)
+
+    check.diagnose = lambda value: message_problem(value, include_identity, allowed) or "$"
+    return check
 
 
 def fill_local_time(activity_time, messages):

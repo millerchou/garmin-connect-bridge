@@ -498,7 +498,11 @@ def test_verify_full_raw_streams_and_spot_check_legacy_streams(
             transfer.verify_snapshot(path)
     with pytest.raises(BridgeError):
         transfer.restore_snapshot(path, tmp_path / "rejected")
-    assert not (tmp_path / "rejected").exists()
+    assert {
+        str(p.relative_to(tmp_path / "rejected"))
+        for p in (tmp_path / "rejected").rglob("*")
+        if p.is_file()
+    } == {"reports/privacy-failure.json"}
 
 
 @pytest.mark.parametrize("command", ["sanitize-fit", "verify-fit", "migrate"])

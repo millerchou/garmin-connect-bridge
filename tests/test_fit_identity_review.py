@@ -131,7 +131,11 @@ def test_old_unsafe_raw_values_fail_all_handoffs_without_values_in_errors(
     assert str(value) not in captured.out + captured.err
     assert target.read_bytes() == before
     assert not (tmp_path / "review-rejected-export").exists()
-    assert not (tmp_path / "review-rejected-restore").exists()
+    assert {
+        str(p.relative_to(tmp_path / "review-rejected-restore"))
+        for p in (tmp_path / "review-rejected-restore").rglob("*")
+        if p.is_file()
+    } == {"reports/privacy-failure.json"}
 
 
 @pytest.mark.parametrize("table", ["records", "laps", "messages", "raw_messages"])

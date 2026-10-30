@@ -16,6 +16,7 @@ from .persistence import (
     validate_state,
 )
 from .errors import BridgeError
+from .privacy import diagnosed, located
 from .jobs import gaps
 from .normalize import sha256
 from .sqlite_store import (
@@ -36,8 +37,9 @@ def digest_file(path):
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
+@located(DATABASE, "documents")
 def inspect_store(store, *, full_validation=True):
-    require(store.read_bytes("index.json") is not None)
+    require(store.read_bytes("index.json") is not None, "sqlite_transfer.inspect_store.1", "name")
     state, job = snapshot(store)
     check_report(store, state, job)
     counts = {
@@ -50,10 +52,15 @@ def inspect_store(store, *, full_validation=True):
     detail_counts = {"events": 0, "messages": 0, "sessions": 0, "identity_revisions": 0}
     field_versions = set()
     with store.database() as db:
-        require(db.execute("PRAGMA integrity_check").fetchall() == [("ok",)])
+        require(
+            db.execute("PRAGMA integrity_check").fetchall() == [("ok",)],
+            "sqlite_transfer.inspect_store.2",
+            "integrity_check",
+            table="sqlite_schema",
+        )
         names = [r[0] for r in db.execute("SELECT name FROM documents ORDER BY name")]
         for name in names:
-            require(document_kind(name) is not None)
+            require(document_kind(name) is not None, "sqlite_transfer.inspect_store.3", "name")
             content = store.read_bytes(name)
             value = decode(content)
             if (
@@ -79,7 +86,9 @@ def inspect_store(store, *, full_validation=True):
                 summary = decode(content)
                 streams = summary["files"]["streams"]
                 stream_content = store.read_bytes(streams)
-                require(stream_content is not None)
+                require(
+                    stream_content is not None, "sqlite_transfer.inspect_store.4", "files.streams"
+                )
                 entry = {
                     "summary": summary,
                     "file_hashes": {
@@ -94,7 +103,11 @@ def inspect_store(store, *, full_validation=True):
                 counts["revisions"] += 1
             if name.endswith("/streams.json"):
                 value = decode(content)
-                require(name.replace("/streams.json", "/summary.json") in names)
+                require(
+                    name.replace("/streams.json", "/summary.json") in names,
+                    "sqlite_transfer.inspect_store.5",
+                    "name",
+                )
                 if "fit_fields_version" in value:
                     field_versions.add(value["fit_fields_version"])
                     detail_counts["sessions"] += 1
@@ -108,13 +121,19 @@ def inspect_store(store, *, full_validation=True):
             db.execute(
                 "SELECT COUNT(*) FROM samples WHERE name NOT IN (SELECT name FROM documents)"
             ).fetchone()[0]
-            == 0
+            == 0,
+            "sqlite_transfer.inspect_store.6",
+            "name",
+            table="samples",
         )
         require(
             all(
                 r[0] in ARRAY_LIMITS and r[1].endswith("/streams.json")
                 for r in db.execute("SELECT DISTINCT kind,name FROM samples")
-            )
+            ),
+            "sqlite_transfer.inspect_store.7",
+            "kind,name",
+            table="samples",
         )
         from .segments import validate_segments
 
@@ -124,9 +143,17 @@ def inspect_store(store, *, full_validation=True):
             artifact_files(entry, store.read_bytes)
         else:
             summary_content = store.read_bytes(entry["summary"]["files"]["summary"])
-            require(summary_content is not None)
-            require(decode(summary_content) == entry["summary"])
-            require(sha256(summary_content) == entry["file_hashes"]["summary"])
+            require(summary_content is not None, "sqlite_transfer.inspect_store.8", "files.summary")
+            require(
+                decode(summary_content) == entry["summary"],
+                "sqlite_transfer.inspect_store.9",
+                "summary",
+            )
+            require(
+                sha256(summary_content) == entry["file_hashes"]["summary"],
+                "sqlite_transfer.inspect_store.10",
+                "summary,file_hashes",
+            )
     times = [
         e["summary"]["activity_time"]["utc"]
         for e in state["activities"].values()
@@ -155,7 +182,11 @@ def inspect_store(store, *, full_validation=True):
 def check_report(store, state, job):
     if job is not None and job["report_valid"]:
         name = f"reports/{job['id']}/gaps.json"
-        require(store.read_bytes(name) == canonical(control_files(state, job)[name]))
+        require(
+            store.read_bytes(name) == canonical(control_files(state, job)[name]),
+            "sqlite_transfer.check_report.1",
+            "gaps",
+        )
 
 
 def copy_logical(source, target):
@@ -163,7 +194,7 @@ def copy_logical(source, target):
     if source._absent_snapshot or not source.path(DATABASE).exists():
         from .storage import empty_state
 
-        require(source.state() == empty_state())
+        require(source.state() == empty_state(), "sqlite_transfer.copy_logical.1", "index.json")
         target.write_json("index.json", empty_state())
         return
     inspect_store(source)
@@ -197,7 +228,8 @@ def receipt(action, info):
 
 def new_destination(path, source_root=None):
     target = Store(Path(path))
-    require(source_root is None or not target.root.is_relative_to(source_root))
+    if source_root is not None and target.root.is_relative_to(source_root):
+        raise BridgeError("unsafe_store")
     if target.root.exists():
         raise BridgeError("destination_exists")
     parent = Store(target.root.parent)
@@ -205,10 +237,12 @@ def new_destination(path, source_root=None):
     return target, parent
 
 
+@diagnosed(source=True, excluded_args=(1,))
 def export_snapshot(source, destination):
     target, parent = new_destination(destination, source.root)
     with (
         source.lock(),
+        source.read_snapshot(),
         tempfile.TemporaryDirectory(prefix=".sqlite-export-", dir=parent.root) as temp,
     ):
         staging = SQLiteStore(Path(temp) / "stage")
@@ -237,16 +271,53 @@ def export_snapshot(source, destination):
     return receipt("export", info)
 
 
+def snapshot_members(store):
+    # SQLite sidecars indicate an active/recoverable database, not a privacy
+    # contract violation. Never recover or ignore them in a portable snapshot.
+    names = {p.name for p in store.root.iterdir()}
+    if names & {DATABASE + suffix for suffix in ("-journal", "-wal", "-shm")}:
+        raise BridgeError("busy")
+    require(
+        names == {DATABASE, "manifest.json"},
+        "snapshot.members",
+        "members",
+        file="manifest.json",
+        table="snapshot",
+    )
+
+
+@diagnosed(excluded_args=(0,))
+@located("manifest.json", "manifest")
 def verify_snapshot(directory):
     store = SQLiteStore(Path(directory))
-    require({p.name for p in store.root.iterdir()} == {DATABASE, "manifest.json"})
+    snapshot_members(store)
     manifest = decode(Store.read_bytes(store, "manifest.json"))
-    require(type(manifest) is dict and manifest.get("segment_algorithm_version") in ALGORITHMS)
-    require(type(manifest.get("size")) is int and 0 < manifest["size"] <= 16 * 1024**3)
-    require(c.digest(manifest.get("sha256")))
-    require(store.path(DATABASE).stat().st_size == manifest["size"])
-    require(digest_file(store.path(DATABASE)) == manifest["sha256"])
-    require(type(manifest.get("format_version")) is int and manifest["format_version"] == 2)
+    require(
+        type(manifest) is dict and manifest.get("segment_algorithm_version") in ALGORITHMS,
+        "snapshot.algorithm_version",
+        "segment_algorithm_version",
+    )
+    require(
+        type(manifest.get("size")) is int and 0 < manifest["size"] <= 16 * 1024**3,
+        "snapshot.size_format",
+        "size",
+    )
+    require(c.digest(manifest.get("sha256")), "snapshot.checksum_format", "sha256")
+    require(
+        store.path(DATABASE).stat().st_size == manifest["size"],
+        "snapshot.size",
+        "size",
+    )
+    require(
+        digest_file(store.path(DATABASE)) == manifest["sha256"],
+        "snapshot.checksum",
+        "sha256",
+    )
+    require(
+        type(manifest.get("format_version")) is int and manifest["format_version"] == 2,
+        "snapshot.format_version",
+        "format_version",
+    )
     validate_state(store.state(), portable=True)
     info = inspect_store(store, full_validation=False)
     expected = {
@@ -257,12 +328,22 @@ def verify_snapshot(directory):
         "size": store.path(DATABASE).stat().st_size,
         "sha256": manifest["sha256"],
     }
-    require(canonical(manifest) == canonical(expected))
-    require(digest_file(store.path(DATABASE)) == manifest["sha256"])
-    require(Store.read_bytes(store, "manifest.json") == canonical(manifest))
+    require(canonical(manifest) == canonical(expected), "snapshot.manifest_match", "manifest")
+    require(
+        digest_file(store.path(DATABASE)) == manifest["sha256"],
+        "snapshot.checksum_changed",
+        "sha256",
+    )
+    require(
+        Store.read_bytes(store, "manifest.json") == canonical(manifest),
+        "snapshot.manifest_changed",
+        "manifest",
+    )
+    snapshot_members(store)
     return receipt("verify", info)
 
 
+@diagnosed(root_arg=1, excluded_args=(0,))
 def restore_snapshot(directory, destination):
     source = SQLiteStore(Path(directory))
     source_manifest = Store.read_bytes(source, "manifest.json")
@@ -273,8 +354,20 @@ def restore_snapshot(directory, destination):
         staging.ensure()
         copy_logical(source, staging)
         info = inspect_store(staging, full_validation=False)
-        require(Store.read_bytes(source, "manifest.json") == source_manifest)
-        require(digest_file(source.path(DATABASE)) == decode(source_manifest)["sha256"])
+        require(
+            Store.read_bytes(source, "manifest.json") == source_manifest,
+            "sqlite_transfer.restore_snapshot.1",
+            "manifest",
+            file="manifest.json",
+            table="manifest",
+        )
+        require(
+            digest_file(source.path(DATABASE)) == decode(source_manifest)["sha256"],
+            "sqlite_transfer.restore_snapshot.2",
+            "sha256",
+            file="manifest.json",
+            table="manifest",
+        )
         staging._fsync_dir(staging.root)
         publish_directory(staging.root, target.root)
         parent._fsync_dir(parent.root)
