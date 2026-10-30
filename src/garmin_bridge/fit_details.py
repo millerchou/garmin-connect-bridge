@@ -39,6 +39,11 @@ class TimestampContext:
             if f.field_def is not None and not f.field_def.is_dev and f.field_def.def_num == 253
         ]
         if frame.time_offset is not None:
+            if frame.global_mesg_num not in TIMESTAMP_MESSAGES:
+                # An unreviewed compressed header cannot advance the trusted
+                # clock used by later documented messages.
+                self.anchor = None
+                return None
             if self.anchor is None or physical:
                 raise BridgeError("invalid_fit")
             offset = frame.time_offset
@@ -55,7 +60,8 @@ class TimestampContext:
             ) != (0x86, 4):
                 self.anchor = None
             else:
-                timestamp = self.anchor = field.raw_value
+                timestamp = field.raw_value
+                self.anchor = timestamp if timestamp_value(timestamp) is not None else None
         return timestamp
 
 

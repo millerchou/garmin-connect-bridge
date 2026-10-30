@@ -29,8 +29,10 @@ NAME_BOUNDARY = re.compile(
     r"(?<=[A-Za-z])(?=[0-9])|(?<=[0-9])(?=[A-Za-z])"
 )
 PRIVATE_NAME = re.compile(
-    r"(?:^|_)(?:position_lat|position_long|lat|long|latitude|longitude|nec|swc|"
-    r"serial_number|user_profile|friendly_name)(?:_|$)",
+    r"(?:^|_)(?:position_lat|position_long|lat|lon|lng|long|latitude|longitude|nec|swc|"
+    r"coordinates?|location|serial(?:_number)?|user_profile|friendly_name|"
+    r"device_id|device_identifier|ant_device_number|ant_transmission_type|"
+    r"descriptor|product_name|user_id|mac_address|device_address)(?:_|$)",
     re.IGNORECASE,
 )
 
@@ -39,7 +41,17 @@ def require_safe_name(name):
     separated = re.sub(r"[^A-Za-z0-9]+", "_", name)
     # Retain case-insensitive whole-name checks before splitting mixed case.
     require(PRIVATE_NAME.search(separated) is None)
-    require(PRIVATE_NAME.search(NAME_BOUNDARY.sub("_", separated)) is None)
+    separated = NAME_BOUNDARY.sub("_", separated)
+    require(PRIVATE_NAME.search(separated) is None)
+    tokens = separated.lower().split("_")
+    require(
+        all(
+            token != "position"
+            or i > 0
+            and tokens[i - 1] in {"power", "cadence", "sensor", "rider"}
+            for i, token in enumerate(tokens)
+        )
+    )
 
 
 def validate_detail_keys(value):

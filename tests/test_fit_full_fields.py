@@ -105,7 +105,7 @@ def test_new_fields_roundtrip_export_report_and_snapshot(store, tmp_path, capsys
         "--end",
         "2021-09-08T01:46:41Z",
     )
-    assert code == 0 and window["records"][0]["sample"]["unknown_90"] == [0, 7, None]
+    assert code == 0 and "unknown_90" not in window["records"][0]["sample"]
     target = tmp_path / "analysis.sqlite"
     export.export_analysis(store, target)
     assert json.loads(read_table(target, "records")[0]["unknown_json"]) == {
@@ -352,7 +352,7 @@ def test_version_1_details_remain_readable_and_reimport_creates_immutable_revisi
     assert all(store.read_bytes(p) == content for p, content in before.items())
     assert store.state()["covered_ranges"] == prior["covered_ranges"]
     assert store.state()["last_success_at"] == prior["last_success_at"]
-    assert store.state()["activities"]["1001"]["summary"]["normalizer_version"] == "1.4.0"
+    assert store.state()["activities"]["1001"]["summary"]["normalizer_version"] == "1.4.1"
     # Existing manifest format remains valid for mixed version history.
     transfer.export_snapshot(store, tmp_path / "mixed-snapshot")
     transfer.verify_snapshot(tmp_path / "mixed-snapshot")

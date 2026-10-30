@@ -14,6 +14,7 @@ missing timestamps and incorrectly imply a one-to-one relationship with records.
 
 import re
 from collections import Counter
+from itertools import chain
 
 from fitdecode import profile
 
@@ -44,9 +45,34 @@ KNOWN_FIELDS = {
 }
 REPORT_PATH = "reports/fit-blocked-fields.json"
 REASONS = frozenset(
-    {"identity_message", "possible_semicircle", "possible_identity", "non_integer_raw"}
+    {
+        "identity_message",
+        "possible_semicircle",
+        "possible_identity",
+        "non_integer_raw",
+        "position_match",
+        "position_correlated",
+        "identity_match",
+    }
 )
 RAW_BASES = frozenset({0, 1, 2, 0x83, 0x84, 0x86, 0xA, 0x8B, 0x8C, 0x8E, 0x8F, 0x90})
+# These Profile lookups only identify data to withhold, never grant permissions.
+POSITION_FIELDS = {
+    number: frozenset(
+        index
+        for index, field in message.fields.items()
+        if re.search(r"(?:^|_)(?:lat|long|latitude|longitude)$", field.name)
+    )
+    for number, message in profile.MESSAGE_TYPES.items()
+}
+IDENTITY_FIELDS = {
+    number: frozenset(
+        index
+        for index, field in message.fields.items()
+        if field.name in {"serial_number", "ant_device_number", "ant_transmission_type"}
+    )
+    for number, message in profile.MESSAGE_TYPES.items()
+}
 
 
 def raw_value(value):
@@ -56,6 +82,23 @@ def raw_value(value):
     return scalar(value) or (
         type(value) is list and 1 <= len(value) <= 255 and all(scalar(x) for x in value)
     )
+
+
+def text_array(value):
+    """ASCII/UTF-8 text can use any integer wire type, not just uint8."""
+    if type(value) is not list:
+        return False
+    if sum(type(x) is int and 32 <= x <= 126 for x in value) >= 4 and all(
+        x is None or x == 0 or 32 <= x <= 126 for x in value
+    ):
+        return True
+    if not all(x is None or 0 <= x <= 255 for x in value):
+        return False
+    try:
+        text = bytes(x or 0 for x in value).strip(b"\0").decode("utf-8")
+    except UnicodeError:
+        return False
+    return len(text) >= 4 and text.isprintable()
 
 
 def undocumented_message(number):
@@ -75,7 +118,10 @@ def valid_unknown(value, message):
         return False
     known = KNOWN_FIELDS[message]
     return all(
-        unknown_number(k) is not None and unknown_number(k) not in known and raw_value(v)
+        unknown_number(k) is not None
+        and unknown_number(k) not in known
+        and raw_value(v)
+        and not text_array(v)
         for k, v in value.items()
     )
 
@@ -91,6 +137,7 @@ def valid_raw_message(value):
             and re.fullmatch(r"0|[1-9][0-9]{0,2}", k)
             and int(k) <= 255
             and raw_value(v)
+            and not text_array(v)
             for k, v in value["fields"].items()
         )
     )
@@ -99,7 +146,7 @@ def valid_raw_message(value):
 def project_unknown(frame, blocked, include_identity=False):
     """Return (unknown object, raw message); counters contain no input values."""
     number = frame.global_mesg_num
-    private = number == 79 or number == 3 and not include_identity
+    private = number in {3, 79}
     generic = undocumented_message(number)
     eligible = frame.name in UNKNOWN_MESSAGES
     if not private and not generic and not eligible:
@@ -112,6 +159,12 @@ def project_unknown(frame, blocked, include_identity=False):
             continue
         index = definition.def_num
         if private:
+            if (
+                number == 3
+                and include_identity
+                and index in {spec.number for spec in FIELDS["user_profile"].values()}
+            ):
+                continue
             denied.add((number, index, "identity_message"))
             continue
         if not generic and not (eligible and field.field is None):
@@ -132,12 +185,7 @@ def project_unknown(frame, blocked, include_identity=False):
                 value = list(value)
             if not raw_value(value):
                 reason = "non_integer_raw"
-            elif (
-                base in {2, 0xA}
-                and type(value) is list
-                and len(value) >= 4
-                and all(x is None or x == 0 or 32 <= x <= 126 for x in value)
-            ):
+            elif text_array(value):
                 reason = "possible_identity"
             else:
                 fields[str(index) if generic else f"unknown_{index}"] = value
@@ -147,6 +195,110 @@ def project_unknown(frame, blocked, include_identity=False):
     return ({} if generic else fields), (
         {"mesg_num": number, "fields": fields} if generic else None
     )
+
+
+def raw_objects(streams):
+    """Mutable raw containers, with no copies of the high-frequency rows."""
+    for row in streams["records"]:
+        yield 20, row, "unknown_"
+    for detail in chain(
+        (streams["session"],),
+        (lap["fit"] for lap in streams["laps"]),
+        streams["messages"],
+    ):
+        if "unknown" in detail:
+            yield MESSAGE_NUMBERS[detail["message"]], detail["unknown"], "unknown_"
+    for row in streams["raw_messages"]:
+        yield row["mesg_num"], row["fields"], ""
+
+
+class RawPrivacy:
+    """Transient cross-field checks; never serialize coordinates or statistics.
+
+    Block exact copies of observed locations/identifiers across all integer types,
+    including unsigned semicircle representations. For co-observed record fields,
+    also block near-perfect linear position correlations (three or more pairs).
+    Entire field families are withheld, including earlier/unpaired rows. The
+    accumulator uses integer sums, so uint64 values cannot lose precision.
+    """
+
+    def __init__(self):
+        self.positions = set()
+        self.identities = set()
+        self.correlations = {}
+
+    def observe(self, frame, unknown):
+        position_fields = POSITION_FIELDS.get(frame.global_mesg_num, ())
+        identity_fields = IDENTITY_FIELDS.get(frame.global_mesg_num, ())
+        private = frame.global_mesg_num in {3, 79}
+        if not position_fields and not identity_fields and not private:
+            return
+        coordinates = []
+        for field in frame.fields:
+            definition = field.field_def
+            if definition is None or definition.is_dev:
+                continue
+            location = definition.def_num in position_fields
+            identity = private or definition.def_num in identity_fields
+            if not location and not identity:
+                continue
+            value = field.raw_value
+            values = value if isinstance(value, tuple) else (value,)
+            for value in values:
+                if type(value) is not int:
+                    continue
+                if location:
+                    self.positions.add(value)
+                    if -(2**31) <= value < 2**32:
+                        self.positions.update((value & 0xFFFFFFFF, (value + 2**31) % 2**32 - 2**31))
+                    if frame.global_mesg_num == 20:
+                        coordinates.append((definition.def_num, value))
+                if identity:
+                    self.identities.add(value)
+        # Other messages have no reviewed alignment to records. Exact matching
+        # above is file-wide; never invent timestamps or joins for raw messages.
+        if not coordinates:
+            return
+        for key, value in unknown.items():
+            values = value if type(value) is list else [value]
+            for slot, value in enumerate(values):
+                if type(value) is not int:
+                    continue
+                for position, coordinate in coordinates:
+                    key_pair = int(key[8:]), slot, position
+                    stats = self.correlations.setdefault(key_pair, [0, 0, 0, 0, 0, 0])
+                    stats[0] += 1
+                    stats[1] += value
+                    stats[2] += coordinate
+                    stats[3] += value * value
+                    stats[4] += coordinate * coordinate
+                    stats[5] += value * coordinate
+
+    def filter(self, streams, blocked):
+        if not self.positions and not self.identities:
+            return
+        reasons = {}
+        for (field, _, _), (n, x, y, xx, yy, xy) in self.correlations.items():
+            variance = (n * xx - x * x) * (n * yy - y * y)
+            if n >= 3 and variance > 0 and (n * xy - x * y) ** 2 * 10000 >= variance * 9999:
+                reasons[(20, field)] = "position_correlated"
+        for number, fields, prefix in raw_objects(streams):
+            for key, value in fields.items():
+                if not key.startswith(prefix):
+                    continue
+                values = value if type(value) is list else [value]
+                field = number, int(key[len(prefix) :])
+                if any(v in self.identities for v in values):
+                    reasons[field] = "identity_match"
+                elif any(v in self.positions for v in values):
+                    reasons.setdefault(field, "position_match")
+        for number, fields, prefix in raw_objects(streams):
+            for key in list(fields):
+                if key.startswith(prefix) and (
+                    reason := reasons.get((number, int(key[len(prefix) :])))
+                ):
+                    del fields[key]
+                    blocked[(number, int(key[len(prefix) :]), reason)] += 1
 
 
 def validate_report(value):

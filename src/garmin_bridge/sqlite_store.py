@@ -19,6 +19,7 @@ from .storage import Store, canonical, check_private, decode, empty_state
 
 DATABASE = "activities.sqlite"
 STORAGE_VERSION = 1
+MAX_SAMPLE_BYTES = 512 * 1024
 # The physical schema already stores typed ordered JSON rows. New detail kinds
 # require no ALTER TABLE or rewriting of immutable historical revisions.
 ARRAY_LIMITS = {
@@ -341,7 +342,7 @@ class SQLiteStore(Store):
                     require(count <= ARRAY_LIMITS[array])
                     # FIT permits up to 255 physical fields of 255 bytes each;
                     # integer arrays can expand beyond the old 32 KiB row cap.
-                    require(size is None or size <= 512 * 1024)
+                    require(size is None or size <= MAX_SAMPLE_BYTES)
                     rows = db.execute(
                         "SELECT ordinal,payload FROM samples WHERE name=? AND kind=? ORDER BY ordinal",
                         (relative, array),
@@ -369,12 +370,16 @@ class SQLiteStore(Store):
             if kind == "streams":
                 metadata = {k: v for k, v in value.items() if k not in ARRAY_LIMITS}
                 for array in stream_arrays(value):
+
+                    def encoded_rows():
+                        for i, row in enumerate(value[array]):
+                            payload = canonical(row)
+                            require(len(payload) <= MAX_SAMPLE_BYTES)
+                            yield relative, array, i, payload
+
                     db.executemany(
                         "INSERT INTO samples VALUES (?,?,?,?)",
-                        (
-                            (relative, array, i, canonical(row))
-                            for i, row in enumerate(value[array])
-                        ),
+                        encoded_rows(),
                     )
                 content = canonical(metadata)
             if kind == "state":

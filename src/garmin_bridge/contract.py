@@ -10,7 +10,7 @@ from .fit_fields import AUXILIARY_MESSAGES, FIT_FIELDS_VERSION, RECORD_UNITS
 from .fit_unknown import validate_report, REPORT_PATH
 
 SCHEMA_VERSION = "1.0"
-NORMALIZER_VERSION = "1.4.0"
+NORMALIZER_VERSION = "1.4.1"
 LEGACY_STREAM_UNITS = {
     "timestamp": "UTC",
     "heart_rate": "bpm",

@@ -31,7 +31,7 @@ from .fit_details import (
 )
 from .fit_fields import AUXILIARY_MESSAGES, FIT_FIELDS_VERSION, RECORD_UNITS
 from .storage import canonical
-from .fit_unknown import project_unknown
+from .fit_unknown import RawPrivacy, project_unknown
 
 MAX_ARCHIVE = 64 * 1024 * 1024
 MAX_FIT = 64 * 1024 * 1024
@@ -302,6 +302,7 @@ def normalize(
     device_count = 0
     cadence_integers = []
     clock = TimestampContext()
+    raw_privacy = RawPrivacy()
 
     def clean(value):
         if value is not None and not numeric(value):
@@ -315,6 +316,12 @@ def normalize(
             error_handling=fitdecode.ErrorHandling.RAISE,
         ) as reader:
             for frame in reader:
+                if isinstance(frame, fitdecode.FitDefinitionMessage):
+                    # A keyed projection cannot represent duplicate physical
+                    # fields safely (including conflicting wire types).
+                    numbers = [field.def_num for field in frame.field_defs]
+                    if len(set(numbers)) != len(numbers):
+                        raise BridgeError("invalid_fit")
                 if not isinstance(frame, fitdecode.FitDataMessage):
                     continue
                 timestamp_raw = clock.read(frame)
@@ -323,6 +330,7 @@ def normalize(
                     values["timestamp"] = timestamp_value(timestamp_raw)
                 detail = project_message(frame, include_identity, timestamp_raw=timestamp_raw)
                 unknown, raw_message = project_unknown(frame, blocked, include_identity)
+                raw_privacy.observe(frame, unknown)
                 if raw_message is not None:
                     raw_messages.append(raw_message)
                     if len(raw_messages) > MAX_RECORDS:
@@ -471,6 +479,7 @@ def normalize(
         "messages": messages,
         "raw_messages": raw_messages,
     }
+    raw_privacy.filter(streams, blocked)
     summary = {
         "schema_version": SCHEMA_VERSION,
         "normalizer_version": NORMALIZER_VERSION,

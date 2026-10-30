@@ -150,7 +150,7 @@ def test_old_backup_cache_reparse_and_immutable_revision(
         result = importing(target, capsys, path)[1]
         assert result["status"] == "updated"
         new = result["activity"]
-        assert new["normalizer_version"] == "1.4.0"
+        assert new["normalizer_version"] == "1.4.1"
         assert {SUMMARY, RECORD} <= set(new["quality_flags"])
         assert new["files"] != old["files"]
         assert importing(target, capsys, path)[1]["status"] == "unchanged"

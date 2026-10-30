@@ -144,6 +144,8 @@ and logical artifact references. Windows are inclusive UTC ranges of at most 600
 seconds, with at most 200 ordered samples per page. Unknown timestamps remain
 unassigned. Queries never authenticate, download, or normalize. Missing stores
 remain absent; missing activities return `not_found`.
+Windows expose only documented measurement columns. Undocumented raw fields are
+available in the private analysis export, not in model-facing query output.
 
 Segment definitions contain an opaque ID and reference time window. Only explicit
 `segment refresh` reads private original positions, temporarily in process memory.
@@ -265,7 +267,7 @@ incomplete API history: consult status and gaps.
 ## Data and privacy boundaries
 
 The primary store is `activities.sqlite`, storage/user version **1**, activity
-schema **1.0**, normalizer **1.4.0**. Existing SQLite stores remain directly usable
+schema **1.0**, normalizer **1.4.1**. Existing SQLite stores remain directly usable
 without migration or schema changes. Historical stream shapes and immutable
 revisions remain readable. The four tables are `documents`, `samples`, `segments`,
 and `efforts`; JSON payloads preserve numeric types, signed zero, nulls, and precision.
@@ -328,11 +330,15 @@ table migration is necessary. New detail shapes are identified by FIT field vers
 stays at format 2, with an additional `fit_counts.raw_messages` count only when 1.1
 streams exist. Analysis format changes to 2 because its SQL schema changes.
 
-Re-sync API activities or re-import offline activities to obtain normalizer 1.4.0
+Re-sync API activities or re-import offline activities to obtain normalizer 1.4.1
 revisions. Original FIT inputs are required. Old immutable revisions remain intact;
 no watermark, authentication or segment-matching algorithm change is involved.
 As before, offline import of identical API-derived content preserves its API
 revision; use sync to upgrade that revision. Older software cannot read 1.1 streams.
+Normalizer 1.4.1 also reparses 1.4.0 revisions to apply the strengthened privacy
+checks. Prior revisions remain immutable; reparsing does not erase historical
+data. Stored text-like raw arrays from 1.4.0 fail the strengthened export/snapshot
+validation rather than being silently copied.
 
 ### Undocumented-field interception and report
 
@@ -348,10 +354,23 @@ raw values enter structured storage:
   Blocking the entire type also catches fields correlated with positions, including
   short or constant streams; no position samples or correlation statistics are saved.
   This deliberately withholds some harmless counters/measurements.
-- Strings and byte blobs are blocked as `possible_identity`, as are uint8/uint8z
-  arrays of at least four elements containing only printable ASCII, zero or null.
+- Across all integer types, raw fields copying observed coordinate or identity
+  values are blocked (`position_match` / `identity_match`), including unsigned
+  representations of semicircle coordinates. Record fields with at least three
+  paired coordinate observations and squared linear correlation of at least
+  0.9999 are blocked as `position_correlated`. Each array slot is checked. A match
+  withholds the entire message/field family, including earlier and unpaired rows.
+  These conservative checks can also withhold coincidentally matching measurements.
+  Only transient sets and integer statistics are used; none enter stored artifacts.
+- Strings and byte blobs are blocked as `possible_identity`, as are arrays of any
+  integer type containing at least four printable ASCII characters with zero/null
+  padding, or at least four printable UTF-8 characters. All-null arrays remain null.
   This avoids retaining possible device names or serial strings. Other non-integer
   types, including floats, are blocked as `non_integer_raw`; no scaling is guessed.
+- Unknown profile fields remain excluded and audited even with identity opt-in.
+  Duplicate physical field numbers are rejected instead of silently overwriting
+  values or bypassing an interception rule. Unreviewed compressed headers cannot
+  advance the clock used for documented timestamps.
 
 The local private report is
 `$GARMIN_BRIDGE_DATA_DIR/reports/fit-blocked-fields.json` (under the effective
@@ -372,16 +391,19 @@ sidecars, excluded from analysis exports and snapshots; restore does not recreat
 them. The command supports review only; it does not enable any blocked fields.
 
 These heuristics cannot identify every numeric encoding of identity or geography.
+Correlation checks require co-observed record positions; no temporal joins are
+inferred for undocumented messages. Encodings without that evidence remain opaque.
 Explicitly retained names/UUIDs may themselves contain personal or place text.
 The export denylist is a key-name backstop, not a semantic anonymizer; keep all
 outputs private. No live files were used to tune the heuristics.
 
 Size scales with field and row counts. An entirely synthetic 3,600-record example,
 adding one raw integer per record plus one four-integer message 534 per record,
-and populating fractional cadence, added **647,168 bytes** to the primary SQLite
-store and **344,064 bytes** to the analysis export (about 0.62/0.33 MiB). This compares
+and populating fractional cadence, added **696,320 bytes** to the primary SQLite
+store and **376,832 bytes** to the analysis export (about 0.66/0.36 MiB). This compares
 two current-version stores and excludes originals. A four-field raw-message JSON
-row was 55 bytes before SQLite keys/page overhead. Arrays and longer text increase
+row was 51–63 bytes before SQLite keys/page overhead (values 0 through 3,602).
+Arrays and longer text increase
 this; these are synthetic estimates, not measurements of personal activity data.
 
 Identity retention is default-off. `sync` and `import-fit` accept
@@ -397,7 +419,10 @@ archives, unsafe paths, bad FIT framing/CRC, multi-session/non-cycling inputs,
 inputs above 64 MiB, and excessive expansion are rejected. Parser limits are
 500,000 records, 10,000 laps, 100,000 events, 100,000 auxiliary messages, and 500,000
 undocumented message rows. SQLite permits up to 512 KiB per stream row to accommodate
-physical FIT arrays after JSON expansion. These limits do not guarantee bounded
+physical FIT arrays after JSON expansion, enforced before writes as well as on reads.
+Privacy checks retain unique observed coordinate/identity values in memory and
+fixed-size statistics per record field/array slot, not a second copy of the raw rows.
+These limits do not guarantee bounded
 memory suitable for every device/file combination.
 
 After raw deduplication, new originals are stored as the decompressed FIT file at
@@ -431,7 +456,7 @@ Default tests are offline and generate FIT/SQLite inputs in code. They must cove
 - Two-pass catalog consistency, pagination, delayed uploads, partial failures,
   interruption/resume, gaps, and failure-does-not-advance-watermark.
 - Atomic SQLite publication/recovery, locking, permissions, missing data, bounded
-  offline queries, and continued use of storage version 1 with normalizer 1.4.0.
+  offline queries, and continued use of storage version 1 with normalizer 1.4.1.
 - Snapshot checksum/integrity/schema checks, contract spot checks, full validation
   on export/restore, revision/progress preservation, and incremental sync after restore.
 - Current-only typed analysis export, identity/location exclusion, atomic overwrite

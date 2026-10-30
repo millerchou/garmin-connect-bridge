@@ -37,9 +37,7 @@ def window_contract(units):
             "coverage": c.coverage_for(units),
             "quality_flags": c.QUALITY,
             "records": c.sequence(
-                c.obj(
-                    {"ordinal": c.count, "sample": c.record_check(sample, units == c.STREAM_UNITS)}
-                ),
+                c.obj({"ordinal": c.count, "sample": c.obj(sample)}),
                 200,
             ),
             "next_offset": c.nullable(c.count),

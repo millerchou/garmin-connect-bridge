@@ -2,6 +2,7 @@
 
 from . import contract as c
 from .errors import BridgeError
+from .fit_unknown import valid_unknown
 from .persistence import require
 from .segments import seconds
 
@@ -22,6 +23,15 @@ def window(store, activity, start, end, offset=0, limit=100):
         and seconds(start) <= seconds(row["timestamp"]) <= seconds(end)
     ]
     page = records[offset : offset + limit]
+    for row in page:
+        sample = row["sample"]
+        unknown = {key: value for key, value in sample.items() if key not in streams["units"]}
+        require(
+            not unknown
+            or streams.get("fit_fields_version") == c.FIT_FIELDS_VERSION
+            and valid_unknown(unknown, "record")
+        )
+        row["sample"] = {key: sample[key] for key in streams["units"]}
     return {
         "schema_version": c.SCHEMA_VERSION,
         "normalizer_version": summary["normalizer_version"],
