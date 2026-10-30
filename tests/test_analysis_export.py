@@ -40,6 +40,21 @@ DENIED_NAMES = (
     "fit_friendly_name_text",
     "fit_NEC_0",
     "SWC_corner",
+    "positionLat",
+    "startPositionLong",
+    "endLatitude",
+    "startLongitude",
+    "fitNECValue",
+    "fitSWCCorner",
+    "serialNumber",
+    "fitSerialNumber0",
+    "garminReportedUserProfileValue",
+    "fitFriendlyNameText",
+    "position-lat",
+    "serial.number",
+    "LaTiTuDe",
+    "SERIAL_nUmber",
+    "fit-USER__PrOfIlE-value",
 )
 
 
@@ -237,6 +252,14 @@ def test_denylist_allows_posture_sensor_and_every_current_export_field():
         "rider_position_change",
         "platform",
         "longitudinal_acceleration",
+        "longest",
+        "along",
+        "latency",
+        "longestInterval",
+        "alongTrack",
+        "fitAvgPowerPosition0",
+        "fitMaxCadencePosition1",
+        "sensorPosition",
         "connected",
     }
     for columns in export.TABLES.values():

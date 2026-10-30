@@ -103,8 +103,9 @@ real run, without constructing a network client, logging in, taking the bridge
 lock, or changing the store, state, or watermark. A missing watermark still returns
 `no_watermark`; `--dry-run` without `--since-last` is an error. The preview reads
 committed SQLite state and refuses journal/WAL sidecars or WAL-mode databases with
-`busy` instead of performing recovery or creating sidecars. Coverage may change
-before a later real run.
+`busy` instead of performing recovery or creating sidecars. It also returns `busy`
+if the database file or header changes during the read. Coverage may change before
+a later real run.
 
 ### Offline FIT import
 
@@ -205,9 +206,9 @@ the full current source contracts, then checks `PRAGMA integrity_check`, foreign
 keys, the exact table/column whitelist, JSON contracts with identity disabled, and
 per-activity row counts and ordinals before atomic rename. An independent denylist
 also checks every column name and every nested `detail_json` key for location and
-identity names, including prefixed/suffixed tokens; approved power/cadence posture
-and sensor-position fields remain allowed. The file and destination
-directory are flushed before success; a directory-flush failure restores the prior
+identity names, including prefixed/suffixed tokens, camelCase and separator
+variants; approved power/cadence posture and sensor-position fields remain allowed.
+The file and destination directory are flushed before success; a directory-flush failure restores the prior
 destination. Failed construction or validation preserves the old destination and
 removes staging files. A hard kill can leave private `.analysis-*` staging or
 recovery links; remove those only after all exporters have exited. It never

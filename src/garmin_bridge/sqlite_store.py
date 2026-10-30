@@ -235,20 +235,37 @@ class SQLiteStore(Store):
             if self.path("index.json").exists():
                 raise BridgeError("storage_format_conflict")
             return empty_state()
-        # Ordinary readers can recover journals. A preview must never write,
-        # including SQLite's recovery or WAL shared-memory bookkeeping.
-        if any(self.path(DATABASE + suffix).exists() for suffix in ("-journal", "-wal", "-shm")):
-            raise BridgeError("busy")
-        # A closed WAL database may have no sidecars yet. SQLite can create
-        # them even with mode=ro; inspect its read/write format before opening.
-        with path.open("rb") as handle:
-            header = handle.read(20)
+
+        def signature():
+            info = path.stat()
+            if any(
+                self.path(DATABASE + suffix).exists() for suffix in ("-journal", "-wal", "-shm")
+            ):
+                raise BridgeError("busy")
+            with path.open("rb") as handle:
+                header = handle.read(100)
+            return (
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+                header,
+            )
+
+        before = signature()
+        header = before[-1]
         if header[18:20] == b"\x02\x02":
             raise BridgeError("busy")
         if header[:16] != b"SQLite format 3\x00" or header[18:20] != b"\x01\x01":
             raise BridgeError("storage_failed")
         try:
-            with closing(connect(path)) as db:
+            # mode=ro alone can create WAL/SHM files if a writer switches modes
+            # after preflight. Immutable access cannot write or recover journals.
+            # Since it also skips SQLite locks, reject the entire result if the
+            # file or header changed, or a transaction sidecar appeared, while
+            # reading. Check even on failure: a racing writer can invalidate pages.
+            with closing(connect(path, immutable=True)) as db:
                 db.execute("BEGIN")
                 check_schema(db)
                 row = db.execute("SELECT payload FROM documents WHERE name='index.json'").fetchone()
@@ -263,6 +280,13 @@ class SQLiteStore(Store):
                 return validate_state(decode(row[0]))
         except sqlite3.Error:
             raise BridgeError("storage_failed") from None
+        finally:
+            try:
+                after = signature()
+            except FileNotFoundError:
+                raise BridgeError("busy") from None
+            if after != before:
+                raise BridgeError("busy")
 
     def state(self):
         value = self.read_json("index.json")

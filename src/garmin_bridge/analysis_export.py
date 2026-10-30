@@ -21,8 +21,12 @@ from .sync import watermark
 from .upstream import now
 
 
-# Match complete underscore-delimited names/tokens, including prefixed and
-# suffixed variants. "position" alone is legitimate for posture and sensors.
+# Normalize separators, camelCase, acronym and numeric boundaries before matching
+# complete tokens. "position" alone is legitimate for posture and sensors.
+NAME_BOUNDARY = re.compile(
+    r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|"
+    r"(?<=[A-Za-z])(?=[0-9])|(?<=[0-9])(?=[A-Za-z])"
+)
 PRIVATE_NAME = re.compile(
     r"(?:^|_)(?:position_lat|position_long|lat|long|latitude|longitude|nec|swc|"
     r"serial_number|user_profile|friendly_name)(?:_|$)",
@@ -31,7 +35,10 @@ PRIVATE_NAME = re.compile(
 
 
 def require_safe_name(name):
-    require(PRIVATE_NAME.search(name) is None)
+    separated = re.sub(r"[^A-Za-z0-9]+", "_", name)
+    # Retain case-insensitive whole-name checks before splitting mixed case.
+    require(PRIVATE_NAME.search(separated) is None)
+    require(PRIVATE_NAME.search(NAME_BOUNDARY.sub("_", separated)) is None)
 
 
 def validate_detail_keys(value):

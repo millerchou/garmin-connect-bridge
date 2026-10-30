@@ -110,7 +110,7 @@ def guard_preview(monkeypatch):
     connect = sqlite_store.connect
 
     def read_only(path, write=False, immutable=False):
-        assert not write and not immutable
+        assert not write and immutable
         return connect(path, write, immutable)
 
     monkeypatch.setattr(sqlite_store, "connect", read_only)
@@ -138,8 +138,8 @@ def test_dry_run_matches_real_window_without_client_lock_or_store_changes(
         assert code == 0 and captured.err == ""
         assert preview == {"start": "2025-01-02", "end": today.isoformat()}
         assert saved_files(store) == before_files
-        assert store.state() == before_state
-        assert sync.watermark(store.state()) == INTERVAL
+    assert store.state() == before_state
+    assert sync.watermark(store.state()) == INTERVAL
     monkeypatch.setattr(cli, "GarminSource", lambda _: Source())
     code, result, _ = command(store, capsys, "sync", "--since-last")
     assert code == 0
@@ -216,6 +216,59 @@ def test_dry_run_refuses_wal_mode_before_sqlite_can_create_sidecars(
     code, result, _ = command(store, capsys, "sync", "--since-last", "--dry-run")
     assert saved_files(store) == before
     assert code == 2 and result["error"] == "busy"
+
+
+def test_dry_run_refuses_wal_switch_after_preflight_without_creating_sidecars(
+    store, today, monkeypatch, capsys
+):
+    run(store, Source())
+    connect = sqlite_store.connect
+    guard_preview(monkeypatch)
+    after_writer = None
+
+    def switch_mode(path, write=False, immutable=False):
+        nonlocal after_writer
+        with closing(connect(path, write=True)) as db:
+            assert db.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+        after_writer = saved_files(store)
+        return connect(path, write=write, immutable=immutable)
+
+    monkeypatch.setattr(sqlite_store, "connect", switch_mode)
+    code, result, captured = command(store, capsys, "sync", "--since-last", "--dry-run")
+    assert code == 2 and result["error"] == "busy" and captured.out == ""
+    assert saved_files(store) == after_writer
+    assert not store.path(sqlite_store.DATABASE + "-wal").exists()
+    assert not store.path(sqlite_store.DATABASE + "-shm").exists()
+
+
+@pytest.mark.parametrize("finish", ["commit", "rollback", "pending"])
+def test_dry_run_refuses_changes_during_read(store, today, monkeypatch, capsys, finish):
+    run(store, Source())
+    check_schema = sqlite_store.check_schema
+    connect = sqlite_store.connect
+    with closing(connect(store.path(sqlite_store.DATABASE), write=True)) as writer:
+        # Force dirty pages to reach the main file before commit/rollback.
+        writer.execute("PRAGMA cache_size=1")
+        original = store.path(sqlite_store.DATABASE).read_bytes()
+        guard_preview(monkeypatch)
+        after_writer = None
+        spilled = False
+
+        def change_state(db):
+            nonlocal after_writer, spilled
+            check_schema(db)
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute("UPDATE documents SET payload=zeroblob(131072) WHERE name='index.json'")
+            spilled = store.path(sqlite_store.DATABASE).read_bytes() != original
+            if finish != "pending":
+                getattr(writer, finish)()
+            after_writer = saved_files(store)
+
+        monkeypatch.setattr(sqlite_store, "check_schema", change_state)
+        code, result, captured = command(store, capsys, "sync", "--since-last", "--dry-run")
+        assert spilled and after_writer is not None
+        assert code == 2 and result["error"] == "busy" and captured.out == ""
+        assert saved_files(store) == after_writer
 
 
 def test_dry_run_output_still_has_a_closed_contract(store, today, monkeypatch, capsys):
