@@ -169,7 +169,7 @@ def test_analysis_current_revisions_typed_values_privacy_and_receipt(
     assert (first["avg_power"], second["avg_power"]) == (230, 200)
     assert first["avg_power_source"] == "fit_session"
     assert first["garmin_reported_normalized_power"] == 215
-    assert first["normalizer_version"] == "1.4.1"
+    assert first["normalizer_version"] == "1.4.0"
     assert first["activity_time_local"] == "2025-01-02T08:00:00"
     assert first["timezone"] == "Asia/Shanghai" and first["utc_offset_seconds"] == 28800
     metadata = read_table(target, "meta")[0]

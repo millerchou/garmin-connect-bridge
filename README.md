@@ -97,6 +97,12 @@ with `--start`, `--end`, `--full`, `--resume`, or `--new-scan`. The normal two-p
 enumeration and failure rules apply; an unfinished job may require `--resume`.
 Use ordinary daily sync to discover delayed uploads outside this date range.
 
+After upgrading, `sync --since-last` does **not** reparse old rides outside its
+recent date range. Run sync once with an explicit date range covering existing
+activities (for example, `sync --start 2025-01-01 --end 2025-12-31`) to reparse them
+with the new normalizer. Choose dates covering your own history; originals are
+required. Subsequent `sync --since-last` runs can resume the usual recent updates.
+
 `sync --since-last --dry-run` prints only `{"start":"YYYY-MM-DD","end":"YYYY-MM-DD"}`
 and exits successfully. It uses the same watermark and host-date calculation as a
 real run, without constructing a network client, logging in, taking the bridge
@@ -199,8 +205,8 @@ Garmin estimates. The existing approved rider-posture fields such as
 
 Analysis format **2** adds the raw-message table and JSON columns. All child tables
 have primary key `(activity_id, ordinal)` and a foreign key to `activities`.
-`records.fractional_cadence`, `laps.fit_event`, and `laps.fit_event_type` use REAL,
-consistent with the existing numeric measurement/code columns. `unknown_json`,
+`records.fractional_cadence` uses REAL; `laps.fit_event` and `laps.fit_event_type`
+use INTEGER for FIT enum codes. `unknown_json`,
 `detail_json` and `fields_json` are validated JSON stored as TEXT; these map directly
 to PostgreSQL JSONB alongside the typed keys. Raw integers retain their JSON integer
 representation, including values outside SQLite's signed INTEGER range. Consumers
@@ -267,7 +273,7 @@ incomplete API history: consult status and gaps.
 ## Data and privacy boundaries
 
 The primary store is `activities.sqlite`, storage/user version **1**, activity
-schema **1.0**, normalizer **1.4.1**. Existing SQLite stores remain directly usable
+schema **1.0**, normalizer **1.4.0**. Existing SQLite stores remain directly usable
 without migration or schema changes. Historical stream shapes and immutable
 revisions remain readable. The four tables are `documents`, `samples`, `segments`,
 and `efforts`; JSON payloads preserve numeric types, signed zero, nulls, and precision.
@@ -318,6 +324,8 @@ fields absent from fitdecode's older profile still use the explicit contract whe
 available; they are never duplicated as raw fields. Entire undocumented messages
 use `raw_messages` rows with `mesg_num` and decimal field-number keys. Their raw
 timestamp fields, if present, stay integers and never seed the compressed clock.
+Rows with no fields remaining after interception are omitted from `raw_messages`;
+surviving rows retain their relative order and receive contiguous ordinals.
 
 The primary store reuses `samples(name TEXT, kind TEXT, ordinal INTEGER, payload
 BLOB)` with primary key `(name, kind, ordinal)`; payload is canonical JSON. The new
@@ -330,15 +338,14 @@ table migration is necessary. New detail shapes are identified by FIT field vers
 stays at format 2, with an additional `fit_counts.raw_messages` count only when 1.1
 streams exist. Analysis format changes to 2 because its SQL schema changes.
 
-Re-sync API activities or re-import offline activities to obtain normalizer 1.4.1
+Re-sync API activities or re-import offline activities to obtain normalizer 1.4.0
 revisions. Original FIT inputs are required. Old immutable revisions remain intact;
 no watermark, authentication or segment-matching algorithm change is involved.
 As before, offline import of identical API-derived content preserves its API
 revision; use sync to upgrade that revision. Older software cannot read 1.1 streams.
-Normalizer 1.4.1 also reparses 1.4.0 revisions to apply the strengthened privacy
-checks. Prior revisions remain immutable; reparsing does not erase historical
-data. Stored text-like raw arrays from 1.4.0 fail the strengthened export/snapshot
-validation rather than being silently copied.
+Prior revisions remain immutable; reparsing does not erase historical data.
+Stored text-like raw arrays fail the strengthened export/snapshot validation
+rather than being silently copied.
 
 ### Undocumented-field interception and report
 
@@ -356,12 +363,34 @@ raw values enter structured storage:
   This deliberately withholds some harmless counters/measurements.
 - Across all integer types, raw fields copying observed coordinate or identity
   values are blocked (`position_match` / `identity_match`), including unsigned
-  representations of semicircle coordinates. Record fields with at least three
+  representations of semicircle coordinates. Identity matching collects only
+  named identifiers (`serial_number`, `ant_device_number`, `device_number`,
+  `device_id`) and integers from the excluded profile/messages 3 and 79, and only
+  when their absolute value is at least **2^16 (65,536)**. This excludes the entire
+  16-bit unsigned range and common small settings/enums from file-wide matching,
+  even for short identifiers; reviewed identity fields themselves remain excluded
+  by default. Transmission types are categories, not identifiers. Coordinate
+  matching has no magnitude threshold. Record fields with at least three
   paired coordinate observations and squared linear correlation of at least
   0.9999 are blocked as `position_correlated`. Each array slot is checked. A match
   withholds the entire message/field family, including earlier and unpaired rows.
   These conservative checks can also withhold coincidentally matching measurements.
   Only transient sets and integer statistics are used; none enter stored artifacts.
+- An undocumented field is blocked as `suspected_identity` when any integer is
+  at least **2^24 (16,777,216)**, is not timestamp-like, and its field/array slot has
+  **at most three distinct non-null integers** across that message type's rows in
+  the file. Single-row fields qualify; nulls and missing fields provide no evidence
+  of variation. Each array slot is checked independently, and a match blocks the
+  entire message/field family. Four or more distinct values exempt that slot from
+  this heuristic, preserving varying counters. No message or field numbers are
+  special-cased. Distinct sets stop growing after four values.
+  Timestamp-like means FIT absolute `date_time` seconds in
+  `[0x10000000, 0xFFFFFFFF)`, within **24 hours** of at least one reviewed UTC
+  timestamp in the same file (including a validated compressed timestamp).
+  This accommodates local-clock offsets without treating the entire date-time
+  range as timestamps. Unknown/developer fields and relative clocks cannot supply
+  that evidence; without reviewed time evidence there is no timestamp exemption.
+  Exact coordinate/identity matches and position correlations still take priority.
 - Strings and byte blobs are blocked as `possible_identity`, as are arrays of any
   integer type containing at least four printable ASCII characters with zero/null
   padding, or at least four printable UTF-8 characters. All-null arrays remain null.
@@ -391,6 +420,10 @@ sidecars, excluded from analysis exports and snapshots; restore does not recreat
 them. The command supports review only; it does not enable any blocked fields.
 
 These heuristics cannot identify every numeric encoding of identity or geography.
+Constant large counters can be withheld; changing identifiers with four or more
+distinct values, short identifiers below the matching threshold, and identifiers
+near reviewed timestamps can escape these checks. The timestamp exemption is a
+privacy-filtering heuristic, not a claim about an unknown field's meaning or units.
 Correlation checks require co-observed record positions; no temporal joins are
 inferred for undocumented messages. Encodings without that evidence remain opaque.
 Explicitly retained names/UUIDs may themselves contain personal or place text.
@@ -420,8 +453,9 @@ inputs above 64 MiB, and excessive expansion are rejected. Parser limits are
 500,000 records, 10,000 laps, 100,000 events, 100,000 auxiliary messages, and 500,000
 undocumented message rows. SQLite permits up to 512 KiB per stream row to accommodate
 physical FIT arrays after JSON expansion, enforced before writes as well as on reads.
-Privacy checks retain unique observed coordinate/identity values in memory and
-fixed-size statistics per record field/array slot, not a second copy of the raw rows.
+Privacy checks retain unique observed coordinate/identity/reviewed timestamp values
+in memory, bounded distinct sets per raw field/array slot, and fixed-size correlation
+statistics per record field/array slot, not a second copy of the raw rows.
 These limits do not guarantee bounded
 memory suitable for every device/file combination.
 
@@ -456,7 +490,7 @@ Default tests are offline and generate FIT/SQLite inputs in code. They must cove
 - Two-pass catalog consistency, pagination, delayed uploads, partial failures,
   interruption/resume, gaps, and failure-does-not-advance-watermark.
 - Atomic SQLite publication/recovery, locking, permissions, missing data, bounded
-  offline queries, and continued use of storage version 1 with normalizer 1.4.1.
+  offline queries, and continued use of storage version 1 with normalizer 1.4.0.
 - Snapshot checksum/integrity/schema checks, contract spot checks, full validation
   on export/restore, revision/progress preservation, and incremental sync after restore.
 - Current-only typed analysis export, identity/location exclusion, atomic overwrite

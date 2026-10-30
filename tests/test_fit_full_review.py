@@ -56,19 +56,23 @@ def test_null_arrays_are_not_misclassified_as_text(base, invalid):
 def test_utf8_names_are_blocked_in_integer_arrays(base):
     data = minimal(frame(534, [raw(0, base, list("Synthétique".encode("utf-8")))]))
     streams, blocked = intercepted(data)
-    assert streams["raw_messages"][0]["fields"] == {}
+    assert streams["raw_messages"] == []
     assert blocked == {(534, 0, "possible_identity"): 1}
 
 
 def test_raw_64bit_extremes_and_invalid_slots_roundtrip_sql_without_precision_loss(store, tmp_path):
     data = minimal(
-        frame(
-            534,
-            [
-                raw(0, 0x8E, [-(2**63), 2**63 - 2, 2**63 - 1]),
-                raw(1, 0x8F, [2**64 - 2, 2**64 - 1]),
-                raw(2, 0x90, [0, 2**64 - 1]),
-            ],
+        # Vary each non-null slot beyond the suspected-identity distinct limit.
+        b"".join(
+            frame(
+                534,
+                [
+                    raw(0, 0x8E, [-(2**63) + i, 2**63 - 2 - i, 2**63 - 1]),
+                    raw(1, 0x8F, [2**64 - 2 - i, 2**64 - 1]),
+                    raw(2, 0x90, [0, 2**64 - 1 - i]),
+                ],
+            )
+            for i in range(4)
         )
     )
     assert publish(store, data)
@@ -102,7 +106,7 @@ def test_unsigned_semicircle_copies_are_blocked(base):
         records=frame(20, [raw(0, 0x85, -123456789)]),
     )
     streams, blocked = intercepted(data)
-    assert streams["raw_messages"][0]["fields"] == {}
+    assert streams["raw_messages"] == []
     assert blocked == {(534, 0, "position_match"): 1}
 
 
@@ -142,7 +146,7 @@ def test_unknown_profile_is_always_audited_and_copied_identifiers_are_blocked(id
         (534, 0, "identity_match"): 1,
         (20, 250, "identity_match"): 1,
     }
-    assert streams["raw_messages"][0]["fields"] == {}
+    assert streams["raw_messages"] == []
     assert "unknown_250" not in streams["records"][0]
 
 
@@ -170,7 +174,7 @@ def test_blocked_values_never_reach_structured_store_export_report_or_cli(store,
     assert "123456789" not in captured.err
     target = tmp_path / "review-analysis.sqlite"
     export.export_analysis(store, target)
-    assert json.loads(read_table(target, "raw_messages")[0]["fields_json"]) == {}
+    assert read_table(target, "raw_messages") == []
 
 
 @pytest.mark.parametrize("number", [20, 534])
@@ -299,10 +303,10 @@ def test_text_array_injection_fails_export_validation_and_preserves_destination(
     assert target.read_bytes() == before
 
 
-def test_review_patch_reparse_preserves_existing_full_field_revisions(store, monkeypatch):
+def test_reparse_preserves_prior_revisions(store, monkeypatch):
     with monkeypatch.context() as previous:
         for module in (c, normalize, sync):
-            previous.setattr(module, "NORMALIZER_VERSION", "1.4.0")
+            previous.setattr(module, "NORMALIZER_VERSION", "1.3.0")
         assert publish(store, minimal())
     prior = copy.deepcopy(store.state())
     files = prior["activities"]["1001"]["summary"]["files"]
@@ -310,5 +314,5 @@ def test_review_patch_reparse_preserves_existing_full_field_revisions(store, mon
     assert publish(store, minimal())
     assert not publish(store, minimal())
     assert all(store.read_bytes(name) == value for name, value in saved.items())
-    assert store.state()["activities"]["1001"]["summary"]["normalizer_version"] == "1.4.1"
+    assert store.state()["activities"]["1001"]["summary"]["normalizer_version"] == "1.4.0"
     assert store.state()["covered_ranges"] == prior["covered_ranges"]

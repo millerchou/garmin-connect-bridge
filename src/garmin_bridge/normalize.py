@@ -330,7 +330,7 @@ def normalize(
                     values["timestamp"] = timestamp_value(timestamp_raw)
                 detail = project_message(frame, include_identity, timestamp_raw=timestamp_raw)
                 unknown, raw_message = project_unknown(frame, blocked, include_identity)
-                raw_privacy.observe(frame, unknown)
+                raw_privacy.observe(frame, unknown, timestamp_raw)
                 if raw_message is not None:
                     raw_messages.append(raw_message)
                     if len(raw_messages) > MAX_RECORDS:

@@ -409,7 +409,7 @@ def test_range_sync_version_revision_idempotence_and_failed_watermark(tmp_path, 
     old_files = prior["activities"]["1001"]["summary"]["files"]
     assert run(store, Source())["updated"] == 1
     current = store.state()["activities"]["1001"]["summary"]
-    assert current["normalizer_version"] == "1.4.1" and current["files"] != old_files
+    assert current["normalizer_version"] == "1.4.0" and current["files"] != old_files
     assert store.read_json(old_files["summary"])["normalizer_version"] == "1.2.1"
     assert run(store, Source())["unchanged"] == 1
     before = copy.deepcopy(store.state())

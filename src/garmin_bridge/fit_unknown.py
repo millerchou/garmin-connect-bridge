@@ -13,6 +13,7 @@ missing timestamps and incorrectly imply a one-to-one relationship with records.
 """
 
 import re
+from bisect import bisect_left
 from collections import Counter
 from itertools import chain
 
@@ -53,9 +54,15 @@ REASONS = frozenset(
         "position_match",
         "position_correlated",
         "identity_match",
+        "suspected_identity",
     }
 )
 RAW_BASES = frozenset({0, 1, 2, 0x83, 0x84, 0x86, 0xA, 0x8B, 0x8C, 0x8E, 0x8F, 0x90})
+# Small settings, enums and short device numbers must not cause file-wide matches.
+IDENTITY_MATCH_MIN = 2**16
+SUSPECTED_IDENTITY_MIN = 2**24
+IDENTITY_DISTINCT_LIMIT = 3
+TIMESTAMP_TOLERANCE = 24 * 60 * 60
 # These Profile lookups only identify data to withhold, never grant permissions.
 POSITION_FIELDS = {
     number: frozenset(
@@ -69,9 +76,13 @@ IDENTITY_FIELDS = {
     number: frozenset(
         index
         for index, field in message.fields.items()
-        if field.name in {"serial_number", "ant_device_number", "ant_transmission_type"}
+        if field.name in {"serial_number", "ant_device_number", "device_number", "device_id"}
     )
     for number, message in profile.MESSAGE_TYPES.items()
+}
+TIMESTAMP_FIELDS = {
+    message: {spec.number: spec for spec in fields.values() if spec.kind == "utc"}
+    for message, fields in FIELDS.items()
 }
 
 
@@ -226,18 +237,30 @@ class RawPrivacy:
         self.positions = set()
         self.identities = set()
         self.correlations = {}
+        self.timestamps = set()
 
-    def observe(self, frame, unknown):
+    def observe_timestamp(self, value):
+        # Same absolute date_time bounds as fit_details.timestamp_value. Relative
+        # device clocks and FIT invalid sentinels cannot exempt suspected IDs.
+        if type(value) is int and 0x10000000 <= value < 0xFFFFFFFF:
+            self.timestamps.add(value)
+
+    def observe(self, frame, unknown, timestamp_raw=None):
+        self.observe_timestamp(timestamp_raw)  # independently reviewed compressed clock
         position_fields = POSITION_FIELDS.get(frame.global_mesg_num, ())
         identity_fields = IDENTITY_FIELDS.get(frame.global_mesg_num, ())
+        timestamp_fields = TIMESTAMP_FIELDS.get(frame.name, {})
         private = frame.global_mesg_num in {3, 79}
-        if not position_fields and not identity_fields and not private:
+        if not position_fields and not identity_fields and not timestamp_fields and not private:
             return
         coordinates = []
         for field in frame.fields:
             definition = field.field_def
             if definition is None or definition.is_dev:
                 continue
+            spec = timestamp_fields.get(definition.def_num)
+            if spec and definition.base_type.identifier == spec.base and definition.size == 4:
+                self.observe_timestamp(field.raw_value)
             location = definition.def_num in position_fields
             identity = private or definition.def_num in identity_fields
             if not location and not identity:
@@ -253,7 +276,7 @@ class RawPrivacy:
                         self.positions.update((value & 0xFFFFFFFF, (value + 2**31) % 2**32 - 2**31))
                     if frame.global_mesg_num == 20:
                         coordinates.append((definition.def_num, value))
-                if identity:
+                if identity and abs(value) >= IDENTITY_MATCH_MIN:
                     self.identities.add(value)
         # Other messages have no reviewed alignment to records. Exact matching
         # above is file-wide; never invent timestamps or joins for raw messages.
@@ -275,9 +298,18 @@ class RawPrivacy:
                     stats[5] += value * coordinate
 
     def filter(self, streams, blocked):
-        if not self.positions and not self.identities:
-            return
         reasons = {}
+        timestamps = sorted(self.timestamps)
+
+        def timestamp_like(value):
+            if not 0x10000000 <= value < 0xFFFFFFFF:
+                return False
+            index = bisect_left(timestamps, value - TIMESTAMP_TOLERANCE)
+            return index < len(timestamps) and timestamps[index] <= value + TIMESTAMP_TOLERANCE
+
+        # Cap distinct sets at limit + 1 per physical field/array slot. A varying
+        # counter must not hide a constant ID in a different slot of the array.
+        distinct, candidates = {}, set()
         for (field, _, _), (n, x, y, xx, yy, xy) in self.correlations.items():
             variance = (n * xx - x * x) * (n * yy - y * y)
             if n >= 3 and variance > 0 and (n * xy - x * y) ** 2 * 10000 >= variance * 9999:
@@ -288,10 +320,22 @@ class RawPrivacy:
                     continue
                 values = value if type(value) is list else [value]
                 field = number, int(key[len(prefix) :])
+                for slot, item in enumerate(values):
+                    if type(item) is not int:
+                        continue
+                    slot_key = (*field, slot)
+                    seen = distinct.setdefault(slot_key, set())
+                    if len(seen) <= IDENTITY_DISTINCT_LIMIT:
+                        seen.add(item)
+                    if item >= SUSPECTED_IDENTITY_MIN and not timestamp_like(item):
+                        candidates.add(slot_key)
                 if any(v in self.identities for v in values):
                     reasons[field] = "identity_match"
                 elif any(v in self.positions for v in values):
                     reasons.setdefault(field, "position_match")
+        for number, field, slot in candidates:
+            if len(distinct[(number, field, slot)]) <= IDENTITY_DISTINCT_LIMIT:
+                reasons.setdefault((number, field), "suspected_identity")
         for number, fields, prefix in raw_objects(streams):
             for key in list(fields):
                 if key.startswith(prefix) and (
@@ -299,6 +343,8 @@ class RawPrivacy:
                 ):
                     del fields[key]
                     blocked[(number, int(key[len(prefix) :]), reason)] += 1
+        # Keep source order among surviving rows, with no empty storage/export rows.
+        streams["raw_messages"][:] = [row for row in streams["raw_messages"] if row["fields"]]
 
 
 def validate_report(value):

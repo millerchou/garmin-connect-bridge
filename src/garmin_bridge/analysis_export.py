@@ -76,7 +76,10 @@ def detail_columns(message):
         if spec.shape == "pair":
             names = [f"{prefix}{name}_{i}" for i in range(2)]
         for column in names:
-            columns[column] = "TEXT" if spec.kind != "number" else "REAL"
+            if message == "lap" and name in {"event", "event_type"}:
+                columns[column] = "INTEGER"
+            else:
+                columns[column] = "TEXT" if spec.kind != "number" else "REAL"
     return columns
 
 

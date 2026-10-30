@@ -128,12 +128,12 @@ def test_new_fields_roundtrip_export_report_and_snapshot(store, tmp_path, capsys
                     export.validate_detail_keys(json.loads(value))
     with store.database() as db:
         assert (
-            db.execute("SELECT count(*) FROM samples WHERE kind='raw_messages'").fetchone()[0] == 3
+            db.execute("SELECT count(*) FROM samples WHERE kind='raw_messages'").fetchone()[0] == 2
         )
     snap = tmp_path / "snapshot"
     transfer.export_snapshot(store, snap)
     assert not (snap / REPORT_PATH).exists()
-    assert json.loads((snap / "manifest.json").read_bytes())["fit_counts"]["raw_messages"] == 3
+    assert json.loads((snap / "manifest.json").read_bytes())["fit_counts"]["raw_messages"] == 2
     transfer.restore_snapshot(snap, tmp_path / "restored")
     restored = SQLiteStore(tmp_path / "restored")
     assert restored.read_json(current["files"]["streams"]) == streams
@@ -211,7 +211,7 @@ def test_ambiguous_raw_types_are_reported_without_values(base, value, reason):
         "a" * 64,
         blocked_fields=blocked,
     )
-    assert streams["raw_messages"] == [{"mesg_num": 534, "fields": {}}]
+    assert streams["raw_messages"] == []
     assert blocked == {(534, 5, reason): 1}
 
 
@@ -352,7 +352,7 @@ def test_version_1_details_remain_readable_and_reimport_creates_immutable_revisi
     assert all(store.read_bytes(p) == content for p, content in before.items())
     assert store.state()["covered_ranges"] == prior["covered_ranges"]
     assert store.state()["last_success_at"] == prior["last_success_at"]
-    assert store.state()["activities"]["1001"]["summary"]["normalizer_version"] == "1.4.1"
+    assert store.state()["activities"]["1001"]["summary"]["normalizer_version"] == "1.4.0"
     # Existing manifest format remains valid for mixed version history.
     transfer.export_snapshot(store, tmp_path / "mixed-snapshot")
     transfer.verify_snapshot(tmp_path / "mixed-snapshot")
