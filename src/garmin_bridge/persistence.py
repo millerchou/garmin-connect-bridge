@@ -4,6 +4,8 @@ These are also the portable backup boundary: hashes alone cannot establish
 privacy or consistency. Unknown keys and free text fail closed.
 """
 
+import copy
+
 from . import contract as c
 from .errors import BridgeError, MESSAGES
 
@@ -235,3 +237,106 @@ def validate_pair(state, job):
         require(state["last_success_at"] is not None and state["last_failure"] is None)
         if job["mode"] == "full":
             require(state["history_initialized"])
+
+
+def snapshot(store):
+    from .jobs import load_job
+
+    state = copy.deepcopy(store.state())
+    for entry in state["activities"].values():
+        entry["raw_ref"] = entry["raw_sha256"] = None
+    job = load_job(store)
+    validate_pair(state, job)
+    return state, job
+
+
+def control_files(state, job):
+    from .jobs import JOB_FILE, gaps
+
+    values = {"index.json": state}
+    if job is not None:
+        values[JOB_FILE] = job
+        # Rebuild from the journal, including after a hard kill. Do not copy
+        # a stale report or arbitrary files from the reports directory.
+        values[f"reports/{job['id']}/gaps.json"] = c.validate_gap_report(
+            {
+                "schema_version": c.SCHEMA_VERSION,
+                "job_id": job["id"],
+                "cutoff_at": job["cutoff_at"],
+                "gaps": gaps(job),
+            }
+        )
+    return values
+
+
+def validate_artifact_paths(summary):
+    from .normalize import sha256
+    from .storage import canonical
+
+    revision = sha256(
+        canonical(
+            [summary["source_digest"], summary["normalizer_version"], summary["schema_version"]]
+        )
+    )
+    require(
+        summary["files"]
+        == {
+            kind: f"objects/{summary['source_activity_id']}/{revision}/{kind}.json"
+            for kind in ("summary", "streams")
+        }
+    )
+
+
+def validate_artifact_relation(summary, streams):
+    """Cheap revision/metadata/count checks, independent of per-sample validation."""
+    validate_artifact_paths(summary)
+    from .fit_details import fill_local_time
+
+    require(identity_enabled(summary) == streams.get("include_identity", False))
+    require(summary["coverage"].keys() == streams["units"].keys())
+    if summary["provenance"]["input"] == "local_fit_file" and "fit_fields_version" in streams:
+        expected_time = {**summary["activity_time"], "local": None, "utc_offset_seconds": None}
+        fill_local_time(expected_time, streams["messages"])
+        require(summary["activity_time"] == expected_time)
+    for key in (
+        "schema_version",
+        "normalizer_version",
+        "provider",
+        "source_activity_id",
+        "source_digest",
+    ):
+        require(streams[key] == summary[key])
+    for array, field in (
+        ("records", "sample_count"),
+        ("laps", "lap_count"),
+        ("timer_events", "timer_event_count"),
+    ):
+        require(len(streams[array]) == summary[field])
+
+
+def artifact_files(entry, read):
+    from .normalize import sha256
+    from .storage import decode
+
+    summary = entry["summary"]
+    validate_artifact_paths(summary)
+    contents = {}
+    for kind, path in summary["files"].items():
+        data = read(path)
+        require(data is not None and sha256(data) == entry["file_hashes"][kind])
+        contents[kind] = (path, data, decode(data))
+    require(contents["summary"][2] == summary)
+    c.project_activity(summary)
+    streams = c.validate_streams(contents["streams"][2])
+    validate_artifact_relation(summary, streams)
+    for key, coverage in summary["coverage"].items():
+        present = sum(row[key] is not None for row in streams["records"])
+        require(
+            coverage
+            == {
+                "present": present,
+                "missing": len(streams["records"]) - present,
+                "total": len(streams["records"]),
+            }
+        )
+    return [(path, data) for path, data, _ in contents.values()]

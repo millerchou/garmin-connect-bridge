@@ -1,10 +1,12 @@
-"""Private files, immutable revisions and a single atomic index commit point.
+"""Private file access, canonical JSON and atomic no-replace publication.
 
 The store is for one OS user and one Garmin account. Never chmod an arbitrary
 existing directory to make it acceptable; reject it instead. Parent system
 directories may be shared, but every component inside the store is owner-only.
 """
 
+import ctypes
+import errno
 import fcntl
 import json
 import os
@@ -104,7 +106,7 @@ class Store:
         check_private(self.root, directory=True)
 
     @contextmanager
-    def lock(self, write=False, allow_restore=False):
+    def lock(self, write=False):
         if not self.root.exists() and not write:
             # Queries must not create a missing root just to lock it. Freeze
             # that empty snapshot so a concurrent first writer cannot make us
@@ -124,8 +126,6 @@ class Store:
                 fcntl.flock(fd, (fcntl.LOCK_EX if write else fcntl.LOCK_SH) | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise BridgeError("busy") from None
-            if not allow_restore and self.path(".restore-pending.json").exists():
-                raise BridgeError("restore_pending")
             yield
         finally:
             os.close(fd)
@@ -195,17 +195,47 @@ class Store:
     def write_json(self, relative: str, value):
         self.write_bytes(relative, canonical(value))
 
-    def state(self):
-        state = self.read_json("index.json")
-        if state is None:
-            return empty_state()
-        if (
-            not isinstance(state, dict)
-            or state.keys() != empty_state().keys()
-            or state["version"] != 1
-            or not isinstance(state["activities"], dict)
-        ):
-            raise BridgeError("storage_failed")
-        from .persistence import validate_state
 
-        return validate_state(state)
+def decode(content):
+    try:
+        value = json.loads(content)
+        # Reject duplicate keys, nonfinite numbers, trailing bytes and hidden
+        # noncanonical content. Every package produced here uses this encoding.
+        if canonical(value) != content:
+            raise BridgeError("storage_failed")
+        return value
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        raise BridgeError("storage_failed") from None
+
+
+def publish_directory(source: Path, destination: Path):
+    """Atomic no-replace rename on both supported operating systems.
+
+    A check followed by os.rename can overwrite a concurrently created empty
+    directory. These kernel primitives fail even for an empty destination.
+    There is deliberately no unsafe fallback on unsupported filesystems.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "linux" and hasattr(libc, "renameat2"):
+        function = libc.renameat2
+        function.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        function.restype = ctypes.c_int
+        result = function(-100, os.fsencode(source), -100, os.fsencode(destination), 1)
+    elif sys.platform == "darwin" and hasattr(libc, "renamex_np"):
+        function = libc.renamex_np
+        function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        function.restype = ctypes.c_int
+        result = function(os.fsencode(source), os.fsencode(destination), 4)
+    else:
+        raise BridgeError("storage_failed")
+    if result != 0:
+        code = ctypes.get_errno()
+        raise BridgeError(
+            "destination_exists" if code in (errno.EEXIST, errno.ENOTEMPTY) else "storage_failed"
+        )

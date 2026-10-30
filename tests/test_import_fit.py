@@ -12,11 +12,12 @@ import zipfile
 
 import pytest
 
-from garmin_bridge import backup, cli, jobs, normalize, sync, upstream
+from garmin_bridge import cli, jobs, normalize, sync, upstream
 from garmin_bridge.errors import BridgeError
 from garmin_bridge.import_fit import import_file
-from garmin_bridge.storage import Store, canonical, empty_state
-from .synthetic import SECRET, Source, activity, archive, fit_bytes
+from garmin_bridge.sqlite_store import SQLiteStore as Store
+from garmin_bridge.storage import canonical, empty_state
+from .synthetic import corrupt_document, SECRET, Source, activity, archive, fit_bytes
 from .test_cli_storage import command
 from .test_history import CUTOFF, execute
 
@@ -42,17 +43,17 @@ def importing(store, capsys, path, source_id="1001"):
 
 def api_snapshot(store):
     state = store.state()
-    refs = [jobs.JOB_FILE]
-    refs += [str(p.relative_to(store.root)) for p in store.root.glob("reports/**/*.json")]
-    refs += [str(p.relative_to(store.root)) for p in store.root.glob("jobs/*.json")]
+    with store.database() as db:
+        refs = [
+            r[0]
+            for r in db.execute(
+                "SELECT name FROM documents WHERE name='sync-job.json' OR name LIKE 'reports/%' OR name LIKE 'jobs/%'"
+            )
+        ]
     return {
         "state": {k: v for k, v in state.items() if k != "activities"},
         "watermark": sync.watermark(state),
-        "files": {
-            ref: (store.read_bytes(ref), store.path(ref).stat().st_mtime_ns)
-            for ref in refs
-            if store.path(ref).exists()
-        },
+        "files": {ref: store.read_bytes(ref) for ref in refs},
     }
 
 
@@ -136,7 +137,8 @@ def test_import_is_offline_without_touching_auth(
     assert len(streams["records"]) == 500 and streams["records"][1]["power"] is None
     assert_private_output(json.dumps(streams))
     entry = store.state()["activities"]["1001"]
-    assert store.read_bytes(entry["raw_ref"]) == original
+    assert store.read_bytes(entry["raw_ref"]) == fit
+    assert entry["raw_sha256"] == normalize.sha256(fit)
     assert command(store, capsys, "list")[1]["activities"][0]["source_activity_id"] == "1001"
     assert command(store, capsys, "activity", "1001")[1]["activity"] == summary
     assert {**store.state(), "activities": {}} == empty_state()
@@ -174,8 +176,9 @@ def test_idempotence_zip_wrapping_content_revision_and_parser_version(
     )
     assert len(store.state()["activities"]) == 1 and spy.call_count == 2
     assert result["activity"]["files"] != first["files"]
-    assert all(store.path(ref).is_file() for ref in first["files"].values())
+    assert all(store.read_bytes(ref) is not None for ref in first["files"].values())
     before_version = result["activity"]
+    monkeypatch.setattr("garmin_bridge.contract.NORMALIZER_VERSION", "1.1.1")
     monkeypatch.setattr(sync, "NORMALIZER_VERSION", "1.1.1")
     monkeypatch.setattr(normalize, "NORMALIZER_VERSION", "1.1.1")
     result = importing(store, capsys, changed)[1]
@@ -224,11 +227,17 @@ def test_offline_import_cannot_replace_missing_api_scan_evidence(store, tmp_path
     assert command(store, capsys, "activity", "1001")[0] == 0
 
 
-def test_damaged_api_artifact_requires_api_repair(store, tmp_path, capsys):
+def test_damaged_api_artifact_rejects_offline_overwrite(store, tmp_path, capsys):
     execute(store, Source())
     entry = store.state()["activities"]["1001"]
     with store.lock(write=True):
-        store.write_bytes(entry["summary"]["files"]["streams"], b"{}")
+        with store.database() as db:
+            ref = entry["summary"]["files"]["streams"]
+            metadata = json.loads(
+                db.execute("SELECT payload FROM documents WHERE name=?", (ref,)).fetchone()[0]
+            )
+        metadata["source_digest"] = "0" * 64
+        corrupt_document(store, ref, canonical(metadata))
     index = store.read_bytes("index.json")
     result = importing(store, capsys, private_file(tmp_path, fit_bytes()))
     assert result[0] == 2 and result[1]["error"] == "import_conflict"
@@ -494,17 +503,14 @@ def test_backup_roundtrip_and_later_api_acquisition(
     queries = {
         args: command(store, capsys, *args)[1] for args in (("list",), ("activity", source_id))
     }
-    bundle = path.parent / "backup.zip"
+    bundle = path.parent / "snapshot"
     code, receipt, _ = command(store, capsys, "backup", "export", "--file", str(bundle))
-    assert code == 0 and receipt["scan_status"] == ("incomplete" if pending_api else "none")
-    with zipfile.ZipFile(bundle) as package:
-        for name in package.namelist():
-            assert name == "manifest.json" or backup.allowed_path(name)
-            assert_private_output(package.read(name).decode())
-        assert not any(
-            name.endswith((".fit", ".bin")) or name.startswith("auth/")
-            for name in package.namelist()
-        )
+    assert code == 0 and receipt["verified"]
+    assert {p.name for p in bundle.iterdir()} == {"activities.sqlite", "manifest.json"}
+    with Store(bundle).database() as db:
+        for table in ("documents", "samples"):
+            for (payload,) in db.execute(f"SELECT payload FROM {table}"):
+                assert_private_output(payload.decode())
     assert command(store, capsys, "backup", "verify", "--file", str(bundle))[0] == 0
     restored = Store(tmp_path / "restored")
     assert command(restored, capsys, "backup", "restore", "--file", str(bundle))[0] == 0
@@ -532,7 +538,9 @@ def test_backup_roundtrip_and_later_api_acquisition(
     assert result["complete"] and result["updated"] == 1
     assert set(restored.state()["activities"]) == {"1001", "1002", "1003"}
     assert (
-        command(restored, capsys, "backup", "export", "--file", str(path.parent / "later.zip"))[0]
+        command(
+            restored, capsys, "backup", "export", "--file", str(path.parent / "later-snapshot")
+        )[0]
         == 0
     )
 
@@ -655,6 +663,6 @@ def test_local_only_backup_cannot_claim_api_success_without_journal(store, tmp_p
     state["last_success_at"] = CUTOFF
     with store.lock(write=True):
         store.write_bytes("index.json", canonical(state))
-    result = command(store, capsys, "backup", "export", "--file", str(path.parent / "bad.zip"))
+    result = command(store, capsys, "backup", "export", "--file", str(path.parent / "bad-snapshot"))
     assert result[0] == 2 and result[1]["error"] == "privacy_failed"
-    assert not (path.parent / "bad.zip").exists()
+    assert not (path.parent / "bad-snapshot").exists()

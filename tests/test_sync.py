@@ -4,9 +4,10 @@ from unittest.mock import Mock
 
 import pytest
 
-from garmin_bridge import normalize, sync
+from garmin_bridge import normalize, sync, sqlite_transfer as transfer
+from garmin_bridge.sqlite_store import SQLiteStore
 from garmin_bridge.errors import BridgeError
-from .synthetic import Source, activity, archive, fit_bytes
+from .synthetic import delete_document, Source, activity, archive, fit_bytes
 
 INTERVAL = {"start": "2025-01-01", "end": "2025-01-03"}
 
@@ -52,13 +53,14 @@ def test_correction_replaces_only_affected_result(store, monkeypatch, correction
     )
     assert current["1002"] == previous["1002"]
     for ref in previous["1001"]["summary"]["files"].values():
-        assert store.path(ref).is_file()
+        assert store.read_bytes(ref) is not None
 
 
 def test_normalizer_version_invalidates_parse_cache(store, monkeypatch):
     source = Source()
     run(store, source)
     previous = store.state()["activities"]["1001"]["summary"]
+    monkeypatch.setattr("garmin_bridge.contract.NORMALIZER_VERSION", "1.0.1")
     monkeypatch.setattr(sync, "NORMALIZER_VERSION", "1.0.1")
     monkeypatch.setattr(normalize, "NORMALIZER_VERSION", "1.0.1")
     result = run(store, source)
@@ -177,15 +179,21 @@ def test_lookback_and_explicit_date_rescan(store):
     ) == {"start": "2024-12-01", "end": "2024-12-31"}
 
 
-def test_missing_artifact_is_repaired_without_duplicating_activity(store):
+def test_missing_immutable_artifact_recovers_from_snapshot_without_duplicates(store, tmp_path):
     source = Source()
     run(store, source)
     summary = store.state()["activities"]["1001"]["summary"]
-    store.path(summary["files"]["streams"]).unlink()
+    snapshot = tmp_path / "recovery-snapshot"
+    transfer.export_snapshot(store, snapshot)
+    delete_document(store, summary["files"]["streams"])
     assert not sync.files_available(store, summary)
     result = run(store, source)
-    assert result["updated"] == 1 and len(store.state()["activities"]) == 1
-    assert sync.files_available(store, summary)
+    assert not result["complete"] and len(store.state()["activities"]) == 1
+    restored = SQLiteStore(tmp_path / "restored")
+    transfer.restore_snapshot(snapshot, restored.root)
+    assert run(restored, source)["unchanged"] == 1
+    assert len(restored.state()["activities"]) == 1
+    assert sync.files_available(restored, summary)
 
 
 def test_only_reviewed_cycling_types_and_safe_ids(store):

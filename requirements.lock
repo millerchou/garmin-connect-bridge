@@ -237,10 +237,6 @@ fitdecode==0.11.0 \
     --hash=sha256:52d920e50eaa76eb065b20bfd4e42f72195e894a079098dacc1cafa908cd4b83 \
     --hash=sha256:a1bdb9b4d1e9ebac0001fc58c22fe07a3f9967ca4e13258c6ef99cdb8d697a78
     # via garmin-connect-bridge
-garmin-fit-sdk==21.218.0 \
-    --hash=sha256:70dc8c39cec3483871f966415ee786a12e121af2a1729b5719f430078d2de495 \
-    --hash=sha256:7b912cde3b0b8f4acd7b543c202d15ac94f6b37b58eab5bad2186ca787b9ab37
-    # via garmin-connect-bridge
 garminconnect==0.3.17 \
     --hash=sha256:624d8c2468d865d286c9fb7ae8133633bb1d52a2b019c8beb5ff9ae10dd43264 \
     --hash=sha256:f6b6dd282c950c394478cb5bcca506e1432e82037e27625d1456ef49c8f17ffe

@@ -1,1331 +1,344 @@
 # Garmin Connect Bridge
 
-A small, read-only Garmin Connect adapter for deterministic data pipelines.
+A read-only Garmin cycling adapter with a private SQLite store, offline FIT import,
+bounded JSON queries, and anonymous segment comparisons. Authentication uses
+`garminconnect==0.3.17`; FIT parsing uses `fitdecode==0.11.0`. Garmin's unofficial
+web services can change. Live authentication, renewal, and synchronization require
+separate private validation.
 
-**Status: installable CLI with SQLite primary storage, explicit legacy migration,
-anonymous segment comparisons, offline FIT import and portable snapshots.**
-The bridge commands, `import-fit`, `sanitize-fit`, `verify-fit` and offline
-`backup` commands below are implemented.
-The first verified runtime was Linux x86_64, Python 3.12.14.
-The code targets macOS and Python 3.12+; synthetic offline checks have also run
-on macOS with Python 3.12.5. Live Garmin authentication, renewal and synchronization remain
-unverified. There is no CI workflow, release or deployed service.
+## Usage
 
-## Design
-
-Use a pinned, inspected release of
-[python-garminconnect](https://github.com/cyberjunky/python-garminconnect) as a
-dependency rather than maintaining a fork of its authentication engine.
-That library accesses unofficial Garmin web services. Authentication and
-endpoints can change; successful website sign-in does not prove programmatic
-authentication or unattended synchronization works.
-
-This is an **independent data store**, populated directly from the current
-Garmin international account. There is no import or migration from old local
-projects, CSV files, Strava IDs, metrics, Coach records or directory layouts.
-Explicit migration accepts only this bridge’s reviewed legacy JSON/ZIP formats.
-Activity identity is `(garmin, activity ID)`. Use one private store per account.
-The offline path accepts a single original exported from Garmin's normal website,
-with an explicitly supplied activity ID; it does not import an old local system.
-
-Acquisition (`upstream.py`), FIT projection (`normalize.py`), private storage
-(`storage.py`), resumable scans (`jobs.py`, `sync.py`) and offline queries
-(`cli.py`) are separate. The offline file adapter (`import_fit.py`) shares the
-same validation/publication function as API downloads in `sync.py`, and the same
-FIT parser and storage interface. `sqlite_store.py` stores ordered full-resolution
-records, laps, events, immutable revisions and the journal in SQLite. Portable
-snapshots (`sqlite_transfer.py`) reuse the reviewed contract and SQLite backup API.
-The CLI returns bounded JSON. A private collection runner can use a separately
-authorized file-transfer connector to transfer verified snapshots. Bridge has no Google OAuth, Drive SDK,
-Space integration, hosted service or deployment configuration.
-
-The API/import dependencies remain `garminconnect==0.3.17` and `fitdecode==0.11.0`; the former is the
-PyPI distribution of python-garminconnect. On 2026-10-14, their non-yanked PyPI
-metadata, wheel hashes, installed versions and relevant source/API signatures
-were checked. Authentication uses the upstream `login`, `resume_login` and
-`client.dumps` interfaces; no authentication engine is copied into this repo.
-Catalog GET requests use the upstream activity-search endpoint and original
-downloads use `ActivityDownloadFormat.ORIGINAL`.
-
-Derived FIT verification additionally pins **`garmin-fit-sdk==21.218.0`** (official
-Garmin Python SDK, Profile **21.218.0Release**), checked against non-yanked PyPI
-metadata and the wheel on 2026-10-18. Its license is
-**`LicenseRef-FIT-Protocol-License-Agreement`**, a custom FIT Protocol License,
-not MIT. See the dependency's `licenses/LICENSE.txt` and
-[official SDK repository](https://github.com/garmin/fit-python-sdk). It is installed
-as a dependency; its code, whole Profile and upstream test data are not vendored.
-The existing parser and authentication dependency versions were not upgraded.
-
-The SDK's general encoder drops `None` fields and can reverse-scale/round values;
-its decoder does not support compressed timestamp messages. Therefore it is used
-as the **second independent output reader**, alongside fitdecode. A small bounded
-physical-field transcriber preserves approved source bytes and expands supported
-compressed timestamp headers before either reader sees the output. Using only
-fitdecode would not provide independent re-reading; re-encoding normalized JSON
-or SDK dictionaries would lose physical presence/precision information.
-
-Verified wheel SHA-256 values:
-
-```text
-garminconnect 0.3.17: 624d8c2468d865d286c9fb7ae8133633bb1d52a2b019c8beb5ff9ae10dd43264
-fitdecode 0.11.0:    a1bdb9b4d1e9ebac0001fc58c22fe07a3f9967ca4e13258c6ef99cdb8d697a78
-garmin-fit-sdk 21.218.0: 7b912cde3b0b8f4acd7b543c202d15ac94f6b37b58eab5bad2186ca787b9ab37
-```
-
-This verification establishes package identity and the inspected adapter
-contract, not successful authentication against Garmin or a security audit of
-all upstream code. `uv.lock` pins development and transitive dependencies across
-platforms. `requirements.lock` is its hash-locked runtime export.
-
-## Install
-
-With Python 3.12+ and [uv](https://docs.astral.sh/uv/):
+Python 3.12+ and [uv](https://docs.astral.sh/uv/) are required for development:
 
 ```sh
 uv sync --frozen
 uv run --frozen garmin-bridge --help
-uv run --frozen python -m pytest
 ```
 
-The installed console entry point is `garmin-bridge`; `python -m garmin_bridge`
-is equivalent. For a collection runner, **uv is optional**. From this repository's root,
-Python 3.12, pip and venv suffice. Install runtime dependencies from
-`requirements.lock` and extract the build backend's complete pinned dependency
-set from `uv.lock`; pip build isolation is disabled so it cannot resolve newer
-build dependencies. These commands use public package registries, not Garmin:
+`python -m garmin_bridge` is equivalent to the installed `garmin-bridge` command.
+`uv.lock` pins all dependencies; `requirements.lock` is the runtime export with
+hashes. Normal installation does not update these pins.
 
-```sh
-python3.12 -m venv .venv
-.venv/bin/python - <<'PY'
-from pathlib import Path
-import tomllib
+`migrate`, `sanitize-fit`, `verify-fit`, and `--legacy-store` were removed in this
+version. They return explicit errors and are omitted from help. Legacy JSON store
+access/migration and derived FIT archive creation/verification have no replacement.
+Existing SQLite stores work directly without `--legacy-store`. For other handoffs,
+use `export analysis` for a non-location SQLite analysis artifact, or
+`snapshot export|verify|restore` for private SQLite backups.
 
-names = {"hatchling", "packaging", "pathspec", "pluggy", "tomlkit", "trove-classifiers"}
-packages = tomllib.loads(Path("uv.lock").read_text())["package"]
-lines = []
-found = set()
-for package in packages:
-    if package["name"] in names:
-        found.add(package["name"])
-        artifacts = [package.get("sdist"), *package.get("wheels", [])]
-        hashes = sorted({item["hash"] for item in artifacts if item})
-        assert hashes
-        lines.append(package["name"] + "==" + package["version"] + " "
-                     + " ".join("--hash=" + value for value in hashes))
-assert found == names
-Path(".venv/bridge-build.lock").write_text("\n".join(sorted(lines)) + "\n")
-PY
-.venv/bin/python -m pip install --no-cache-dir --only-binary=:all: --require-hashes \
-  -r requirements.lock -r .venv/bridge-build.lock
-.venv/bin/python -m pip install --no-cache-dir --no-index --no-deps --no-build-isolation .
-.venv/bin/python -m pip check
-.venv/bin/garmin-bridge --help
-export PATH="$PWD/.venv/bin:$PATH"
-```
-
-`uv sync --frozen` is the development setup, including pytest, Ruff and the
-pinned build backend. Build with `uv build --no-build-isolation` from that
-environment. Dependency updates are intentional changes to the pins and lock
-files, not something a normal sync command performs.
-
-Alternatively, after installing uv separately, this runtime-only recipe is
-available; do not assume uv already exists in the collection environment:
-
-```sh
-uv sync --frozen --no-dev --python 3.12
-export PATH="$PWD/.venv/bin:$PATH"
-garmin-bridge --help
-```
-
-Keep the checkout and virtual environment available; the uv project installation
-is editable. This is an installation recipe, not a deployment or scheduled job.
-
-## MVP
-
-| Command | Responsibility |
-| --- | --- |
-| `auth` | Explicit private sign-in, MFA continuation, and protected token persistence. |
-| `status` | Authentication state, synchronization watermarks, freshness, and actionable failures; never credentials. |
-| `sync` | Full historical import, resume, daily discovery/rechecks, and explicit historical rescans. |
-| `import-fit` | Import one private original FIT or single-FIT ZIP entirely offline, with an explicit Garmin activity ID. |
-| `sanitize-fit` | Create a new private derived training FIT archive directly from physical FIT fields, without changing the activity store. |
-| `verify-fit` | Recheck all physical fields and both parsers; choose full comparison with `--source` or archive integrity only with `--archive-only`. |
-| `list` | Read the local activity index without network access. |
-| `activity` | Read an existing bounded activity summary and references to approved local files. |
-| `snapshot export / verify / restore` | Publish, check or recover an independent SQLite snapshot. |
-| `backup export / verify / restore` | Same SQLite path for new stores; retains legacy ZIP compatibility. |
-| `migrate` | Validate a legacy bridge store or ZIP into a new SQLite directory without changing the source. |
-| `window` | Bounded, ordered samples in an explicit time window. |
-| `segment define / refresh / history` | Anonymous time-window definitions, private local matching, bounded cached results. |
-
-All command results are JSON. Exit codes: `0` for successful imports/queries or
-a complete scan, `1` for an incomplete scan, `2` for safe command/auth/storage errors, and
-`130` for interruption. Invalid command arguments are not echoed back.
-
-## Private store and authentication
-
-The default store is outside the checkout:
-
-- Linux: `$XDG_DATA_HOME/garmin-connect-bridge`, or
-  `~/.local/share/garmin-connect-bridge` when XDG_DATA_HOME is unset.
-- macOS: `~/Library/Application Support/garmin-connect-bridge`.
-
-Override it with `GARMIN_BRIDGE_DATA_DIR` or the global `--data-dir PATH` option
-**before** the command. Existing permissive directories, symlinks inside the
-store, hardlinked files, and stores inside Git checkouts are rejected. System
-path aliases such as macOS `/tmp` are resolved. The store is intended for a
-single OS user on a local filesystem with POSIX locking and atomic rename.
-
-For a collection runner, choose a persistent private location outside every checkout. This
-portable example uses the current user's home, without a machine-specific path:
+Choose a persistent private directory outside every Git checkout:
 
 ```sh
 umask 077
 export GARMIN_BRIDGE_DATA_DIR="$HOME/.local/share/garmin-connect-bridge"
 garmin-bridge auth
-garmin-bridge auth --refresh
 garmin-bridge status
-```
-
-The data root is configurable; the authentication subdirectory is always
-`$GARMIN_BRIDGE_DATA_DIR/auth` (there is no separate auth-directory option).
-Bridge creates private directories itself and refuses unsafe existing ones.
-
-`auth` requires a private interactive terminal; email, password and MFA input
-are hidden prompts. MFA resumes on the same upstream client, with up to three
-code attempts. An interrupted MFA challenge is not serialized: rerun `auth`.
-Passwords and codes are never accepted as arguments or saved. The session is
-atomically saved as `auth/session.json` with mode `0600`, under directories with
-mode `0700`. A failed sign-in leaves the previous session intact. Ambient
-`GARMINTOKENS` is not imported. Upstream debugging and dynamic exception bodies
-are suppressed.
-
-`auth --refresh` explicitly checks/refreshes the saved session through the
-upstream library; sync can also refresh it and saves rotated tokens. Neither
-falls back to a password prompt. Rejected sessions report `reauth_required`.
-Offline `status` reports `absent`, `saved_unverified` or `reauth_required` and a
-last-verification timestamp; a saved session is not proof of present validity.
-
-For a minimal live check in the separately authorized private environment,
-replace this example day with a known cycling day in that account:
-
-```sh
-garmin-bridge sync --start 2025-01-02 --end 2025-01-02
-garmin-bridge status
-garmin-bridge list --start 2025-01-02 --end 2025-01-02 --limit 5
-garmin-bridge activity 1001
-```
-
-Replace `1001` with a numeric ID returned by `list`. A one-day scan checks the
-pipeline but does not initialize full history. Resolve an unfinished scan with
-`sync --resume`, then start `sync --full`; alternatively `sync --full --new-scan`
-retains unresolved gaps while starting the full scan. MFA is entered only at the
-hidden `auth` prompt, with no separate MFA argument or command.
-
-## First full historical import
-
-After authentication, use the same configured store:
-
-```sh
 garmin-bridge sync --full
-garmin-bridge status
 ```
 
-A new store's plain `sync` refuses to substitute a recent-only import and asks
-for `sync --full`. Full import has no lower date bound or server calendar-date
-filter: it enumerates the visible cycling catalog, obtains originals, validates
-FIT and publishes reviewed results. Current profile settings are never used to
-fill historical fields. An explicitly requested range scan can populate a
-subset, but does not mark the store as initialized for daily sync.
+The global `--data-dir PATH` option overrides the environment variable. Defaults
+are `$XDG_DATA_HOME/garmin-connect-bridge` (or `~/.local/share/garmin-connect-bridge`)
+on Linux and `~/Library/Application Support/garmin-connect-bridge` on macOS.
+Use one store per account. Directories must be owner-only (`0700`), files `0600`;
+symlinks, hardlinks, permissive stores, and stores inside Git are rejected.
 
-Each job freezes a UTC `cutoff_at`. It includes activities starting at or before
-that instant, not a claimed snapshot of upload time. Activities after it are
-recorded as skipped. Missing start times are not invented: the historical FIT
-session time is used when present, otherwise time remains missing. Full catalog
-queries avoid assuming that the Garmin account and host share a time zone.
-The JSON filter, cutoff and `observed_range` describe the scan scope and earliest/
-latest observed dates; the latter is not a promise that older records do not
-exist on Garmin.
+`auth` requires a private interactive terminal with hidden email, password, and
+MFA prompts. It saves only protected session state in `auth/session.json`.
+`auth --refresh` explicitly checks/refreshes the saved session without prompting
+for a password. Failed authentication preserves the prior session. Offline status
+reports `saved_unverified` for an unchecked saved session; this is not proof of
+present validity. Sync may refresh and save rotated tokens.
 
-Offset pagination is deduplicated by source ID. Pages and activity states are
-checkpointed before moving on. A second full catalog pass must match the first
-pass's in-scope IDs and reviewed metadata; a changed catalog triggers another
-pass, up to three passes per invocation. This catches shifts caused by uploads
-during enumeration, including uploads with old activity dates. Observed required
-IDs remain required even if a later pass omits them. Absence never deletes an
-existing local activity.
-
-`complete: true` requires both converged enumeration and successful processing
-of every required activity. A successful HTTP request or an empty page alone
-does not satisfy this. Page limits, repeated pages, malformed responses,
-non-convergence, authentication failures and activity gaps report `incomplete`.
-The default budget is 1,000 pages per pass (100 requested rows per page, including
-the terminating empty page); `--max-pages` can increase it up to 10,000. Page
-offsets advance by actual returned rows, handling smaller server page caps.
-
-**Completeness is scoped to the API-visible cycling catalog.** The inspected API
-does not provide a verified cycling count, snapshot token or historical extent
-guarantee. Two matching passes cannot prove that Garmin silently hid or capped
-history, or prevent a later upload. `server_snapshot` is always false and the
-completion basis is explicit in the output. Known truncation/budget exhaustion
-is incomplete; any suspected server history restriction must be checked against
-the private account before calling a live import comprehensive.
-
-## Resume and gaps
+### Synchronization and recovery
 
 ```sh
 garmin-bridge sync --resume
-garmin-bridge sync --resume --max-pages 2000
+garmin-bridge sync
+garmin-bridge sync --since-last
+garmin-bridge sync --since-last --dry-run
+garmin-bridge sync --lookback-days 30
+garmin-bridge sync --start 2025-01-01 --end 2025-01-31
 garmin-bridge sync --full --new-scan
 ```
 
-`sync --resume`, another `sync --full` for an unfinished full import, or plain
-`sync` with unfinished work resumes the existing job and its original cutoff.
-The private journal contains the page offset, pass fingerprints, normalizer and
-schema versions, per-ID metadata, attempts and processing state. Resume first
-handles queued activities, then continues pagination. Reconciliation may revisit
-catalog pages, but already completed unchanged activities are not parsed again.
-Resumed completed items and old activities considered for a daily skip have
-their derived file hashes checked; missing or damaged results are queued again.
-There is no unsupported byte-range resume: an unfinished original is downloaded
-again, never promoted from a temporary file.
+A new store needs `sync --full` before daily sync. Full import enumerates the
+API-visible cycling catalog without a lower date bound. Every job freezes a UTC
+cutoff; activities starting after it are explicitly skipped. Missing time is not
+invented. Two complete catalog passes must agree on in-scope IDs and reviewed
+metadata, with at most three passes per invocation. Every previously observed
+required ID remains required. The default budget is 1,000 pages per pass;
+`--max-pages` allows up to 10,000. Budget exhaustion or non-convergence is incomplete.
 
-Every job separately counts `discovered`, `completed`, `skipped`, `pending`,
-`retry` and `unavailable`. Completed items include confirmed unchanged inputs;
-`updated` and `unchanged` describe their recorded processing outcomes. Skips have
-explicit journal reasons: outside scope, after cutoff, or outside the daily
-recheck window. Unknown activity types, unsupported/corrupt FIT and unavailable
-originals remain gaps rather than silently becoming successful skips.
+Completion requires both converged enumeration and successful processing of all
+required activities. Unavailable/corrupt originals remain explicit gaps. Matching
+passes cannot prove Garmin exposed all historical data: `server_snapshot` is
+always false. Catalog absence never deletes local activities.
 
-The CLI returns at most 20 gaps plus `gap_count` and a private
-`reports/<job-id>/gaps.json` reference containing the full reviewed gap list.
-During a killed/in-progress job the journal remains authoritative; the report
-reference is omitted until a matching report is written. `status` exposes the
-current scan and bounded gaps without networking. Existing completed activities
-remain queryable while gaps are unresolved.
+Resume retains the cutoff, page checkpoints, completed activities, and gaps.
+`--full --new-scan` archives the prior journal and carries unresolved IDs forward.
+Network operations have bounded retries. A failed scan preserves the last usable
+results and successful watermark; disconnected date ranges cannot advance it over
+a gap. Status and scan receipts expose bounded gaps and a logical full-report reference.
 
-Network and rate-limit errors have at most three bridge attempts per operation,
-with 1- and 2-second backoff. Rate-limit exhaustion or rejected authentication
-stops further acquisition; network failures on an individual activity can leave
-other activities complete. A later resume retries transient and unavailable FIT
-items. No automatic background retries run. `--full --new-scan` freezes a new
-cutoff, archives the old journal and carries its unresolved IDs forward; it does
-not discard gaps or cached results. This also supports discovery of new data
-while an older original remains unavailable.
+Daily sync scans the catalog for new IDs, including delayed uploads with old dates.
+Downloads cover new/changed metadata, missing/damaged artifacts, changed processing
+versions, and a recent recheck window (14 days by default). Unchanged decompressed
+FIT content and reviewed metadata avoid redundant parsing. A changed ZIP wrapper
+alone does not create a revision. Content corrections outside the recent window
+with unchanged catalog metadata require an explicit date-range or full recheck.
+Date ranges are inclusive activity-local calendar dates.
 
-## Daily sync and historical review
+`sync --since-last` is a date-range shortcut: start at the end of the local
+contiguous successful watermark minus **one day**, and end today (the host's
+calendar date). It overlaps prior coverage to recheck recent uploads. Disconnected
+later coverage does not move its start forward. Without a watermark it returns
+`no_watermark`; it never starts a full import automatically. It cannot be combined
+with `--start`, `--end`, `--full`, `--resume`, or `--new-scan`. The normal two-pass
+enumeration and failure rules apply; an unfinished job may require `--resume`.
+Use ordinary daily sync to discover delayed uploads outside this date range.
 
-After a complete full import:
+`sync --since-last --dry-run` prints only `{"start":"YYYY-MM-DD","end":"YYYY-MM-DD"}`
+and exits successfully. It uses the same watermark and host-date calculation as a
+real run, without constructing a network client, logging in, taking the bridge
+lock, or changing the store, state, or watermark. A missing watermark still returns
+`no_watermark`; `--dry-run` without `--since-last` is an error. The preview reads
+committed SQLite state and refuses journal/WAL sidecars or WAL-mode databases with
+`busy` instead of performing recovery or creating sidecars. It also returns `busy`
+if the database file or header changes during the read. Coverage may change before
+a later real run.
 
-```sh
-garmin-bridge sync
-garmin-bridge sync --lookback-days 30
-garmin-bridge sync --start 2025-01-01 --end 2025-01-31
-```
-
-Daily sync scans the visible **catalog** to detect new IDs, including delayed
-uploads with old start dates. The inspected API offers no reliable upload-time
-cursor, so catalog enumeration is the intentional network cost; unchanged old
-originals are not routinely downloaded or parsed. Downloads are limited to new
-IDs, changed reviewed metadata, missing/damaged local artifacts, changed normalizer
-versions, and the recent recheck window (default 14 calendar days relative to the
-UTC cutoff date, compared with the activity's local date when available).
-
-For a rechecked activity, `source_digest` hashes the provider/source ID, reviewed
-metadata and decompressed FIT SHA-256. A different ZIP timestamp/container alone
-does not cause parsing. Matching input digest, schema/normalizer version and
-stored artifact hashes skip parsing and preserve the previous result. Revisions
-are published under the same source identity, never as another activity.
-
-There is no verified upstream original-content revision/ETag. Rechecks therefore
-download the original before confirming its content hash. A FIT-only correction
-outside the recent window whose reviewed catalog metadata does not change
-**cannot be discovered reliably** by daily sync. Use an explicit date range to
-force historical rechecks, or `sync --full` for a full audit. Date-range bounds
-are inclusive Garmin local calendar dates; `--start` is required, and `--end`
-defaults to the host's current date. Explicit ranges do not reset older coverage.
-
-## Offline import of a website export
-
-`import-fit` needs no authentication and does not read/write authentication
-files, construct `GarminSource`, contact Garmin, or use Drive. Obtain the original
-FIT or single-FIT ZIP using Garmin's normal website in a separate private
-environment, then place it in an owner-only directory outside Git. The input
-file must be a regular file with `0600` permissions and its immediate parent
-must have `0700` permissions. Symlinks, hardlinks, paths containing `..`, files
-inside this store's `auth` directory, and non-`.fit`/`.zip` suffixes are rejected.
-ZIP member names never become filesystem paths. All existing archive, size,
-ambiguity, cycling-session and CRC checks still apply.
-
-After installing the current reviewed checkout, these are the private-runtime acceptance
-commands. `BRIDGE_FIT` must refer to the privately downloaded file and `BRIDGE_ID`
-must be the activity ID from the Garmin activity page, not a device number or an
-inferred ID. The prompts below keep actual private paths and IDs out of examples:
+### Offline FIT import
 
 ```sh
-umask 077
-export GARMIN_BRIDGE_DATA_DIR="$HOME/.local/share/garmin-connect-bridge-offline"
-install -d -m 700 "$GARMIN_BRIDGE_DATA_DIR" "$HOME/.local/share/garmin-bridge-transfer"
-read -r -p 'Private FIT or ZIP path: ' BRIDGE_FIT
-read -r -p 'Garmin activity ID: ' BRIDGE_ID
-
-garmin-bridge --data-dir "$GARMIN_BRIDGE_DATA_DIR" import-fit \
-  --file "$BRIDGE_FIT" --activity-id "$BRIDGE_ID"
-# Repeat unchanged input: status must be unchanged, with the same file references.
-garmin-bridge --data-dir "$GARMIN_BRIDGE_DATA_DIR" import-fit \
-  --file "$BRIDGE_FIT" --activity-id "$BRIDGE_ID"
+garmin-bridge import-fit --file "$PRIVATE_FIT_OR_ZIP" --activity-id "$ACTIVITY_ID"
 garmin-bridge list --limit 20
-garmin-bridge activity "$BRIDGE_ID"
-
-# Keep this filename new; choose a new path for each later backup.
-BRIDGE_BUNDLE="$HOME/.local/share/garmin-bridge-transfer/offline-import-snapshot-001"
-garmin-bridge backup export --file "$BRIDGE_BUNDLE"
-garmin-bridge backup verify --file "$BRIDGE_BUNDLE"
-# This destination must not exist. Authentication and original FITs are absent.
-BRIDGE_RESTORE="$HOME/.local/share/garmin-connect-bridge-offline-restored"
-garmin-bridge --data-dir "$BRIDGE_RESTORE" backup restore --file "$BRIDGE_BUNDLE"
-garmin-bridge --data-dir "$BRIDGE_RESTORE" list --limit 20
-garmin-bridge --data-dir "$BRIDGE_RESTORE" activity "$BRIDGE_ID"
-garmin-bridge --data-dir "$BRIDGE_RESTORE" import-fit \
-  --file "$BRIDGE_FIT" --activity-id "$BRIDGE_ID"
+garmin-bridge activity "$ACTIVITY_ID"
 ```
 
-The per-file receipt has `status: created|updated|unchanged`, a bounded activity
-summary, approved file references, `api_state_changed: false`, and
-`input: {kind: local_file, activity_id_origin: cli_argument,
-garmin_api_verified: false}`. A newly saved offline summary records
-`provenance.input: local_fit_file`, the same ID origin and verification flag,
-and quality flags `local_file_import`, `missing_api_metadata`, and
-`unverified_activity_id`. No original filename/path, raw bytes or sample arrays
-are printed. The syntactically valid ID is accepted as supplied; offline import
-cannot prove its association with the file or an account. Check it privately.
+Inputs must be private regular `.fit` or single-FIT `.zip` files outside Git and
+authentication directories, with a `0700` parent and `0600` file permissions.
+Import is entirely offline and never reads authentication state. Supply the Garmin
+activity ID yourself; import cannot verify its association with the file/account.
+Local provenance records that limitation. Missing API metadata remains missing.
 
-Missing API metadata stays missing. Only observed FIT session/record values are
-retained; session start may supply UTC. Unambiguous activity `local_timestamp`
-or historical `device_settings` offset evidence can supply local time and UTC
-offset (see the data contract below); an IANA zone is never inferred. Without
-that evidence local time and offset remain null. Missing start time is not
-guessed from records or the host. Garmin
-estimates/settings remain separately labeled. The input digest includes source,
-supplied ID, missing metadata, decompressed FIT SHA-256 and local provenance;
-the parse cache also checks schema/parser version and saved artifact hashes.
-Changing a ZIP name/comment/container does not trigger another parse or record.
+Receipts report `created`, `updated`, or `unchanged`. Changed offline content creates
+an immutable revision. Identical content for an API-derived activity preserves its
+API provenance; differing content or damaged API artifacts returns `import_conflict`.
+Import leaves API coverage, journals, gaps, and watermarks unchanged. An offline-only
+store still needs authentication and `sync --full` before daily API acquisition.
 
-For an existing **offline** ID, changed FIT content creates a new immutable
-revision and atomically replaces its index entry. An existing **API-derived**
-ID is handled conservatively: identical FIT content with intact derived files
-returns `unchanged` and preserves its metadata, provenance, parser version and
-revision. A content difference or damaged API artifacts returns `import_conflict`;
-resolve it with an explicit API recheck when available, or inspect the ID privately.
-No force-overwrite option is provided. A successful later API acquisition verifies
-the source through its normal path and replaces the local provenance, even if
-optional API metadata is absent. Existing originals after backup may be absent;
-reimporting an unchanged offline record can replenish its raw file without parsing.
-
-Offline import changes only the activity map and its referenced files. It leaves
-`covered_ranges`, `pending_ranges`, the computed watermark, `history_initialized`,
-`full_completed_at`, `last_success_at`, `last_attempt_at`, `last_failure`, scan
-offsets, tasks and gaps unchanged. Importing a file for a pending API gap does
-**not** resolve that gap. Its receipt never claims account history is complete.
-An offline-only store has no API job; that also means no API scan was
-completed. Snapshot receipts report counts and validation, not API completeness. Failed imports return a safe error and retain the previous result;
-they do not create or modify API gap reports. Retry the same command after fixing
-the file, permissions or lock contention. Keep originals private for later
-reparsing: portable backups intentionally omit them.
-
-This entry point handles one activity at a time, not whole-account export bundles
-or legacy migrations. When API access later works, an offline-only store still
-requires `auth` followed by `sync --full`; an existing unfinished API job still
-requires `sync --resume`. A previously initialized store may use normal `sync`.
-None of those API commands are implicit in import, queries or restore. This
-change neither diagnoses network restrictions nor integrates with Google Drive.
-
-## Offline derived FIT archives
-
-`sanitize-fit` produces a **“去除显式位置的派生训练FIT”**: a derived training FIT with
-explicit location and identity fields removed. It is **not anonymous**. Original
-timestamps, physiological/training measurements, altitude and historical thresholds
-can still identify or characterize a person. Keep the complete archive private.
-Removed fields cannot be recovered from it; this is not a lossless copy of the
-whole input or a promise that every future training metric can be reconstructed.
-
-These two commands work entirely offline. They do not construct a GarminSource,
-read/write authentication files, open the activity index, change API coverage,
-watermarks, scan/gap state, or change the `backup` format. `--data-dir` (or its
-normal default) is used only to reject an archive destination inside that store
-and an input under its authentication directory. Do not place archives in any
-other account's store or authentication directory either.
-
-Use the installed executable from the intended Python 3.12 environment. For
-example, from the checkout containing that environment:
-
-```sh
-BRIDGE="$PWD/.venv/bin/garmin-bridge"
-umask 077
-FIT_PRIVATE="$HOME/.local/share/garmin-bridge-fit-archives"
-mkdir -p "$FIT_PRIVATE/inbox" "$FIT_PRIVATE/archives"
-chmod 700 "$FIT_PRIVATE" "$FIT_PRIVATE/inbox" "$FIT_PRIVATE/archives"
-
-# Put a copy of the website export in this private inbox separately.
-# Use its actual private path locally; do not paste it or the FIT into a model.
-FIT_INPUT="$FIT_PRIVATE/inbox/input.fit"  # A single-FIT .zip is also accepted.
-chmod 600 "$FIT_INPUT"
-FIT_ARCHIVE="$FIT_PRIVATE/archives/derived-001"  # Must not already exist.
-
-"$BRIDGE" sanitize-fit --file "$FIT_INPUT" --output-dir "$FIT_ARCHIVE"
-"$BRIDGE" verify-fit --source "$FIT_INPUT" --directory "$FIT_ARCHIVE"
-```
-
-Successful commands exit 0 and return only a fixed description, counts, validation
-status and the relative names `derived.fit`, `manifest.json`, `report.json`.
-Errors are fixed codes/messages, exit 2; an interrupt exits 130. No original
-filename/path, input/output hash, decoded value, raw frame or upstream exception
-is printed. The private manifest contains the required SHA-256 values; do not
-paste it into a public issue or model context.
-
-`verify-fit --source` requires the **same original bytes**, including the ZIP wrapper when
-one was supplied. It reads the original and archive without changing either,
-recomputes the projection and manifest, traverses all output definitions/data,
-and re-reads the actual output using both pinned parsers. A stored `verified`
-flag or a matching checksum alone is insufficient. A missing/unreadable `--source`
-fails; it never falls back to another mode. Its receipt has `mode: "with_source"`
-and `source_comparison: {"status":"passed"}`.
-
-If the original is no longer available, explicitly request an archive-only check:
-
-```sh
-"$BRIDGE" verify-fit --archive-only --directory "$FIT_ARCHIVE"
-```
-
-`--archive-only` and `--source` are mutually exclusive; one is required. The
-archive-only mode reads **only** `derived.fit`, `manifest.json`, and `report.json`.
-It rechecks the exact member set, private regular files, canonical closed JSON
-structures and supported versions, output/report SHA-256, document/inventory
-consistency, strict FIT CRC and complete byte consumption. Every physical definition
-and data field is checked against the unchanged policy, including base types,
-array bounds, context and cross-message references. Canonical framing excludes
-unused/redundant definitions and extra payload. Both pinned parsers reread the
-actual approved FIT. Reads are bounded to 64 MiB for FIT, 4 MiB for the manifest,
-and 64 KiB for the report. Historical `validations` flags are required format
-metadata, **not** evidence that the checks passed this time.
-
-Both verification modes return current checks in `checks`. Archive-only success
-returns `mode: "archive_only"`, only observed `output_messages`/`retained_fields`
-counts, and exactly:
-
-```json
-{"source_comparison":{"status":"not_checked","reason":"source_not_provided"}}
-```
-
-Here `status: "verified"` means the selected checks passed. It does **not** claim
-that original values, missing/invalid patterns, message order or retention
-completeness were compared again. Source hashes, source definition/removal counts
-and preservation flags in the historical documents cannot be independently
-confirmed without the original. They are neither reissued as current results nor
-rewritten. Matching unkeyed hashes cannot establish source authenticity: a change
-to approved training values accompanied by consistent CRC/hash updates can pass
-archive-only checks; a full comparison against the original rejects it. Preserve
-the original privately if later preservation comparison is needed. No file is
-automatically deleted or uploaded.
-
-The archive has three fixed members:
-
-| File | Private contents |
-| --- | --- |
-| `derived.fit` | Approved physical fields in original message/field order and byte order, including invalid sentinels. |
-| `manifest.json` | Format/rule/SDK/Profile versions; original-container, extracted-FIT, output and report SHA-256; field-number inventory, counts, fixed reason codes and verification results. |
-| `report.json` | Bounded aggregate counts, verification results and fixed limitations; no sample values. |
-
-The manifest inventories every definition, including unused ones, and every
-data-field occurrence. A definition marked `retained` means its shape is eligible;
-only occurrences passing context/reference checks are actually retained. Summary
-counts refer to data occurrences. Pending-review counts are a subset of removals,
-not additional missing fields. Compressed timestamps supplied by a record header
-are counted as retained logical timestamp occurrences, with the representation
-change reported separately. Rebuilt definition records need not retain the original
-local slot assignments or byte positions.
-Preservation validation flags refer to the approved retained fields, not equality
-of the complete original and derived files.
-
-The complete closed policy, all 152 candidate decisions, physical base types,
-array bounds, scale/offset facts and contextual rules are in
-[FIT_SANITIZE_RULES.md](FIT_SANITIZE_RULES.md). Key limits:
-
-- One activity FIT, one cycling session and at least one retained record are
-  required. Multi-session/multisport files and whole-account exports are unsupported.
-  The same original input ZIP path, member, CRC, size and ambiguity checks apply.
-- 151 core candidates are eligible. `lap 19:40` is deferred because swimming-length
-  context is unsupported. Unknown messages/fields and all developer fields are
-  removed; future SDK recognition grants no new permission. Wrong base types or
-  unsupported array lengths are removed and reported, never coerced.
-- Additional individually reviewed fields retain file type, sport, session/lap
-  indices and counts, activity timing, historical zone configurations, split metrics,
-  device clock/battery context, legacy speed/altitude and power-phase pairs.
-  Rule `1.1.0` adds the reviewed non-identity fields in the normalized FIT detail
-  allowlist. No current settings, inferred timezone name, interpolated data or
-  independently recomputed metrics are written to the derived FIT. Garmin estimates
-  and configuration remain source-reported historical fields, not validated metrics.
-- Documented event headers and reviewed `data`/`data16` contexts have explicit
-  conditions. Gear components are retained only for gear-change events. Course-point
-  indices, opaque payloads and unknown events are removed and reported. Zone records
-  require unique surviving session/lap targets. Dangling indices/counts and ambiguous
-  global zone configurations are removed and reported, without synthesizing replacements.
-- Integers, bitfields, fractional cadence, left/right balance, array order, invalid
-  patterns, signed zero, float bytes, original scale/offset encoding and timestamps
-  are copied exactly. Parser-expanded components are never written as new fields.
-  With `--source`, the verifier compares exact retained bytes, distinguishing absent fields
-  from all-invalid fields even when a parser omits them from its dictionaries.
-- Supported compressed timestamp records omit field 253 from their local definition
-  and have a preceding valid timestamp anchor from an explicitly approved message
-  and field. Unknown-message or mistyped timestamp fields invalidate the anchor;
-  they cannot inject private bytes indirectly into later retained timestamps.
-  The 5-bit offsets/rollovers become
-  explicit timestamps. Missing anchors or definitions also containing timestamp 253
-  are rejected as unsupported/ambiguous. No timestamp is guessed.
-- FIT headers must be 12 or 14 bytes, protocol 1.0/2.0, with an exact data length and
-  strict CRCs (a 14-byte header must have a valid header CRC). Chained FIT files,
-  trailing bytes, malformed/reserved record headers and duplicate fields fail.
-  Input/output FIT and original ZIP limits remain 64 MiB; framing is additionally
-  bounded to 500,000 definition/data messages, 2,000,000 field occurrences including
-  definitions, and 8,192 inventory rows. Oversized input fails without publication.
-
-Inputs are read-only; symlinks, hardlinks, Git paths, input/output aliases, and
-existing destinations are rejected. Archives are `0700`, files `0600`. Publication
-uses private temporary files, fsync and an atomic **no-replace** directory rename
-(`renameat2(RENAME_NOREPLACE)` on Linux; `renamex_np(RENAME_EXCL)` on macOS).
-Concurrent creators cannot replace each other or an empty existing destination.
-An unsupported filesystem fails safely; there is no replace-in-place fallback.
-An ordinary failure cleans the staging directory. A hard process exit can leave
-a private `.fit-pending-*` directory, which `verify-fit` explicitly rejects; it
-may be removed privately after confirming no writer remains. Retry with a new
-archive path. Once publication succeeds, the complete archive is immutable by
-Bridge; verification never repairs or rewrites it.
-
-This archive is separate from Bridge's non-location database snapshot. `backup export`
-does not include original FIT/ZIP **or these derived archives**; `backup restore`
-does not restore them. This task adds no Drive transport or integration.
-
-### Private collection-runtime acceptance (not performed during development)
-
-First install this checkout using the locked Python 3.12 instructions above.
-When offline, provide a private local wheelhouse containing the exact runtime
-and build wheels from the current locks (including the new SDK). After generating
-`.venv/bridge-build.lock` with the installation snippet above:
-
-```sh
-# Set this to a directory already populated with the locked wheels.
-BRIDGE_WHEELHOUSE="$HOME/bridge-wheelhouse"
-.venv/bin/python -m pip install --no-cache-dir --no-index --find-links "$BRIDGE_WHEELHOUSE" \
-  --only-binary=:all: --require-hashes -r requirements.lock -r .venv/bridge-build.lock
-.venv/bin/python -m pip install --no-index --no-deps --no-build-isolation --force-reinstall .
-.venv/bin/python -m pip check
-.venv/bin/garmin-bridge sanitize-fit --help
-.venv/bin/garmin-bridge verify-fit --help
-```
-
-No uv is required for this pip path. A wheelhouse from the prior import-only
-version lacks `garmin-fit-sdk==21.218.0`; offline installation cannot download it.
-Obtain that hash-locked wheel through an approved code/dependency transfer first.
-Always invoke `.venv/bin/garmin-bridge` explicitly to avoid an older CLI on PATH.
-
-In a separate private environment, copy one real website FIT/ZIP into a `0700`
-inbox, keep the source `0600` and run the two commands above with no credentials.
-Locally check source hashes before/after, both exit codes, archive permissions,
-and the manifest's per-field removal/review reasons. Repeat to a second new
-directory and compare derived bytes privately; the same input/rules are
-deterministic. Trying the first destination again must fail and preserve it.
-Validate representative invalid arrays, event contexts and historical zone
-references against the private source. Compare any existing activity index,
-scan/gap files and authentication directory before/after; they must be unchanged.
-Do not publish the real files, manifests, hashes, counts or reports. These real-file
-checks, macOS atomic publication and future downstream-reader compatibility remain
-unverified; this development task uses synthetic inputs only and performs no upload.
-
-## Offline queries and persistence
+### Offline queries and segments
 
 ```sh
 garmin-bridge status
-garmin-bridge list --limit 20
-garmin-bridge list --start 2025-01-01 --end 2025-01-31 --offset 20
-garmin-bridge activity 1001
-```
-
-These commands never log in, download or normalize data. An empty store returns
-zero activities and absent authentication; a missing activity returns a safe
-`not_found` error. List pages contain at most 50 compact summaries. `activity`
-returns a bounded summary, field coverage, quality flags and approved file
-references, not sample arrays. References are relative to the configured private
-root, so output does not disclose the user's home-directory name.
-
-## SQLite primary storage
-
-Fresh CLI stores use SQLite by default. API sync and offline import share the
-same publication function, provenance protections and immutable revision IDs.
-`list`, `activity`, `status`, gap/watermark logic and backup all read that store.
-`storage_version: 1` is independent of activity schema `1.0`, normalizer `1.3.0`
-and segment algorithm `1.0.1`; changing storage does not change metric semantics.
-
-```text
-activities.sqlite                    complete structured primary store
-raw/<sha256>.bin                      private original FIT/ZIP; never a shared artifact
-auth/session.json                    private upstream authentication
-.lock                                POSIX process lock
-```
-
-The four closed tables are `documents` (summaries, stream metadata, catalog and
-journals), `samples` (one row per record/lap/timer event), `segments` and `efforts`.
-Canonical JSON cells preserve integers versus floats, signed zero, null, all
-reviewed fields and numeric precision. `(stream reference, kind, ordinal)` retains
-original order, duplicate timestamps and duplicate samples. There is no resampling
-or deduplication of sample rows. Full-resolution JSON stream files are **not** a
-second required store. `objects/.../*.json` and report references in compatible
-summaries are logical identifiers inside SQLite; they are not filesystem paths.
-`files_available` checks those stored artifacts. `sanitize-fit` remains an explicit,
-independent compatibility export and is never run automatically by sync.
-
-A revision's stream rows, summary and current-index switch commit in one SQLite
-transaction. Originals are saved privately first. The existing job checkpoint
-ordering controls successful coverage; publication failure cannot advance a
-successful watermark. Prior revisions remain queryable by controlled programs.
-The store uses SQLite's FULL synchronous rollback journal and the existing POSIX
-lock: writers are exclusive, readers shared, contention returns `busy`. SQLite
-recovers a killed writer's hot journal before reading the previous commit; this
-is transaction recovery, not migration. Queries on a missing store create nothing.
-Files/directories remain owner-only (`0600`/`0700`), and symlinks/hardlinks are
-rejected, including SQLite sidecars. Originals may remain after failed publication;
-no automatic deletion or retention policy is implemented.
-
-Only a complete scan advances successful coverage. Disconnected explicit ranges
-do not jump a continuous watermark over a gap. A failed rescan preserves the
-last successfully completed watermark and timestamp; the pending journal and
-failure code expose current incompleteness. Missing upstream activities never
-trigger deletion. Offline imports never resolve API gaps or overwrite API provenance.
-
-### Explicit legacy migration
-
-Old bridge stores remain readable without migration or authentication. Normal
-acquisition against one returns `migration_required`. `--legacy-store` explicitly
-selects the old compatibility implementation (including its ZIP backup); it is
-for legacy testing/recovery, not the daily SQLite workflow. It refuses an existing
-SQLite directory; mixing JSON and SQLite stores is rejected instead of silently
-reading only one catalog. Do not operate both stores as competing primary copies after choosing a cutover.
-
-```sh
-# Both destinations must be NEW, outside Git and separate from the old input.
-garmin-bridge migrate --source "$OLD_BRIDGE_STORE" --destination "$NEW_SQLITE_STORE"
-# Or migrate a bridge ZIP backup; no original FIT is required.
-garmin-bridge migrate --bundle "$OLD_BRIDGE_ZIP" --destination "$NEW_SQLITE_STORE"
-garmin-bridge --data-dir "$NEW_SQLITE_STORE" list --limit 5
-garmin-bridge --data-dir "$NEW_SQLITE_STORE" status
-```
-
-Directory migration holds a shared lock on the old store's existing `.lock` without
-creating a source file. An input directory lacking that lock is rejected; use a
-verified legacy bridge ZIP for a standalone backup. All source documents are read
-only, checked against their closed contracts, and compared again before publication.
-The destination is staged privately, checked by canonical-byte round trips and
-cross-document identities/counts/coverage, then atomically renamed without replacement.
-Unknown fields, nested payloads, duplicate JSON keys, corrupt files, missing
-catalogs and inconsistent gap reports fail before publication. Destinations inside
-source stores or snapshots are rejected before creating a staging directory. Source files, timestamps, backups and originals are
-not changed or deleted. A failed/killed migration cannot switch the active store;
-only explicitly changing `--data-dir` selects the new store.
-
-Directory migration includes all complete historical object revisions and archived
-jobs present in the old layout. Legacy ZIPs contain only current revisions, so
-migration cannot recover older revisions absent from the ZIP. Values, nulls/zero,
-source/quality flags, processing versions, gaps, watermarks and current revisions
-are preserved. The gap report is rebuilt from its authoritative job. Raw references
-become null; originals and authentication are neither copied nor required. Keep the
-original old store privately until acceptance. Reimporting the same offline-derived FIT, or an explicit API recheck,
-can replenish a missing original in the new collection store; unavailable originals
-mean new segment matching/reprocessing is unavailable, not invented data.
-
-### Bounded offline windows
-
-SQLite `list` adds storage version, per-activity normalizer version, revision,
-sample count and coverage. `activity` keeps the complete bounded summary and its
-coverage. Neither command emits the full sample stream. For a deliberate window:
-
-```sh
-garmin-bridge window 1001 --start 2025-01-02T00:00:00Z \
-  --end 2025-01-02T00:05:00Z --limit 100 --offset 0
-```
-
-Windows are inclusive UTC instants, at most 600 seconds, with at most 200 samples
-per page. `ordinal` is the original sample position, not a resampled timestamp.
-`next_offset` is null at exhaustion, including offsets beyond the end. Samples with
-unknown timestamps cannot be assigned to a window; their counts remain in activity
-coverage. Output is recursively closed-schema validated. There is no SQL, Python,
-free-text query, arbitrary file-content or location-output endpoint.
-
-## Anonymous segment comparisons
-
-A definition contains only an opaque random ID, reference activity ID, observed
-UTC start/end instants, definition version and matching-algorithm version. It never
-contains a name, location hash, coordinate, polyline or virtual GPS. Select exact
-observed timestamps using a bounded window. For example:
-
-```sh
-garmin-bridge segment define --reference 1001 \
-  --start 2025-01-02T00:00:00Z --end 2025-01-02T00:01:00Z
-# Substitute the returned anonymous ID; run refresh explicitly after collection.
+garmin-bridge list --limit 20 --offset 0
+garmin-bridge activity "$ACTIVITY_ID"
+garmin-bridge window "$ACTIVITY_ID" --start "$UTC_START" --end "$UTC_END" --limit 100
+garmin-bridge segment define --reference "$ACTIVITY_ID" --start "$UTC_START" --end "$UTC_END"
 garmin-bridge segment refresh "$SEGMENT_ID"
 garmin-bridge segment history "$SEGMENT_ID" --limit 20 --offset 0
-# Redefine the same ID explicitly; increments definition version and invalidates its cache.
-garmin-bridge segment define --id "$SEGMENT_ID" --reference 1001 \
-  --start 2025-01-02T00:00:02Z --end 2025-01-02T00:00:58Z
 ```
 
-Only `segment refresh` reads private originals. It validates their hashes and FIT
-framing, then temporarily reads record timestamps/coordinates and optional GPS
-accuracy in process memory. Nothing logs or persists those positions. The existing
-normalizer and sanitizer field policies are unchanged. The matcher returns a
-closed non-location result that is validated before persistence and again on query.
+List pages have at most 50 summaries. Activity queries return summaries, coverage,
+and logical artifact references. Windows are inclusive UTC ranges of at most 600
+seconds, with at most 200 ordered samples per page. Unknown timestamps remain
+unassigned. Queries never authenticate, download, or normalize. Missing stores
+remain absent; missing activities return `not_found`.
 
-Algorithm `1.0.1` is deliberately conservative:
+Segment definitions contain an opaque ID and reference time window. Only explicit
+`segment refresh` reads private original positions, temporarily in process memory.
+Algorithm `1.0.1` requires exact observed boundaries, a directed whole-path match
+within 20 m, adequate samples, and consistent length. Gaps, poor accuracy, reverse
+travel, truncated boundaries, short paths, or exceeded work limits do not establish
+a match. Missing originals return `unavailable`. Elapsed time includes stops;
+HR/power means use observed samples, preserve zero, and report coverage. Results
+are evidence within fixed tolerances, not geographic certification.
 
-- An open reference path needs at least 10 points, 100 m of path and endpoints
-  at least 50 m apart. Exact reference boundary samples are required. Closed loops
-  and short paths return `insufficient_data`.
-- Timestamps must strictly increase; gaps above 15 seconds, spatial jumps above
-  50 m, missing coordinates or supplied GPS accuracy worse than 10 m invalidate
-  the evidence. This version conservatively rejects an activity with such gaps
-  even outside the proposed effort. Missing accuracy has no invented estimate.
-- Start/end proximity selects candidates only. Directed discrete Frechet
-  reachability must cover **both entire ordered paths** within 20 m, and candidate
-  length must be within 15% of reference length. Endpoint proximity or elevation
-  similarity alone never proves a match. No elevation-only fallback exists.
-- Endpoint samples must bracket the reference boundary plane, with only 0.5 m
-  slack for coordinate quantization. A truncated recording that merely starts or
-  ends within the 15 m proximity gate returns `insufficient_data`. No crossing
-  timestamp is interpolated.
-- Contiguous boundary visits select the nearest observed sample; separate visits
-  yield separate, non-overlapping efforts. Reverse travel is rejected. Reference
-  length is capped at 4,096 points and matching at 5,000,000 point-pair checks per
-  activity; exceeding the budget returns `insufficient_data`, never a partial success.
+History reads cached non-location results. Activity/reference revisions and
+segment definition/algorithm versions invalidate stale results. Redefining an ID
+with the same values is idempotent. Older algorithm caches require explicit refresh.
 
-`elapsed_seconds` is end timestamp minus start timestamp, **including stops**.
-No moving-time estimate is manufactured. Distance is the in-memory observed path
-length in metres, not an independently calibrated odometer. Heart-rate/power means
-are arithmetic means of observed samples in the inclusive time window; missing
-values are excluded, true zero retained, and present/total counts accompany them.
-These are explicitly sample-weighted, not time-weighted averages. The boundary
-sampling-interval field describes sampling resolution only, not total GPS error.
-Fixed tolerances cannot distinguish nearby parallel roads or establish geographic
-identity; a match is evidence within the stated tolerance, not route certification.
+Commands return bounded, closed-schema JSON. Exit codes are `0` for success, `1`
+for an incomplete scan, `2` for safe errors, and `130` for interruption. Errors do
+not echo arguments, credentials, upstream bodies, or raw input.
 
-Results record activity/reference revisions, definition/algorithm versions,
-effort ordinal, timing, coverage and a fixed match-quality label. Missing originals
-return `unavailable`; insufficient evidence returns `insufficient_data`; a complete
-usable path with no qualifying match returns `no_match`. Successful/no-match caches
-are reused by revision. New/corrected activities recompute only their own results;
-a changed reference or redefined segment invalidates all affected results. Unavailable
-or insufficient results are retried explicitly so replenished originals can help.
-Repeating an identical definition with the same ID is idempotent. Historical
-algorithm `1.0.0` definitions/results remain portable, but are omitted from current
-history until explicit `refresh` recalculates them with `1.0.1`; a missing original
-produces `unavailable`. Algorithm changes do not alter normalizer/schema versions.
-`history` never reads originals or reruns location matching: stale revisions are
-omitted and `cached_activity_count` versus `activity_count` exposes incomplete cache coverage.
-Pagination is by effort/result row, at most 50, including activities without a match.
-
-## Portable SQLite snapshots and future Drive workflow
-
-Do **not** archive the collection root: it contains location-bearing originals and
-authentication. Export a fresh snapshot directory outside the store:
+### SQLite analysis export
 
 ```sh
-umask 077
-# These are local private paths chosen by the operator.
+garmin-bridge export analysis --file "$PRIVATE_ANALYSIS_SQLITE"
+```
+
+This offline handoff for SQL analysis contains only each activity's **current**
+revision. It needs no authentication or originals. The destination must be a
+private file with an owner-only parent outside Git and outside the source store.
+Close other writers first; destinations with SQLite journal/WAL sidecars are refused.
+An existing destination is replaced atomically only after validation. Success
+returns JSON with `sha256`, byte `size`, activity count, and `verified: true`.
+This is a query artifact, not a restorable store or snapshot.
+
+| Table | Contents |
+| --- | --- |
+| `activities` | One row per activity, flattened summary metrics and `garmin_reported_*` estimates, metric `*_source` columns, normalizer/schema/FIT-field versions, UTC/local activity time, timezone and UTC offset, provenance, counts, coverage and quality JSON. |
+| `records` | `activity_id`, zero-based `ordinal`, `timestamp`, and one numeric/text column per existing record whitelist field. Duplicates and input order are preserved. |
+| `laps` | Base `start`, `end`, `duration`, `distance`; detailed `fit_*` and `garmin_reported_*` columns. Two-element FIT arrays use `_0` and `_1` in original order. |
+| `events` | Detailed `fit_*` columns, including `fit_timestamp`. Historical streams without detailed events retain their timer rows in `timer_type`; unavailable numeric event codes remain NULL. |
+| `messages` | The detailed session at ordinal zero, followed by auxiliary messages in source order; `message` and validated `detail_json` retain field units and `garmin_reported` labels. Historical streams without details have no message rows. |
+| `meta` | One row: export format version, generated UTC time, CLI version, current activity UTC range, contiguous successful coverage dates, all covered/pending ranges, gap count, per-table counts, and `units_json`. No content hashes determine these counts. |
+
+Column units follow the existing normalized contract and are recorded explicitly
+as `meta.units_json[table][column]`; JSON detail quantities carry their own units.
+Numeric measurements use SQLite REAL, counts and ordinals INTEGER, and identifiers
+and ISO timestamps TEXT. Tables use SQLite STRICT typing (SQLite 3.37+).
+IDs remain text to avoid integer overflow. SQL NULL means
+missing or invalid; no values are interpolated. `garmin_reported_*` values remain
+Garmin estimates. The existing approved rider-posture fields such as
+`avg_power_position` describe riding posture, not geographic position.
+
+Identity-enabled **current** revisions are refused with `analysis_identity`, even
+if no serial/profile value was present. Reimport/recheck with identity retention
+off before exporting. Older identity-enabled revisions stay private in the source
+store and are not exported. No location fields, identity fields, raw references,
+revision hashes, journals, or segment caches are copied. Measurements and timestamps
+remain personal data; keep the analysis file private.
+
+Export builds a fresh temporary SQLite file in the destination directory, validates
+the full current source contracts, then checks `PRAGMA integrity_check`, foreign
+keys, the exact table/column whitelist, JSON contracts with identity disabled, and
+per-activity row counts and ordinals before atomic rename. An independent denylist
+also checks every column name and every nested `detail_json` key for location and
+identity names, including prefixed/suffixed tokens, camelCase and separator
+variants; approved power/cadence posture and sensor-position fields remain allowed.
+The file and destination directory are flushed before success; a directory-flush failure restores the prior
+destination. Failed construction or validation preserves the old destination and
+removes staging files. A hard kill can leave private `.analysis-*` staging or
+recovery links; remove those only after all exporters have exited. It never
+publishes a partial target. Readers with the previous file open can finish reading
+that version.
+
+### Private SQLite snapshots
+
+```sh
 garmin-bridge snapshot export --directory "$NEW_SNAPSHOT_DIRECTORY"
 garmin-bridge snapshot verify --directory "$NEW_SNAPSHOT_DIRECTORY"
-# Equivalent for a SQLite source: backup export --file "$NEW_SNAPSHOT_DIRECTORY"
+garmin-bridge --data-dir "$NEW_STORE" snapshot restore --directory "$NEW_SNAPSHOT_DIRECTORY"
 ```
 
-The snapshot contains exactly `activities.sqlite` and `manifest.json`. It includes
-all structured revisions, current/archived scan journals, gap state, segment
-definitions and cached efforts. It omits raw FIT/ZIP, authentication, private
-absolute paths and raw references. The manifest records byte size, SHA-256,
-storage/schema/normalizer/algorithm versions, current-activity and total revision/
-record/lap/timer counts, the current activity time range and full current gap list.
-Manifest format `2` also records `fit_fields_versions`, `fit_counts` (detailed events,
-auxiliary messages, sessions and identity-enabled revisions), and `identity_included`.
-The latter covers **all revisions**, including historical opt-in revisions after the
-current activity has been reimported with identity disabled. Format `1` snapshots
-remain verifiable/restorable with their original closed contract.
-A verified snapshot can still contain incomplete API history; consult gaps/status.
+Snapshot is a private backup tool. A snapshot contains exactly `activities.sqlite`
+and `manifest.json` (manifest format `2`). It preserves every structured revision,
+current/archived scan journal, gap state, segment definition, and cached effort.
+It excludes authentication, original FIT/ZIP files, and raw-file references.
+`backup export|verify|restore --file DIRECTORY` is an alias for the same SQLite path.
+Destinations must be new and outside the source directory.
 
-Export validates every document, row, relation and contract, rebuilds a clean database
-to exclude stale/free-page payload, and uses **SQLite's backup API** for the final
-self-contained file. It never copies a live main file or depends on WAL/SHM. Verification
-checks the exact table schemas, SQLite integrity, every nested contract, hashes,
-counts, coverage, revision links and canonical physical encoding. Effort timestamps,
-non-overlap, observed sample counts, means and sampling intervals are also checked
-against the referenced stored revisions. These checks cannot re-prove the original
-GPS match or authenticate an untrusted sender without the private original.
-Hidden deleted-page content, trailing bytes, unknown tables/columns/triggers and rehashed private-field
-injections are rejected. The creator SQLite 3.x library-version header is validated
-separately to permit transfer between SQLite 3.x runtimes. Other physical encoding
-changes fail closed and may require a future storage-format version.
+Export validates every document, stream row, and relation, builds one clean logical
+copy, and uses SQLite's backup API to produce an independent file. Verification
+checks SHA-256, size, `PRAGMA integrity_check`, the exact schema whitelist, manifest
+counts/versions, control documents, summaries, revision links/counts, and contract
+spot checks. It checks first/middle/last record and event rows per stream, with
+lap/message context retained.
+It does not rebuild the database or require a canonical physical byte layout.
+Checksums detect corruption; these checks do not authenticate an untrusted sender
+or certify unused pages/trailing bytes as free of private content. Keep backups private.
 
-The verified directory is atomically published with no replacement. Existing files
-or directories are refused, even when empty. Prior snapshots are retained; there is
-no implicit `latest` pointer update. Any future connector should publish/update its
-reference only after this verification succeeds. Snapshot and restore failures leave
-existing data untouched; a hard kill may leave a private hidden staging directory,
-which is never a published result. Automatic cleanup of such remnants is not provided.
+Publication uses an atomic no-replace directory rename. Failed export/restore never
+replaces an existing destination. A hard kill can leave an unpublished private
+staging directory; retry to the intended new destination after the writer exits.
+Restore validates all documents while copying into a fresh store. It needs neither
+authentication nor originals. Reimport/recheck can replenish missing originals;
+new segment matching and reparsing require them. Damaged immutable SQLite revisions
+require recovery from a known-good snapshot; sync does not overwrite historical rows. A verified backup can contain
+incomplete API history: consult status and gaps.
 
-A collection runner can run `sync`, explicitly refresh each configured segment,
-export/verify a new snapshot, and upload its **two files** through its existing private
-Drive connector. After download, preserve `0700` directory / `0600` file permissions:
+## Data and privacy boundaries
 
-```sh
-garmin-bridge snapshot verify --directory "$DOWNLOADED_SNAPSHOT"
-# Queries may read the immutable snapshot directly, without creating a lock file in it.
-garmin-bridge --data-dir "$DOWNLOADED_SNAPSHOT" list --limit 5
-# Optional recovery into a NEW collection/query store, without auth or originals.
-garmin-bridge --data-dir "$NEW_RESTORED_STORE" snapshot restore \
-  --directory "$DOWNLOADED_SNAPSHOT"
-```
+The primary store is `activities.sqlite`, storage/user version **1**, activity
+schema **1.0**, normalizer **1.3.0**. Existing SQLite stores remain directly usable
+without migration or schema changes. Historical stream shapes and immutable
+revisions remain readable. The four tables are `documents`, `samples`, `segments`,
+and `efforts`; JSON payloads preserve numeric types, signed zero, nulls, and precision.
+`(name, kind, ordinal)` preserves sample order and duplicates. Artifact references
+such as `objects/.../streams.json` are logical SQLite identifiers, not files.
 
-`backup verify --file` recognizes old ZIPs and SQLite directories; `backup restore
---file` restores SQLite or explicitly migrates a verified legacy ZIP to SQLite.
-Legacy ZIP exports remain available for legacy stores, but contain neither
-historical revisions nor segment results; use SQLite snapshots for daily work. Checksums detect corruption, not authenticity of
-an untrusted sender. Treat all physiological data and timestamps as private even
-without coordinates; this is not personal-data anonymization or encryption.
+Stream rows, summaries, and current-index switches commit in one transaction.
+SQLite uses FULL synchronous rollback journals and POSIX process locks; contention
+returns `busy`. Normal reads trust stored documents, retaining row-order and size
+checks. Writes and exports validate full contracts; CLI output remains independently
+validated. The catalog and each requested stream are materialized in memory. The
+database limit is 16 GiB; this is not an unbounded-history performance guarantee.
 
-No Google OAuth/Drive SDK, hosted MCP, tunnel, resident service, scheduling or cloud
-deployment is added. Remote collection and analysis clients are not configured
-here. Downloading this SQLite artifact and executing queries in an external
-analysis environment have **not** been live-validated. No real account, original,
-transfer or true legacy migration was used during development.
+The normalized field allowlist is [fit_fields.py](src/garmin_bridge/fit_fields.py).
+Summary metrics, units, sources, and fallback behavior are fixed. Detailed session,
+lap, event, and auxiliary fields have `fit_fields_version: "1.0"`. Absent fields
+stay absent; FIT invalid values become null; arrays retain order and null slots.
+There is no resampling, interpolation, clamping, or invented sensor data. Garmin
+estimates and historical settings remain labelled `garmin_reported`, not independent
+measurements. Cadence consistency flags do not correct or discard observations.
 
-The SQLite file is bounded at 16 GiB; per-activity parser limits still apply.
-The catalog/journal and one activity stream are currently materialized in memory;
-this is not an unbounded-history performance claim. Snapshot validation uses extra
-space for clean copies and is intentionally more expensive than ordinary queries.
+Local time uses only unambiguous historical file evidence when API time is absent.
+No IANA timezone is inferred; `utc_offset` alone is not a timezone. Compressed FIT
+timestamps require an approved standard anchor. Unknown/developer fields cannot
+supply it. Unreviewed fields and arbitrary nested/free-text payloads are excluded.
 
-## Data contract
+Identity retention is default-off. `sync` and `import-fit` accept
+`--include-fit-identity` for reviewed serial/profile fields only. Positions remain
+excluded. Sport labels use a closed vocabulary; opt-in friendly names are bounded.
+Changing this option creates/reuses an immutable revision and requeues affected
+work on resume. Turning it off does not erase older revisions; snapshots explicitly
+declare identity retained anywhere in their history. Such data must remain private.
 
-Version the output schema. Include the provider, source activity ID, source
-digest, acquisition time, activity time and time zone, units, field coverage,
-quality flags, and normalizer version.
+Original archives are read in memory without extracting supplied paths. Ambiguous
+archives, unsafe paths, bad FIT framing/CRC, multi-session/non-cycling inputs,
+inputs above 64 MiB, and excessive expansion are rejected. Parser limits are
+500,000 records, 10,000 laps, 100,000 events, and 100,000 auxiliary messages.
 
-Normalizer **`1.3.0`** extends the reviewed FIT projection. The outer activity and
-control schema remains `1.0`; the additive stream detail has its own required
-`fit_fields_version: "1.0"`. Historical streams without that key retain their exact
-old shape. The validators accept both closed variants, never arbitrary extra keys.
-The existing **12 summary metrics and five `garmin_reported` quantities are
-unchanged**, including their sources, units and fallback behavior.
+After raw deduplication, new originals are stored as the decompressed FIT file at
+`raw/<sha256>.bin`, named by the SHA-256 of those FIT bytes. Garmin's ZIP wrapper
+is not retained for new objects; different wrappers and activities with identical
+FIT content share one object. Existing raw references still verify against their
+stored byte hash and accept either FIT or ZIP content, so existing ZIP references
+remain readable. There is no migration or deletion of old objects;
+unchanged existing references and all immutable revisions remain readable.
 
-| Stream member | Reviewed content |
-| --- | --- |
-| `records` / `units` / summary `coverage` | Existing full-resolution fields plus `left_torque_effectiveness`, `right_torque_effectiveness`, `left_pedal_smoothness`, `right_pedal_smoothness`, `combined_pedal_smoothness` (%) and `accumulated_power` (FIT accumulated watts, **not joules**). |
-| `session` | A typed FIT detail object containing observed session fields. |
-| `laps[].fit` | The same typed detail structure for each lap, alongside unchanged `start`, `end`, `duration`, `distance` and `lap_units`. |
-| `events` | Ordered documented event headers and explicitly reviewed payloads, including gear changes. |
-| `timer_events` | The existing start/stop-only compatibility view; `timer_event_count` still counts that view. |
-| `messages` | Ordered `time_in_zone`, `split`, `split_summary`, `activity`, `device_settings`, `zones_target`, `sport`, `training_settings`, `device_info`, `device_aux_battery_info`, `file_id`, and `file_creator` detail. Reviewed `user_profile` fields require identity opt-in. |
+This public repository contains only code, documentation, and fixtures generated
+from invented constants. Never add real activity/health data, original exports,
+credentials, account/browser state, or live request recordings. Partial redaction
+is not a synthetic fixture. Keep authentication and location-bearing originals
+outside the checkout; never archive the collection root for sharing. Physiological
+measurements and timestamps remain personal data even without coordinates.
 
-Each detail object is exactly `{message, fields, garmin_reported}`. Each present
-field is `{value, unit}`. Absent detail fields are omitted; physically present FIT
-invalids become null. Arrays preserve order, zero and null slots. Pair arrays
-(power phases and posture-indexed power/cadence) require two entries; zone arrays
-allow 1–32 and device clock arrays 1–8. Enum and bitfield units are `FIT:<type>` and
-values retain numeric Profile codes; phase units are degrees. Posture and pedal
-phase fields describe the rider/pedal, not geographic position. Unreviewed fields,
-wrong wire types, unsupported shapes and all developer fields are omitted.
-The literal table in [fit_fields.py](src/garmin_bridge/fit_fields.py) is the complete
-normalized detail allowlist, with physical IDs, types, scales and output units.
-SDK recognition alone never adds permission. The pinned fitdecode Profile labels
-some newer SDK-documented `split_summary` fields internally as `unknown_*` (including
-313:1 sport and 313:25 average power). Only the reviewed numeric IDs and exact wire
-types in the literal table are mapped to their documented names; those internal
-parser labels and all unreviewed unknown fields are never stored.
-
-Session/lap detail includes average torque effectiveness and pedal smoothness,
-power-phase and phase-peak pairs, left/right balance as the original FIT bitfield,
-posture-indexed average/maximum power and cadence, fractional cadence, temperature,
-VAM (m/s per Profile), total work (J), respiration (breaths/min), calories (kcal),
-elapsed time (s), cycling strokes, and sport/sub-sport context. Session adds lap
-count, intensity factor and training load. Lap adds average/maximum HR, power,
-cadence and speed, ascent/descent and lap trigger. Enhanced speed takes precedence
-for the detail's `avg_speed`/`max_speed` as it does for the summary; the explicitly
-present enhanced field remains available too. Fractional session/lap cadence is
-stored separately, without changing the 12-item summary's integer cadence.
-`total_strokes` is the documented `total_cycles` subfield when that message declares
-cycling; without the sport context the base `total_cycles` remains labelled cycles.
-
-The pinned Profile **does not define lap** `intensity_factor`, `training_load_peak`,
-`enhanced_min_respiration_rate`, or `sport_profile_name`. Those are retained for
-sessions where documented and present, never fabricated on laps or mapped from an
-`unknown_*` field. Session minimum enhanced respiration follows its documented
-hundredths scale and the enhanced respiration family unit. The existing summary's
-Garmin estimates, plus detail normalized power, intensity factor, training stress,
-training effect, threshold power and training load, remain in `garmin_reported`.
-Historical configuration is file evidence, not a current athlete profile or an
-independently validated measurement.
-
-All documented event IDs in the pinned Profile have a closed header allowlist.
-`event`, `event_type`, `event_group` and timestamp are retained; unknown IDs are
-excluded. Payloads remain raw, labelled `FIT:event_data`; their event code supplies
-the subfield meaning and scale. Timers, gear changes, rider position, battery,
-pace/HR/speed/cadence/power/duration alerts, equipment state, sport-point scores,
-communication timeout, auto-activity duration, dive alert and radar alert have
-reviewed payload contexts. Course-point indices and other opaque payloads are
-excluded. Gear changes expose `gear_change_data` and the four gear components;
-explicit physical components take precedence over packed-data expansion. The
-sanitizer preserves only physical components and never synthesizes new fields.
-Zone records require a unique surviving session/lap index; ambiguous global zone
-configuration and dangling zone references are omitted.
-
-Local-time filling uses only unambiguous file evidence: paired UTC/local activity
-timestamps, the active `time_zone_offset`, or active `time_offset - utc_offset`
-with FIT unsigned wrapping. `utc_offset` alone is a system-clock correction,
-**not a timezone offset**. Conflicting offsets, missing start time, invalid active
-indices and offsets outside ±14 hours do not fill local time. A known file offset
-is applied to the observed session start; this does not establish a timezone name
-or prove that an offset stayed constant across a DST change during the activity.
-Existing API local time/offset is preserved. Relative FIT system times below the
-Profile's UTC timestamp threshold are not relabelled as absolute UTC.
-
-Normalization checks the compressed timestamp clock independently of fitdecode.
-Only approved standard timestamp fields with the exact wire type and size can
-anchor it. Unknown, mistyped or invalid standard timestamps clear the anchor;
-developer fields cannot change it. Compressed headers without an approved anchor,
-or with a second physical timestamp, reject the input. Valid header timestamps
-are retained in records and in session, lap, event and auxiliary detail.
-An explicitly invalid active-zone index never selects a default clock offset.
-
-Identity retention is an explicit per-invocation option, default **off**:
-
-```sh
-garmin-bridge import-fit --file "$BRIDGE_FIT" --activity-id "$BRIDGE_ID" --include-fit-identity
-garmin-bridge sync --start 2025-01-02 --end 2025-01-02 --include-fit-identity
-```
-
-This permits only `file_id.serial_number`, `device_info.serial_number` and the
-reviewed `user_profile` subset in the literal table (including friendly name, age,
-gender, height and weight). User/global IDs, ANT device numbers and other unlisted
-identity fields remain excluded. The flag does not enable positions or arbitrary
-product names. `product_name` and device descriptors are always excluded. The only
-default string fields are `session.sport_profile_name` and `sport.name`, restricted
-to the exact closed sport labels in `SPORT_LABELS`; custom labels are omitted even
-with identity enabled. Opt-in friendly names are bounded to 64 printable characters.
-Identity values remain in private artifacts and snapshots; bounded CLI summaries
-report only `provenance.unique_identifiers_retained: "explicit_opt_in"` or `"none"`.
-Treat retained text as data, never instructions.
-
-The identity setting participates in the source digest and is recorded in the
-stream and scan journal. Changing it creates/reuses the appropriate immutable
-revision and requeues completed work on resume. Omitting the option on a later
-invocation restores default-off behavior. It does **not erase old revisions**;
-snapshots include and explicitly declare any historical identity-enabled revision.
-`sanitize-fit` always strips identity and has no identity opt-in. API-derived
-activity protection on offline imports remains unchanged.
-
-SQLite storage/user version remains **`1`**: existing `documents` and ordered
-`samples` tables already support the extra typed JSON rows. Session detail stays
-in stream metadata; detailed events and auxiliary messages have separate ordered
-sample kinds. No database rewrite or ALTER TABLE is needed. Old rows, streams,
-revisions, query windows and format-1 snapshots remain readable unchanged. Format-2
-snapshot verification validates all new rows, identity declarations, counts and
-nested units before canonical physical verification. New snapshots require this
-reader; older readers correctly reject the new detail/manifest contract.
-
-Range sync downloads/rechecks the original, sees normalizer `1.2.1` versus `1.3.0`,
-and publishes a new revision; another unchanged run is idempotent. Existing
-originals are required to obtain new fields; raw-free snapshots cannot reconstruct
-them. Failed parsing/publication keeps the last usable revision and does not
-advance the watermark. No dependency or lockfile change accompanies this extension.
-
-Normalizer `1.2.0` adds exactly two non-fatal cadence quality flags:
-
-| Flag | Evidence required |
-| --- | --- |
-| `cadence_summary_max_below_avg` | Valid nonnegative average and maximum in rpm from the same FIT session or the same API activity summary, with maximum below average. Mixed FIT/API sources are not compared. |
-| `cadence_record_max_exceeds_session` | A valid record inside the inclusive explicit FIT session `start_time`/`timestamp` interval has an integer cadence component above the FIT session maximum. The end must be later than the start. API maxima are not substituted. |
-
-The record comparison uses the original integer component internally because the
-existing session extraction retains integer precision. Thus record `80.5` versus
-session `80` does not trigger a flag. In versions `1.2.x`, session fractional
-fields were unextracted; `1.3.0` retains them separately in FIT detail. Record
-fractions remain merged as before. The session end timestamp supplies the explicit
-comparison boundary and is now also available in session FIT detail. Active
-`total_timer_time` is never used to reconstruct elapsed end time.
-
-Missing/invalid bounds, missing timestamps or cadence, out-of-range records, and
-API-only maxima provide no deterministic record/session judgment. A missing or
-partial stream cannot establish that a larger session maximum is wrong. Even
-with partial coverage, one valid in-range integer exceedance supplies positive
-evidence; no minimum sample count or fixed rpm threshold diagnoses sensor error.
-A flag is a consistency hint, not a rejection or correction: all original values,
-units, sources, nulls, zeros, coverage and other flags remain unchanged. Isolated
-and consecutive high points are preserved without clamping, filtering, filling,
-overflow guesses or adding 256.
-
-Normalizer `1.2.1` excludes negative session maxima and negative record integer
-components from comparison evidence, while retaining those source values and
-coverage unchanged. Mixed negative/valid records still retain valid evidence.
-This patch version also invalidates `1.2.0` offline parse caches.
-
-The closed quality vocabulary accepts these two names, not arbitrary flags or
-fields. Existing `1.0.0`/`1.1.0`/`1.2.0`/`1.2.1` summaries and backups remain readable.
-Reimporting an old offline cache with original FIT bytes creates a new immutable
-`1.3.0` revision; the next identical import is unchanged. API-source protection still
-applies: offline import cannot upgrade or overwrite an existing API record.
-
-Keep Garmin-reported estimates and settings in a separate namespace. Values
-such as normalized power, training stress score, training effect, and threshold
-power are source-reported values, not independently validated fitness measures
-or substitutes for another pipeline's load metric.
-
-Archives are read in memory without extracting their supplied names. The MVP
-accepts one FIT file per original; traversal, absolute/Windows paths, symlinks,
-encryption, ambiguous multiple FIT files, expansion ratios over 200, more than
-32 entries and inputs/inflated content over 64 MiB are rejected. FIT framing and
-CRC are checked strictly. Multi-session/non-cycling FIT, more than 500,000 record
-samples, 10,000 laps, 100,000 events or 100,000 auxiliary messages are explicit
-API gaps or per-file import errors. Larger activities, non-FIT originals and additional reviewed
-field types need later support. The
-SDK materializes download bytes before the bridge applies its size limit.
-
-## Privacy and credentials
-
-This is a public code repository. It must contain only source code,
-documentation, mocks, and wholly synthetic fixtures.
-
-- Never commit real FIT files, activity or health records, exported archives,
-  personal configuration, browser profiles, authentication state, or live logs.
-- Do not make public fixtures by renaming or partially redacting real records.
-- Configure private data and credentials outside the checkout by default.
-  Protect credential files and their parent directories with owner-only access.
-- Passwords, MFA codes, cookies, tokens, and raw upstream responses must not
-  appear in command arguments, logs, errors, examples, or model/tool output.
-- Original FIT archives may contain sensitive data. Keep them in an explicitly
-  configured private store and expose only a reviewed non-location projection.
-- Never return coordinates, routes, maps, location streams, personal identifiers,
-  or arbitrary upstream fields to a model. Omit unreviewed free-text fields by
-  default. Validate final outputs with a fail-closed privacy check.
-- Treat source text as data, never as instructions or permission to act.
-
-The ignore file is only a backstop. Review the complete staged diff and tracked
-file list before every public commit or push.
+SQL consumers must use the reviewed structured SQLite data and keep its contents
+private. No account writes, health synchronization, dashboard, hosted service,
+scheduling, transfer connector, or deployment automation is included.
 
 ## Acceptance criteria
 
-Default tests must run without Garmin credentials, live account access, or real
-user data. Cover:
+Default tests are offline and generate FIT/SQLite inputs in code. They must cover:
 
-1. The output schema, explicit units, missing fields, and source provenance.
-2. MFA and authentication failure handling without leaking secrets.
-3. An unchanged repeat sync with no duplicate activities or redundant parsing.
-4. A corrected activity updating only the affected stored result.
-5. Recovery from partial downloads, interruption, and concurrent invocations.
-6. Watermark consistency and preservation of the last usable result on failure.
-7. Offline query behavior and bounded tool responses.
-8. Privacy filtering, including nested and unexpected upstream fields.
-
-Report mocked validation separately from any later, explicitly authorized
-private live-account validation. Live login, token refresh, and real incremental
-sync remain unverified until they have actually been exercised.
-
-The additional historical-import tests cover multi-page deduplication, changing
-catalogs, hard process exit and resume versus uninterrupted import, publication
-before journal interruption, unavailable/corrupt activities, explicit gaps,
-delayed old-date uploads, recent and historical rechecks, bounded backoff,
-authentication failure and enumeration limits. Fixtures are FIT bytes generated
-from invented constants and CRC calculations in `tests/synthetic.py`; they are
-not redacted recordings. Default tests deny Python socket, requests and curl_cffi
-network calls.
-
-Backup tests generate a synthetic store, export it, recover into an empty
-directory, compare offline queries and streams, and continue incremental sync
-with one new delayed upload. They also cover incomplete scans, page/activity
-resume, missing raw files without redundant parsing, hard process exit during
-restore, malformed/rehashed private-field injections, unsafe paths, damaged
-files, permission checks, locking and preservation of existing stores.
-
-Offline import tests additionally forbid authentication construction and auth
-file reads/writes, import FIT and ZIP without credentials, check repeat/wrapper
-idempotence and revision conflicts, and compare all API index fields plus scan
-and gap file bytes/mtime before and after import. They cover value-access traps
-for forbidden FIT fields, malformed files, interrupted publication, concurrent
-imports, local-only and incomplete-API backup recovery, and subsequent mocked
-API full/resume/incremental synchronization.
-
-## Verification and remaining private validation
-
-Non-location FIT extension (`1.3.0`), 2026-10-29: **1,342 offline synthetic tests
-passed** (705 existing cases retained and 637 added). `uv run ruff check`,
-`uv run ruff format --check` (43 Python files), and `git diff --check` passed.
-Commands used `UV_OFFLINE=1` and a task-specific temporary uv cache. No dependency,
-lockfile, CI, deployment or account change was made.
-
-New cases compare every approved detail field with the pinned official Profile,
-parse invented binary FIT, and reread sanitizer output with both parsers. They
-cover all auxiliary message types through SQLite/snapshot restore, arrays/nulls/
-zeros/units, estimates, gear and other events, default-off identity and opt-in,
-closed labels, position/unknown/developer exclusion, local-time evidence, policy
-changes on resume, version-triggered revisions, idempotence, failure watermarks,
-and rehashed snapshot injections. Actual legacy stream shapes and format-1 SQLite
-snapshots remain readable and can acquire new revisions without migration.
-Historical sanitizer rule-1.0.0 archives verify under their original policy.
-No real FIT, database, credential, Garmin account or running deployment was used;
-live compatibility remains unverified.
-
-The follow-up review added 27 adversarial cases. Fixes cover truncated segment
-boundaries; effort/sample consistency; algorithm cache invalidation and idempotent
-definitions; source reversion to immutable revisions and downloaded FIT-hash checks; missing catalogs; gap-report
-consistency; source/destination overlap; mixed backend selection; strict manifest
-types; historical local provenance; and avoiding reads of unreviewed FIT values.
-A snapshot generated by the previous delivered wheel was also verified and restored:
-old algorithm caches stay hidden until refreshed, and absent originals yield
-`unavailable`. No schema/normalizer change or dependency addition was needed.
-
-
-SQLite/segment implementation, 2026-10-29, macOS / CPython 3.12.5 / SQLite 3.53.2:
-**705 offline synthetic tests passed** (640 existing tests plus 65 new cases).
-The existing CLI-test helper explicitly selects legacy compatibility so all old
-assertions still exercise their original file contracts; separate tests exercise
-the default SQLite CLI. No old assertions were removed. Ruff and formatting passed
-for all 40 Python files; `git diff --check` passed. No dependency or lockfile change
-was needed. Source tests used `PYTHONPATH=src` because the local editable-install
-path hook was not recognized in this execution environment.
-
-New checks cover full-resolution fidelity, signed zero/null/precision, duplicate
-sample timestamps/order, immutable revisions, source protection, transaction rollback
-and hard process exit, lock contention, exact legacy migration, old ZIP compatibility,
-completed/incomplete API progress and resume, raw-free restore, default CLI routing,
-bounded pagination, corrupted/rehashed nested/table/column/free-page/trailing-content
-injections, immutable snapshot queries, repeated segment efforts, reverse/detour/gap
-rejection, stops in elapsed time and revision/definition cache invalidation. These
-results establish local synthetic behavior only. Live account/transfer/analysis-client behavior and
-cross-platform runtime transfer remain separate acceptance work.
-
-
-Development checks:
+- Closed field contracts, explicit units/provenance, nulls/zero, and privacy filtering,
+  including unknown, nested, developer, location, and identity fields.
+- MFA/session failures and safe diagnostics without leaking input or credentials.
+- Idempotent sync/import, ZIP-wrapper changes, immutable revisions, source reversion,
+  and protection of API provenance from offline replacement.
+- Two-pass catalog consistency, pagination, delayed uploads, partial failures,
+  interruption/resume, gaps, and failure-does-not-advance-watermark.
+- Atomic SQLite publication/recovery, locking, permissions, missing data, bounded
+  offline queries, and continued use of storage version 1 with normalizer 1.3.0.
+- Snapshot checksum/integrity/schema checks, contract spot checks, full validation
+  on export/restore, revision/progress preservation, and incremental sync after restore.
+- Current-only typed analysis export, identity/location exclusion, atomic overwrite
+  and failure preservation, SQL units/provenance, and legacy stream support.
+- `--since-last` overlap and no-watermark errors, a dry-run without clients, bridge
+  locks or writes, successful watermark preservation on failure, decompressed raw
+  deduplication, and existing ZIP reference readability.
+- Anonymous segment matching, insufficient/unavailable evidence, cached-result
+  invalidation, and exclusion of locations from persisted/output results.
 
 ```sh
-uv sync --frozen
-uv run --frozen python -m pytest
-uv run --frozen ruff check src tests
-uv run --frozen ruff format --check src tests
-uv build --no-build-isolation
+uv run --frozen pytest
+uv run --frozen ruff check
+uv run --frozen ruff format --check
+git diff --check
 ```
 
-Cadence eligibility follow-up (`1.2.1`), 2026-10-19, CPython 3.12.14:
-**640 passed** in the full offline suite. Eleven new signed-field synthetic FIT
-cases cover negative maxima/records, mixed records, valid exceedances, zeros and
-summary eligibility; one additional historical-cache case covers `1.2.0`.
-Before the fix, four signed-field cases reproduced the false flag. Source values,
-coverage, other flags and streams are compared unchanged. Frozen Python 3.12
-installation, Ruff, formatting (32 files), wheel/sdist build and diff checks all
-passed again using command-local `UV_CACHE_DIR=/tmp/cadence-uv-cache`; builds
-went to `/tmp/cadence-fix-dist`. No original tests were removed or skipped.
-
-Actual cadence-quality verification on 2026-10-19, Linux x86_64, CPython 3.12.14:
-
-- `UV_CACHE_DIR=/tmp/cadence-uv-cache uv sync --frozen --python 3.12`: passed.
-- `uv run --frozen python -m pytest --tb=short`: **628 passed**, including 34
-  new synthetic cadence cases and all 594 pre-existing tests; none skipped.
-- `uv run --frozen ruff check src tests`, `uv run --frozen ruff format --check
-  src tests`, and `git diff --check`: passed (32 Python files formatted).
-- `uv build --no-build-isolation --out-dir /tmp/cadence-dist`: wheel and sdist
-  built. All uv checks used a command-local temporary cache, no persistent change.
-- Tests cover precision, absent/invalid fractions and integer components, zeros,
-  mixed sources, missing/reversed/empty bounds, out-of-range records, partial
-  coverage, high points, sanitization/import/backup recovery, historical versions,
-  immutable cache replacement, API-source protection and privacy rejection.
-
-Comparisons are intentionally skipped where no reliable temporal or source
-comparison exists, as specified above; missing samples do not establish a full
-observed maximum. This is synthetic validation, with no real activity or Garmin
-account access. Existing sanitizer policy, dependencies and AGENTS.md are unchanged.
-
-Actual derived-FIT verification on 2026-10-18, Linux x86_64, CPython 3.12.14:
-
-| Check actually run | Result |
-| --- | --- |
-| `.venv/bin/python -m pytest --tb=short` | **594 passed**: 365 derived-FIT cases, 58 archive-only cases and all 171 existing API/auth/import/privacy/backup cases; offline and synthetic. |
-| `.venv/bin/ruff check src tests`; `.venv/bin/ruff format --check src tests`; `git diff --check` | Passed; all 31 Python files formatted. |
-| `uv lock --check --offline`; before/after lock comparison | Consistent; only `garmin-fit-sdk==21.218.0` added, all existing versions unchanged. |
-| `.venv/bin/python -m hatchling build -t wheel -t sdist -d /tmp/garmin-bridge-archive-only-dist` | Built locally; 22 wheel members and 39 source-package members checked against explicit allowlists. No FIT, runtime data, credentials or vendored SDK fixtures. |
-| Python 3.12 fresh pip venv; hash-locked local wheelhouse; `pip install --no-index --no-deps --no-build-isolation --force-reinstall .`; built-wheel installation; `pip check` | Source and wheel paths passed; installs used local locked wheels without uv/network. Public PyPI was used separately to obtain dependencies. |
-| Installed `sanitize-fit`/`verify-fit` help and synthetic FIT/ZIP execution | Passed with network, authentication construction and activity-state access forbidden; source bytes unchanged. Reinstalled the archive-only wheel without network; both input forms passed full verification, then archive-only verification after deletion of the synthetic source. Missing `--source` failed; historical files stayed unchanged. |
-| Installed root help and empty-store `status`/`list`/`activity` | Exit 0/0/2 for queries; no store created. |
-| Physical policy, private output and recovery tests | All 152 candidates checked against the fixed Profile and in both byte orders; exact bytes/invalid arrays/zero/bitfields, conditional events, unknown-anchor rejection, references, unused definitions, CRC/trailing content, recursive JSON boundaries, concurrent no-replace publication and hard exit covered. |
-| `.venv/bin/python -m pytest tests/test_verify_fit_archive.py --tb=short` | **58 passed**: original deleted; explicit modes/no fallback; strict files/JSON/versions/hashes; policy, arrays, context/references and extra definitions rejected despite recomputed CRC/hashes; both parsers reexecuted; historical files unchanged; safe errors. |
-| Existing mocked API stores before/after sanitize and both verify modes | Index, watermarks, pagination/activity jobs, gaps and synthetic auth-marker bytes/mtime/modes unchanged for interrupted pagination, partial activity processing and completed history. |
-
-Full verification uses one source byte snapshot and bounds archive reads to the
-expected sizes; archive-only verification has independent fixed read limits.
-Review also prevents unknown fields from seeding compressed
-timestamps, and retains a real zero lap count without creating a dangling first-lap
-reference. Source files and derived artifacts stay outside Git. AGENTS.md and the
-existing activity/backup formats are unchanged. No real-file acceptance, upload,
-account access, commit, push, PR, deployment or release is part of this work.
-
-The baseline MVP previously passed 116 tests. Actual verification of the offline
-import change on 2026-10-15, Linux x86_64, CPython 3.12.14:
-
-| Check actually run | Result |
-| --- | --- |
-| `.venv/bin/python -m pytest --tb=short` | **171 passed**, including 55 new import cases; entirely offline and synthetic. |
-| `.venv/bin/ruff check src tests` | Passed. |
-| `.venv/bin/ruff format --check src tests` | All 23 Python files formatted. |
-| `git diff --check` | Passed. |
-| `uv lock --check --offline` | Lock matches the project. |
-| `.venv/bin/python -m hatchling build -t wheel -t sdist -d /tmp/garmin-bridge-import-fit-dist` | Wheel and sdist built locally; explicit member allowlists checked, including the new module/test. |
-| Pip-only environment: lock-derived build requirements, `pip install --no-index --no-deps --no-build-isolation .`, wheel installation, `pip check` | Both installation paths passed with the existing hash-locked dependencies; build dependency closure verified. No uv or network was needed for these installs. |
-| Installed CLI root/import-fit/query/backup help pages | Exit 0; `--file` and required `--activity-id` present. |
-| Installed CLI, empty private store: `status`, `list`, `activity 1001` | Exit 0/0/2; absent/empty/not-found; queries create no state. |
-| Installed CLI: synthetic FIT/ZIP import with network and GarminSource construction forbidden | Created/unchanged results, wrapper idempotence, no auth files, no API progress changes. |
-| Installed package: import → export/verify/restore → identical queries → reimport → mocked full/incremental sync | Queries identical after restore; unchanged reimport; later API initialization succeeds and incremental sync adds exactly one new activity. No Drive/Garmin access. |
-
-Package contents were checked for private runtime artifacts; none were included.
-The source distribution has an explicit code/documentation/lockfile allowlist.
-Dependency acquisition used public package-registry access. Test execution and
-the installed CLI smoke checks required no network or credentials. Local build
-artifacts are ignored, and no distribution was published.
-
-No real account, credentials, FIT record, browser state, collection-runtime file or request
-recording was used. Actual website-export compatibility and the supplied ID/file
-association still require private validation; offline import cannot verify that
-association itself. A later, separately authorized private environment should
-use a persistent owner-only store outside any checkout and validate the website
-export/import/restore commands above, then, when API access is available:
-
-1. First sign-in, MFA continuation/cancellation, saved session permissions,
-   process restart, explicit refresh, expiry/revocation and safely reported failure.
-2. Full visible history against the account's privately inspected history,
-   including oldest available cycling, supported subtypes, missing originals,
-   server page caps, date/time-zone behavior and any hidden history limits.
-3. Interrupt/resume, rate-limit backoff and gap recovery without losing earlier
-   results or advancing coverage over unresolved work.
-4. Unchanged repeat, a new ride, a delayed old-date upload, a corrected recent
-   ride and an explicit old-range recheck; privately compare source digests,
-   counts, preserved missing values and unchanged parse outcomes.
-5. Export, compare the receipt, transfer privately through an authorized private
-   transfer connector, download and verify, restore to a fresh directory, authenticate
-   again, and resume or incrementally sync. The current verification covers the
-   local synthetic recovery chain only, with no Google Drive or Garmin access.
-
-Keep all resulting data, tokens and diagnostic artifacts private; report only
-reviewed aggregate results. macOS runtime behavior, unofficial API stability,
-true account history visibility and unattended renewal remain live-validation
-gaps. The SQLite catalog/journal adapter still materializes documents in memory;
-disk encryption, keychain integration, retention/garbage collection,
-deletion reconciliation and automatic scheduling are not implemented.
-
-## Out of scope for the first version
-
-- Garmin activity edits, deletions, uploads, or workout scheduling.
-- Intervals.icu, health-data synchronization, medical interpretation, or AI coaching.
-- A web dashboard, a hosted MCP server, or a permanently running public service.
-- CI/release automation and production deployment.
-
-Those can be considered separately after the acquisition and privacy contracts
-have been validated. A development workspace is not the long-term private data store.
+Report these synthetic checks separately from any explicitly authorized live
+account, original-file, cross-platform, or external SQL/transfer validation.

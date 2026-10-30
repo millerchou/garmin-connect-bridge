@@ -2,7 +2,7 @@ import socket
 
 import pytest
 
-from garmin_bridge.storage import Store
+from garmin_bridge.sqlite_store import SQLiteStore as Store
 
 
 @pytest.fixture(autouse=True)

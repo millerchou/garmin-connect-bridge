@@ -1,4 +1,4 @@
-"""SQLite primary storage; virtual legacy references are compatibility identifiers.
+"""SQLite primary storage; document references are logical identifiers.
 
 Only canonical, closed-contract documents enter this database. Ordered rows store
 one record/lap/event each, including duplicates and nulls; no JSON stream file is
@@ -13,10 +13,9 @@ import tempfile
 import sqlite3
 
 from . import contract as c
-from .backup import decode
 from .errors import BridgeError
 from .persistence import require, validate_job, validate_state, validate_summary_provenance
-from .storage import Store, canonical, check_private
+from .storage import Store, canonical, check_private, decode, empty_state
 
 DATABASE = "activities.sqlite"
 STORAGE_VERSION = 1
@@ -104,22 +103,9 @@ def check_schema(db):
     require(db.execute("PRAGMA user_version").fetchone()[0] == STORAGE_VERSION)
 
 
-class LegacyStore(Store):
-    @contextmanager
-    def lock(self, write=False, allow_restore=False):
-        # Refuse before the legacy lock could create a file inside a snapshot;
-        # recheck under the lock as well for a concurrent first writer.
-        if self.path(DATABASE).exists():
-            raise BridgeError("storage_format_conflict")
-        with super().lock(write=write, allow_restore=allow_restore):
-            if self.path(DATABASE).exists():
-                raise BridgeError("storage_format_conflict")
-            yield
-
-
 class SQLiteStore(Store):
     @contextmanager
-    def lock(self, write=False, allow_restore=False):
+    def lock(self, write=False):
         # A portable snapshot is immutable, even for ordinary query locks.
         if self.path("manifest.json").exists():
             if write:
@@ -135,7 +121,7 @@ class SQLiteStore(Store):
             finally:
                 os.close(fd)
             return
-        with super().lock(write=write, allow_restore=allow_restore):
+        with super().lock(write=write):
             yield
 
     def _database(self, create=False):
@@ -145,9 +131,9 @@ class SQLiteStore(Store):
         portable = self.path("manifest.json").exists()
         require(not (portable and create))
         if create and not path.exists():
-            # A legacy store must go through explicit migration, never mixed writes.
+            # Never mix a file catalog with SQLite documents.
             if super().read_bytes("index.json") is not None:
-                raise BridgeError("migration_required")
+                raise BridgeError("storage_format_conflict")
             fd, name = tempfile.mkstemp(prefix=".sqlite-init-", dir=self.root)
             os.close(fd)
             try:
@@ -217,7 +203,7 @@ class SQLiteStore(Store):
 
     def revision_artifacts(self, source_id, digest, fit_hash):
         """Reuse an existing immutable revision when a source correction is reverted."""
-        from .backup import artifact_files
+        from .persistence import artifact_files
         from .normalize import sha256
 
         revision = sha256(canonical([digest, c.NORMALIZER_VERSION, c.SCHEMA_VERSION]))
@@ -242,8 +228,69 @@ class SQLiteStore(Store):
         )
         return summary, decode(stream_data)
 
+    def preview_state(self):
+        """Read one committed catalog without the bridge lock or journal recovery."""
+        path = self._database()
+        if not path.exists():
+            if self.path("index.json").exists():
+                raise BridgeError("storage_format_conflict")
+            return empty_state()
+
+        def signature():
+            info = path.stat()
+            if any(
+                self.path(DATABASE + suffix).exists() for suffix in ("-journal", "-wal", "-shm")
+            ):
+                raise BridgeError("busy")
+            with path.open("rb") as handle:
+                header = handle.read(100)
+            return (
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+                header,
+            )
+
+        before = signature()
+        header = before[-1]
+        if header[18:20] == b"\x02\x02":
+            raise BridgeError("busy")
+        if header[:16] != b"SQLite format 3\x00" or header[18:20] != b"\x01\x01":
+            raise BridgeError("storage_failed")
+        try:
+            # mode=ro alone can create WAL/SHM files if a writer switches modes
+            # after preflight. Immutable access cannot write or recover journals.
+            # Since it also skips SQLite locks, reject the entire result if the
+            # file or header changed, or a transaction sidecar appeared, while
+            # reading. Check even on failure: a racing writer can invalidate pages.
+            with closing(connect(path, immutable=True)) as db:
+                db.execute("BEGIN")
+                check_schema(db)
+                row = db.execute("SELECT payload FROM documents WHERE name='index.json'").fetchone()
+                if row is None:
+                    require(
+                        db.execute(
+                            "SELECT 1 FROM documents WHERE name LIKE 'objects/%' LIMIT 1"
+                        ).fetchone()
+                        is None
+                    )
+                    return empty_state()
+                return validate_state(decode(row[0]))
+        except sqlite3.Error:
+            raise BridgeError("storage_failed") from None
+        finally:
+            try:
+                after = signature()
+            except FileNotFoundError:
+                raise BridgeError("busy") from None
+            if after != before:
+                raise BridgeError("busy")
+
     def state(self):
-        value = super().state()
+        value = self.read_json("index.json")
+        value = empty_state() if value is None else validate_state(value)
         if not self._absent_snapshot and self.path(DATABASE).exists():
             with self.database() as db:
                 # A first scan can checkpoint its job before its first index.
@@ -264,13 +311,14 @@ class SQLiteStore(Store):
             return super().read_bytes(relative, limit)
         if self._absent_snapshot or not self.path(DATABASE).exists():
             if super().read_bytes("index.json") is not None:
-                raise BridgeError("migration_required")
+                raise BridgeError("storage_format_conflict")
             return None
         with self.database() as db:
             row = db.execute("SELECT payload FROM documents WHERE name=?", (relative,)).fetchone()
             if row is None:
                 return None
             value = decode(row[0])
+            require(type(value) is dict)
             if kind == "streams":
                 require(not (ARRAY_LIMITS.keys() & value.keys()))
                 arrays = stream_arrays(value)
@@ -295,8 +343,10 @@ class SQLiteStore(Store):
                     ).fetchall()
                     require(all(type(r[0]) is int and r[0] == i for i, r in enumerate(rows)))
                     value[array] = [decode(r[1]) for r in rows]
-            validate_document(relative, value)
-            return canonical(value)
+            content = canonical(value)
+            if limit is not None and len(content) > limit:
+                raise BridgeError("storage_failed")
+            return content
 
     def write_bytes(self, relative, content):
         kind = document_kind(relative)
@@ -324,7 +374,7 @@ class SQLiteStore(Store):
                 content = canonical(metadata)
             if kind == "state":
                 # Commit point: all referenced immutable data must already exist.
-                from .backup import artifact_files
+                from .persistence import artifact_files
 
                 previous = db.execute(
                     "SELECT payload FROM documents WHERE name='index.json'"
@@ -337,11 +387,3 @@ class SQLiteStore(Store):
 
     def has_artifacts(self, summary):
         return all(self.read_bytes(ref) is not None for ref in summary["files"].values())
-
-
-def open_store(root):
-    """Old stores stay readable; every fresh CLI store uses SQLite."""
-    legacy = LegacyStore(root)
-    if legacy.path("index.json").exists() and not legacy.path(DATABASE).exists():
-        return legacy
-    return SQLiteStore(root)

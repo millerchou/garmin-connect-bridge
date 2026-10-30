@@ -11,11 +11,22 @@ import warnings
 
 from .contract import SCHEMA_VERSION, day, identifier, project_activity, validate_output
 from .errors import BridgeError, MESSAGES
-from .sync import choose_range, files_available, freshness, synchronize
+from .sync import choose_range, files_available, freshness, since_last_range, synchronize
 from .upstream import GarminSource, authenticate, auth_status
 
 
 class PrivateParser(argparse.ArgumentParser):
+    def _check_value(self, action, value):
+        # Recognize retired commands without advertising them as parser choices.
+        if action.dest == "command" and value in {"migrate", "sanitize-fit", "verify-fit"}:
+            raise BridgeError("removed_" + value.replace("-", "_"))
+        return super()._check_value(action, value)
+
+    def _parse_optional(self, arg_string):
+        if arg_string.split("=", 1)[0] == "--legacy-store":
+            raise BridgeError("removed_legacy_store")
+        return super()._parse_optional(arg_string)
+
     def error(self, message):
         # argparse normally echoes rejected values; those might be secrets.
         raise BridgeError("usage")
@@ -55,9 +66,6 @@ def build_parser():
         type=Path,
         help="Private store outside Git; defaults to the OS user data directory",
     )
-    parser.add_argument(
-        "--legacy-store", action="store_true", help="Explicit legacy JSON compatibility mode"
-    )
     commands = parser.add_subparsers(dest="command", required=True)
     auth = commands.add_parser("auth", help="Interactive sign-in and MFA; save a protected session")
     auth.add_argument(
@@ -83,35 +91,6 @@ def build_parser():
         action="store_true",
         help="Explicitly retain reviewed user profile and serial fields in private artifacts",
     )
-    cleaning = commands.add_parser(
-        "sanitize-fit",
-        help="Offline derived training FIT archive; explicit location/identity removal",
-    )
-    cleaning.add_argument(
-        "--file", type=Path, required=True, help="Private original FIT or single-FIT ZIP"
-    )
-    cleaning.add_argument(
-        "--output-dir",
-        type=Path,
-        required=True,
-        help="New private archive outside the activity store",
-    )
-    verifying = commands.add_parser(
-        "verify-fit",
-        help="Offline archive checks, optionally including comparison with its original source",
-    )
-    verification_mode = verifying.add_mutually_exclusive_group(required=True)
-    verification_mode.add_argument(
-        "--source", type=Path, help="Unchanged private original FIT or ZIP; required for fidelity"
-    )
-    verification_mode.add_argument(
-        "--archive-only",
-        action="store_true",
-        help="Check the three archive files only; source fidelity is not checked",
-    )
-    verifying.add_argument(
-        "--directory", type=Path, required=True, help="Derived FIT archive to verify"
-    )
     sync = commands.add_parser(
         "sync", help="Explicitly discover cycling activities and store private original FIT data"
     )
@@ -136,6 +115,16 @@ def build_parser():
     modes.add_argument(
         "--resume", action="store_true", help="Resume the durable scan with its original cutoff"
     )
+    modes.add_argument(
+        "--since-last",
+        action="store_true",
+        help="Sync from the contiguous successful watermark end minus one day through today",
+    )
+    sync.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --since-last, print the date window without login, a store lock or writes",
+    )
     sync.add_argument(
         "--new-scan",
         action="store_true",
@@ -156,30 +145,29 @@ def build_parser():
         "activity", help="Offline summary, coverage and approved file references"
     )
     activity.add_argument("activity_id", type=positive_id)
+    exporting = commands.add_parser("export", help="Offline analysis exports")
+    actions = exporting.add_subparsers(dest="export_action", required=True)
+    analysis = actions.add_parser("analysis", help="Current revisions as typed SQLite tables")
+    analysis.add_argument(
+        "--file", type=Path, required=True, help="Private SQLite file outside Git"
+    )
     backup = commands.add_parser(
         "backup", help="Offline non-location backup, validation and restore"
     )
     actions = backup.add_subparsers(dest="backup_action", required=True)
     for action, help_text in (
-        ("export", "Export reviewed current data and recovery state; omit auth and originals"),
-        ("verify", "Validate every package member without changing any store"),
-        ("restore", "Restore a verified package into an empty private store"),
+        ("export", "Export all reviewed revisions and recovery state; omit auth and originals"),
+        ("verify", "Check snapshot integrity and contract samples without changing any store"),
+        ("restore", "Restore a verified snapshot into a new private store"),
     ):
         command = actions.add_parser(action, help=help_text)
         command.add_argument(
             "--file",
             type=Path,
             required=True,
-            help="Private snapshot directory (SQLite) or legacy ZIP path outside Git",
+            help="Private SQLite snapshot directory outside Git",
         )
-    migration = commands.add_parser(
-        "migrate", help="Explicit read-only JSON/old ZIP to new SQLite store"
-    )
-    inputs = migration.add_mutually_exclusive_group(required=True)
-    inputs.add_argument("--source", type=Path)
-    inputs.add_argument("--bundle", type=Path)
-    migration.add_argument("--destination", type=Path, required=True)
-    snapshots = commands.add_parser("snapshot", help="Self-contained SQLite snapshots")
+    snapshots = commands.add_parser("snapshot", help="Private self-contained SQLite backups")
     actions = snapshots.add_subparsers(dest="snapshot_action", required=True)
     for action in ("export", "verify", "restore"):
         command = actions.add_parser(action)
@@ -229,9 +217,7 @@ def private_prompt(label):
 def query(store, args):
     state = store.state()
     base = {"schema_version": SCHEMA_VERSION, "freshness": freshness(state)}
-    sqlite = hasattr(store, "database")
-    if sqlite:
-        base["storage_version"] = 1
+    base["storage_version"] = 1
     if args.command == "status":
         from .jobs import load_job, report
 
@@ -286,12 +272,11 @@ def query(store, args):
         }
         for s in page
     ]
-    if sqlite:
-        for card, summary in zip(cards, page):
-            card.update(
-                {key: summary[key] for key in ("coverage", "normalizer_version", "sample_count")}
-            )
-            card["revision"] = summary["files"]["summary"].split("/")[2]
+    for card, summary in zip(cards, page):
+        card.update(
+            {key: summary[key] for key in ("coverage", "normalizer_version", "sample_count")}
+        )
+        card["revision"] = summary["files"]["summary"].split("/")[2]
     next_offset = args.offset + len(page)
     return {
         **base,
@@ -301,58 +286,37 @@ def query(store, args):
 
 
 def execute(args):
-    if args.command in {"sanitize-fit", "verify-fit"}:
-        from .sanitize_fit import sanitize_file, verify_archive, verify_archive_only
-
-        if args.command == "sanitize-fit":
-            return sanitize_file(args.file, args.output_dir, args.data_dir)
-        if args.archive_only:
-            return verify_archive_only(args.directory, args.data_dir)
-        return verify_archive(args.source, args.directory, args.data_dir)
-    from .sqlite_store import LegacyStore, SQLiteStore, open_store
+    from .sqlite_store import SQLiteStore
     from . import sqlite_transfer as transfer
+    from .storage import default_root
 
-    if args.command == "migrate":
-        return transfer.migrate(
-            args.source or args.bundle, args.destination, bundle=args.bundle is not None
-        )
-    if args.command == "snapshot":
-        if args.snapshot_action == "verify":
-            return transfer.verify_snapshot(args.directory)
-        if args.snapshot_action == "restore":
-            from .storage import default_root
+    if args.command in {"snapshot", "backup"}:
+        action = args.snapshot_action if args.command == "snapshot" else args.backup_action
+        directory = args.directory if args.command == "snapshot" else args.file
+        if action == "verify":
+            return transfer.verify_snapshot(directory)
+        if action == "restore":
+            return transfer.restore_snapshot(directory, args.data_dir or default_root())
+        return transfer.export_snapshot(SQLiteStore(args.data_dir), directory)
+    if args.command == "export":
+        from .analysis_export import export_analysis
 
-            return transfer.restore_snapshot(args.directory, args.data_dir or default_root())
-        return transfer.export_snapshot(SQLiteStore(args.data_dir), args.directory)
-    if args.command == "backup":
-        from .backup import export_bundle, restore_bundle, verify_bundle
-
-        if args.backup_action == "verify":
-            return (
-                transfer.verify_snapshot(args.file)
-                if args.file.is_dir()
-                else verify_bundle(args.file)
-            )
-        if args.legacy_store:
-            operation = export_bundle if args.backup_action == "export" else restore_bundle
-            return operation(LegacyStore(args.data_dir), args.file)
-        if args.backup_action == "restore":
-            from .storage import default_root
-
-            target = args.data_dir or default_root()
-            if args.file.is_dir():
-                return transfer.restore_snapshot(args.file, target)
-            return transfer.migrate(args.file, target, bundle=True)
-        source = open_store(args.data_dir)
-        if isinstance(source, SQLiteStore):
-            return transfer.export_snapshot(source, args.file)
-        return export_bundle(source, args.file)
-    store = LegacyStore(args.data_dir) if args.legacy_store else open_store(args.data_dir)
+        return export_analysis(SQLiteStore(args.data_dir), args.file)
+    if args.command == "sync":
+        if args.dry_run and not args.since_last:
+            raise BridgeError("dry_run_requires_since_last")
+        if ((args.full or args.resume or args.since_last) and (args.start or args.end)) or (
+            args.new_scan and not args.full
+        ):
+            raise BridgeError("usage")
+        if args.end and not args.start:
+            raise BridgeError("usage")
+    store = SQLiteStore(args.data_dir)
+    if args.command == "sync" and args.dry_run:
+        return since_last_range(store.preview_state(), date.today())
     write = args.command in {"auth", "sync", "import-fit"}
     write = write or (args.command == "segment" and args.segment_action != "history")
     with store.lock(write=write):
-        if write and not args.legacy_store and not isinstance(store, SQLiteStore):
-            raise BridgeError("migration_required")
         if args.command == "window":
             from .sqlite_query import window
 
@@ -360,8 +324,6 @@ def execute(args):
         if args.command == "segment":
             from . import segments
 
-            if not isinstance(store, SQLiteStore):
-                raise BridgeError("migration_required")
             if args.segment_action == "define":
                 return {
                     "definition": segments.define(
@@ -385,14 +347,12 @@ def execute(args):
             )
             return {"schema_version": SCHEMA_VERSION, "state": "saved", "verified_at": verified}
         if args.command == "sync":
-            if ((args.full or args.resume) and (args.start or args.end)) or (
-                args.new_scan and not args.full
-            ):
-                raise BridgeError("usage")
-            if args.end and not args.start:
-                raise BridgeError("usage")
             interval = (
-                choose_range(store.state(), args.start, args.end, args.lookback_days, date.today())
+                since_last_range(store.state(), date.today())
+                if args.since_last
+                else choose_range(
+                    store.state(), args.start, args.end, args.lookback_days, date.today()
+                )
                 if args.start
                 else None
             )
@@ -402,7 +362,7 @@ def execute(args):
                 else "resume"
                 if args.resume
                 else "range"
-                if args.start
+                if args.start or args.since_last
                 else "incremental"
             )
             return synchronize(
@@ -422,10 +382,11 @@ def main(argv=None):
     logging.disable(logging.CRITICAL)
     try:
         args = build_parser().parse_args(argv)
-        result = validate_output(args.command, execute(args))
+        preview = args.command == "sync" and args.dry_run
+        result = validate_output("sync-preview" if preview else args.command, execute(args))
         serialized = json.dumps(result, allow_nan=False, separators=(",", ":"))
         print(serialized)
-        return 1 if args.command == "sync" and not result["complete"] else 0
+        return 1 if args.command == "sync" and not preview and not result["complete"] else 0
     except (KeyboardInterrupt, EOFError):
         code = "interrupted"
     except BridgeError as error:

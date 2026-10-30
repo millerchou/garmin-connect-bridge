@@ -6,11 +6,20 @@ from unittest.mock import Mock
 
 import pytest
 
-from garmin_bridge import cli, jobs, normalize, sync
+from garmin_bridge import cli, jobs, normalize, sync, sqlite_transfer as transfer
+from garmin_bridge.storage import canonical
 from garmin_bridge.contract import validate_output
 from garmin_bridge.errors import BridgeError
-from garmin_bridge.storage import Store
-from .synthetic import START, Source, activity, archive, fit_bytes
+from garmin_bridge.sqlite_store import SQLiteStore as Store
+from .synthetic import (
+    corrupt_document,
+    delete_document,
+    START,
+    Source,
+    activity,
+    archive,
+    fit_bytes,
+)
 
 CUTOFF = "2025-01-10T12:00:00Z"
 
@@ -83,7 +92,7 @@ def test_force_exit_resumes_page_and_activity_and_matches_uninterrupted(
 import os, sys
 from pathlib import Path
 from garmin_bridge import jobs, sync
-from garmin_bridge.storage import Store
+from garmin_bridge.sqlite_store import SQLiteStore as Store
 from tests.synthetic import Source, activity
 jobs.now = sync.now = lambda: "2025-01-10T12:00:00Z"
 class Killed(Source):
@@ -195,7 +204,7 @@ def test_old_metadata_change_also_triggers_recheck(store):
 
 @pytest.mark.parametrize("mode", ["incremental", "resume"])
 @pytest.mark.parametrize("damage", ["missing", "corrupt"])
-def test_rechecks_and_resume_repair_damaged_confirmed_artifacts(store, mode, damage):
+def test_damaged_immutable_artifacts_require_snapshot_recovery(store, tmp_path, mode, damage):
     source = Source([activity(1), activity(2)])
     if mode == "resume":
         source.downloads["2"] = BridgeError("network_failed")
@@ -203,17 +212,33 @@ def test_rechecks_and_resume_repair_damaged_confirmed_artifacts(store, mode, dam
     assert result["complete"] == (mode == "incremental")
     ref = store.state()["activities"]["1"]["summary"]["files"]["streams"]
     valid = store.read_bytes(ref)
+    prior = store.state()
+    snapshot = tmp_path / "recovery-snapshot"
+    transfer.export_snapshot(store, snapshot)
     with store.lock(write=True):
         if damage == "missing":
-            store.path(ref).unlink()
+            delete_document(store, ref)
         else:
-            store.write_bytes(ref, b"synthetic damaged content")
+            with store.database() as db:
+                metadata = json.loads(
+                    db.execute("SELECT payload FROM documents WHERE name=?", (ref,)).fetchone()[0]
+                )
+            metadata["source_digest"] = "0" * 64
+            corrupt_document(store, ref, canonical(metadata))
     source.calls.clear()
     source.downloads.clear()
     result = execute(store, source, mode=mode, lookback=3)
-    assert result["complete"] and store.read_bytes(ref) == valid
+    # SQLite keeps revisions immutable; it never overwrites damaged historical rows.
+    assert not result["complete"]
+    for ident, entry in prior["activities"].items():
+        assert store.state()["activities"][ident] == entry
+    assert sync.watermark(store.state()) == sync.watermark(prior)
     assert ("download", "1") in source.calls
-    assert len(store.state()["activities"]) == 2
+    restored = Store(tmp_path / "recovered")
+    transfer.restore_snapshot(snapshot, restored.root)
+    assert execute(restored, source, mode=mode, lookback=3)["complete"]
+    assert restored.read_bytes(ref) == valid
+    assert len(restored.state()["activities"]) == 2
 
 
 def test_backoff_is_bounded_and_retry_state_survives_exhaustion(store):
