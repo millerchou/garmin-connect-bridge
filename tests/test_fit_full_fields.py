@@ -74,18 +74,23 @@ def test_new_fields_roundtrip_export_report_and_snapshot(store, tmp_path, capsys
     assert detail(streams, "time_in_zone")["fields"]["reference_mesg"]["value"] == 312
     assert streams["events"][0]["fields"]["event"]["value"] == 39
     assert "data" not in streams["events"][0]["fields"]
-    assert (
-        streams["raw_messages"][:2]
-        == [{"mesg_num": 534, "fields": {"253": 1000000000, "0": 7, "1": [0, 4]}}] * 2
-    )
+    assert streams["raw_messages"][:2] == [{"mesg_num": 534, "fields": {"0": 7, "1": [0, 4]}}] * 2
     assert_safe_keys(streams)
     encoded = json.dumps(streams)
     for private in ("123456789", "234567890", "987654321", "Synthetic private", "Synthetic device"):
         assert private not in encoded
     report_bytes = store.read_bytes(REPORT_PATH)
     report = json.loads(report_bytes)
-    assert {r["field"] for r in report} == {"3.0", "3.250", "79.0", "20.250", "534.2", "534.3"}
-    assert all(r["row_count"] == 1 for r in report)
+    assert {r["field"] for r in report} == {
+        "3.0",
+        "3.250",
+        "79.0",
+        "20.250",
+        "534.2",
+        "534.3",
+        "534.253",
+    }
+    assert all(r["row_count"] == (2 if r["field"] == "534.253" else 1) for r in report)
     assert validate_report(report) == report
     assert all(set(r) == {"field", "reason", "row_count"} for r in report)
     assert not publish(store, data)
@@ -305,7 +310,7 @@ def test_unknown_json_export_backstop_preserves_destination(
                 value["unknown"] = {"unknown_250": {name: 1}}
             else:
                 value[name] = 1
-            row[key] = json.dumps(value)
+            row[key] = export.json_text(value)
         return insert(db, table, row)
 
     monkeypatch.setattr(export, "insert", inject)
@@ -313,8 +318,9 @@ def test_unknown_json_export_backstop_preserves_destination(
     monkeypatch.setattr(export, "valid_unknown", lambda *a: True)
     monkeypatch.setattr(export, "valid_raw_message", lambda *a: True)
     monkeypatch.setattr(export, "valid_message", lambda *a: True)
-    with pytest.raises(BridgeError):
+    with pytest.raises(BridgeError) as caught:
         export.export_analysis(store, target)
+    assert caught.value.code == "privacy_failed"
     assert target.read_bytes() == before
 
 

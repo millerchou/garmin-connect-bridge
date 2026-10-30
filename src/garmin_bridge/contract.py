@@ -507,6 +507,11 @@ def validate_streams(value):
     )
     if not check(value):
         raise BridgeError("privacy_failed")
+    if full:
+        from .fit_unknown import suspected_identity_fields
+
+        if suspected_identity_fields(value):
+            raise BridgeError("privacy_failed")
     if (
         extended
         and filter_message_context(value["session"], value["laps"], value["messages"])

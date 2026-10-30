@@ -70,6 +70,11 @@ DENIED_NAMES = (
     "startPosition",
     "end_position",
     "homeLocation",
+    "device_number",
+    "fitDeviceNumber0",
+    "nested-device.number",
+    "localId",
+    "global_id",
 )
 
 

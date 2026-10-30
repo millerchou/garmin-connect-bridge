@@ -60,12 +60,15 @@ def test_named_serial_match_takes_priority_over_the_timestamp_exemption():
     stamp = 1_000_000_000
     streams, blocked = intercepted(
         minimal(
-            frame(534, [raw(0, 0x86, stamp)])
+            b"".join(
+                frame(534, [raw(0, 0x86, stamp + i)]) + frame(23, [raw(253, 0x86, stamp + i)])
+                for i in range(3)
+            )
             + frame(23, [raw(3, 0x8C, stamp), raw(253, 0x86, stamp)])
         )
     )
     assert streams["raw_messages"] == []
-    assert blocked == {(534, 0, "identity_match"): 1}
+    assert blocked == {(534, 0, "identity_match"): 3}
 
 
 @pytest.mark.parametrize("number,field", [(23, 250), (20, 250), (534, 0), (325, 42)])
@@ -118,56 +121,65 @@ def test_distinct_counts_are_scoped_to_message_and_field():
 
 @pytest.mark.parametrize("offset", [-86401, -86400, 0, 86400, 86401])
 @pytest.mark.parametrize("number,field", [(534, 0), (23, 250)])
-def test_timestamp_exemption_requires_closeness_to_reviewed_file_time(number, field, offset):
+def test_constant_ids_near_or_equal_to_reviewed_file_time_are_blocked(number, field, offset):
     stamp = 1_000_000_000
     streams, blocked = intercepted(
         minimal(
             frame(number, [raw(field, 0x86, stamp + offset)]) + frame(23, [raw(253, 0x86, stamp)])
         )
     )
-    if abs(offset) > 86400:
-        assert blocked == {(number, field, "suspected_identity"): 1}
+    assert blocked == {(number, field, "suspected_identity"): 1}
+    if number == 534:
+        assert streams["raw_messages"] == []
     else:
-        assert not blocked
-        if number == 534:
-            assert streams["raw_messages"][0]["fields"] == {str(field): stamp + offset}
-        else:
-            assert detail(streams, "device_info")["unknown"] == {f"unknown_{field}": stamp + offset}
+        assert detail(streams, "device_info")["unknown"] == {}
 
 
-@pytest.mark.parametrize("value", [0x0FFFFFFF, 0x10000000, 0xFFFFFFFE, 0xFFFFFFFF])
-def test_timestamp_exemption_obeys_fit_absolute_time_bounds(value):
-    stamp = max(0x10000000, min(value, 0xFFFFFFFE))
+@pytest.mark.parametrize(
+    "value,allowed",
+    [(0x0FFFFFFF, False), (0x10000000, True), (0xFFFFFFFC, True), (0xFFFFFFFE, False)],
+)
+def test_timestamp_exemption_obeys_fit_absolute_time_bounds(value, allowed):
     streams, blocked = intercepted(
-        minimal(frame(534, [raw(0, 0x8F, value)]) + frame(23, [raw(253, 0x86, stamp)]))
+        minimal(
+            b"".join(
+                frame(534, [raw(0, 0x8F, value + i)])
+                + frame(23, [raw(253, 0x86, min(value + i, 0xFFFFFFFF))])
+                for i in range(3)
+            )
+        )
     )
-    assert bool(blocked) is (value in {0x0FFFFFFF, 0xFFFFFFFF})
-    assert bool(streams["raw_messages"]) is (not blocked)
+    assert bool(blocked) is (not allowed)
+    assert bool(streams["raw_messages"]) is allowed
 
 
 @pytest.mark.parametrize("anchor", ["unknown", "relative", "none", "wrong_wire_type"])
 def test_unreviewed_or_missing_time_evidence_cannot_exempt_suspected_ids(anchor):
     stamp = 1_000_000_000
-    extra = {
-        "unknown": frame(325, [raw(253, 0x86, stamp)]),
-        "relative": frame(23, [raw(253, 0x86, 17)]),
-        "none": b"",
-        "wrong_wire_type": frame(23, [raw(253, 0x8F, stamp)]),
-    }[anchor]
-    streams, blocked = intercepted(minimal(extra + frame(534, [raw(0, 0x86, stamp)])))
-    assert blocked[(534, 0, "suspected_identity")] == 1
+    extra = b""
+    for i in range(3):
+        extra += {
+            "unknown": frame(325, [raw(253, 0x86, stamp + i)]),
+            "relative": frame(23, [raw(253, 0x86, 17 + i)]),
+            "none": b"",
+            "wrong_wire_type": frame(23, [raw(253, 0x8F, stamp + i)]),
+        }[anchor]
+        extra += frame(534, [raw(0, 0x86, stamp + i)])
+    streams, blocked = intercepted(minimal(extra))
+    assert blocked[(534, 0, "suspected_identity")] == 3
     assert not streams["raw_messages"]
 
 
-def test_reviewed_compressed_timestamp_can_exempt_nearby_unknown_time():
+def test_reviewed_compressed_timestamps_can_exempt_matching_varying_times():
     stamp = 1_000_000_000
     records = frame(20, [raw(253, 0x86, stamp)])
     records += compressed(20, [raw(7, 0x84, 17)], 1)
+    records += compressed(20, [raw(7, 0x84, 17)], 2)
     streams, blocked = intercepted(
-        minimal(frame(534, [raw(0, 0x86, stamp + 86401)]), records=records)
+        minimal(b"".join(frame(534, [raw(0, 0x86, stamp + i)]) for i in range(3)), records=records)
     )
     assert not blocked
-    assert streams["raw_messages"][0]["fields"]["0"] == stamp + 86401
+    assert [r["fields"]["0"] for r in streams["raw_messages"]] == [stamp + i for i in range(3)]
 
 
 def test_developer_timestamp_cannot_exempt_suspected_ids():
@@ -176,11 +188,14 @@ def test_developer_timestamp_cannot_exempt_suspected_ids():
     descriptions += frame(
         206, [raw(0, 2, 0), raw(1, 2, 253), raw(2, 2, 0x86), raw(3, 7, b"timestamp\0")]
     )
-    extra = descriptions + frame(23, [], developer=[(253, 0, stamp.to_bytes(4, "little"))])
-    extra += frame(534, [raw(0, 0x86, stamp)])
+    extra = descriptions + b"".join(
+        frame(23, [], developer=[(253, 0, (stamp + i).to_bytes(4, "little"))])
+        + frame(534, [raw(0, 0x86, stamp + i)])
+        for i in range(3)
+    )
     streams, blocked = intercepted(minimal(extra))
     assert streams["raw_messages"] == []
-    assert blocked == {(534, 0, "suspected_identity"): 1}
+    assert blocked == {(534, 0, "suspected_identity"): 3}
 
 
 def test_all_blocked_raw_rows_are_omitted_from_store_export_and_value_free_report(store, tmp_path):

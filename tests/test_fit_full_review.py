@@ -290,16 +290,17 @@ def test_text_array_injection_fails_export_validation_and_preserves_destination(
                 if row["message"] == "session":
                     value = json.loads(row["detail_json"])
                     value["unknown"] = {"unknown_250": [83, 89, 78, 84, 72]}
-                    row["detail_json"] = json.dumps(value)
+                    row["detail_json"] = export.json_text(value)
             else:
                 key = "fields_json" if name == "raw_messages" else "unknown_json"
                 field = "250" if name == "raw_messages" else "unknown_250"
-                row[key] = json.dumps({field: [83, 89, 78, 84, 72]})
+                row[key] = export.json_text({field: [83, 89, 78, 84, 72]})
         return insert(db, name, row)
 
     monkeypatch.setattr(export, "insert", inject)
-    with pytest.raises(BridgeError):
+    with pytest.raises(BridgeError) as caught:
         export.export_analysis(store, target)
+    assert caught.value.code == "privacy_failed"
     assert target.read_bytes() == before
 
 

@@ -31,7 +31,7 @@ from .fit_details import (
 )
 from .fit_fields import AUXILIARY_MESSAGES, FIT_FIELDS_VERSION, RECORD_UNITS
 from .storage import canonical
-from .fit_unknown import RawPrivacy, project_unknown
+from .fit_unknown import FIT_PRIVACY_VERSION, RawPrivacy, project_unknown
 
 MAX_ARCHIVE = 64 * 1024 * 1024
 MAX_FIT = 64 * 1024 * 1024
@@ -330,7 +330,7 @@ def normalize(
                     values["timestamp"] = timestamp_value(timestamp_raw)
                 detail = project_message(frame, include_identity, timestamp_raw=timestamp_raw)
                 unknown, raw_message = project_unknown(frame, blocked, include_identity)
-                raw_privacy.observe(frame, unknown, timestamp_raw)
+                raw_privacy.observe(frame, unknown)
                 if raw_message is not None:
                     raw_messages.append(raw_message)
                     if len(raw_messages) > MAX_RECORDS:
@@ -552,8 +552,10 @@ def _cadence_quality(metrics, session, records, integers):
     return flags
 
 
-def input_digest(meta, fit_hash, *, local_import=False, include_identity=False):
+def input_digest(meta, fit_hash, *, local_import=False, include_identity=False, legacy=False):
     value = {"provider": "garmin", "metadata": meta, "fit_sha256": fit_hash}
+    if not legacy:
+        value["fit_privacy_version"] = FIT_PRIVACY_VERSION
     if local_import:
         # Do not let a later API acquisition reuse an unverified local result,
         # even when the API happens to supply no optional metadata either.
@@ -561,3 +563,18 @@ def input_digest(meta, fit_hash, *, local_import=False, include_identity=False):
     if include_identity:
         value["include_fit_identity"] = True
     return sha256(canonical(value))
+
+
+def input_digest_matches(digest, meta, fit_hash, *, local_import=False, include_identity=False):
+    """Validate historical provenance without making old revisions cache hits."""
+    return any(
+        digest
+        == input_digest(
+            meta,
+            fit_hash,
+            local_import=local_import,
+            include_identity=include_identity,
+            legacy=legacy,
+        )
+        for legacy in (False, True)
+    )

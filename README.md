@@ -254,9 +254,11 @@ Destinations must be new and outside the source directory.
 Export validates every document, stream row, and relation, builds one clean logical
 copy, and uses SQLite's backup API to produce an independent file. Verification
 checks SHA-256, size, `PRAGMA integrity_check`, the exact schema whitelist, manifest
-counts/versions, control documents, summaries, revision links/counts, and contract
-spot checks. It checks first/middle/last record and event rows per stream, with
-lap/message context retained.
+counts/versions, control documents, summaries, revision links/counts, and contracts.
+Streams with raw fields (FIT field version 1.1) are validated in full, because
+the identity checks need all rows to distinguish constants from varying counters.
+Older streams use first/middle/last record and event spot checks, with lap/message
+context retained.
 It does not rebuild the database or require a canonical physical byte layout.
 Checksums detect corruption; these checks do not authenticate an untrusted sender
 or certify unused pages/trailing bytes as free of private content. Keep backups private.
@@ -344,8 +346,11 @@ no watermark, authentication or segment-matching algorithm change is involved.
 As before, offline import of identical API-derived content preserves its API
 revision; use sync to upgrade that revision. Older software cannot read 1.1 streams.
 Prior revisions remain immutable; reparsing does not erase historical data.
-Stored text-like raw arrays fail the strengthened export/snapshot validation
-rather than being silently copied.
+A privacy-processing discriminator in the input digest prevents reuse of earlier
+1.4.0 artifacts while retaining normalizer version 1.4.0. Rechecks and resumed jobs
+apply the current rules. Stored text-like raw arrays and suspected numeric
+identifiers fail the strengthened export/snapshot validation rather than being
+silently copied; a snapshot containing unsafe historical revisions is also refused.
 
 ### Undocumented-field interception and report
 
@@ -365,32 +370,40 @@ raw values enter structured storage:
   values are blocked (`position_match` / `identity_match`), including unsigned
   representations of semicircle coordinates. Identity matching collects only
   named identifiers (`serial_number`, `ant_device_number`, `device_number`,
-  `device_id`) and integers from the excluded profile/messages 3 and 79, and only
+  `device_id`, `local_id`, `global_id`) and undocumented integers from the excluded
+  profile/messages 3 and 79, and only
   when their absolute value is at least **2^16 (65,536)**. This excludes the entire
   16-bit unsigned range and common small settings/enums from file-wide matching,
   even for short identifiers; reviewed identity fields themselves remain excluded
-  by default. Transmission types are categories, not identifiers. Coordinate
+  by default. Known profile settings, including wake/sleep times, and transmission
+  categories do not supply identifier matches. Coordinate
   matching has no magnitude threshold. Record fields with at least three
   paired coordinate observations and squared linear correlation of at least
   0.9999 are blocked as `position_correlated`. Each array slot is checked. A match
   withholds the entire message/field family, including earlier and unpaired rows.
   These conservative checks can also withhold coincidentally matching measurements.
   Only transient sets and integer statistics are used; none enter stored artifacts.
-- An undocumented field is blocked as `suspected_identity` when any integer is
-  at least **2^24 (16,777,216)**, is not timestamp-like, and its field/array slot has
+- An undocumented field is blocked as `suspected_identity` when any integer's
+  absolute magnitude is at least **2^24 (16,777,216)**, is not timestamp-like, and
+  its field/array slot has
   **at most three distinct non-null integers** across that message type's rows in
   the file. Single-row fields qualify; nulls and missing fields provide no evidence
   of variation. Each array slot is checked independently, and a match blocks the
   entire message/field family. Four or more distinct values exempt that slot from
   this heuristic, preserving varying counters. No message or field numbers are
   special-cased. Distinct sets stop growing after four values.
-  Timestamp-like means FIT absolute `date_time` seconds in
-  `[0x10000000, 0xFFFFFFFF)`, within **24 hours** of at least one reviewed UTC
-  timestamp in the same file (including a validated compressed timestamp).
-  This accommodates local-clock offsets without treating the entire date-time
-  range as timestamps. Unknown/developer fields and relative clocks cannot supply
-  that evidence; without reviewed time evidence there is no timestamp exemption.
+  Timestamp-like requires at least **three distinct values**, all exactly matching
+  reviewed UTC timestamps retained in the same activity (including validated
+  compressed timestamps), within the FIT absolute `date_time` range
+  `[0x10000000, 0xFFFFFFFF)`. Proximity to an activity time is insufficient: a
+  constant ID can have the same magnitude as a timestamp. Constant/sparse unknown
+  times and unconfirmed local-clock offsets are withheld as ambiguous. Documented
+  timestamps are unaffected. Unknown/developer fields and relative clocks cannot
+  supply evidence; without reviewed time evidence there is no timestamp exemption.
   Exact coordinate/identity matches and position correlations still take priority.
+  The same suspicion check runs across all rows of each activity during structured
+  validation and independently on the constructed analysis export. It never pools
+  variation or timestamp evidence across activities.
 - Strings and byte blobs are blocked as `possible_identity`, as are arrays of any
   integer type containing at least four printable ASCII characters with zero/null
   padding, or at least four printable UTF-8 characters. All-null arrays remain null.
@@ -421,8 +434,9 @@ them. The command supports review only; it does not enable any blocked fields.
 
 These heuristics cannot identify every numeric encoding of identity or geography.
 Constant large counters can be withheld; changing identifiers with four or more
-distinct values, short identifiers below the matching threshold, and identifiers
-near reviewed timestamps can escape these checks. The timestamp exemption is a
+distinct values, short identifiers below the matching threshold, and varying
+identifiers exactly copying reviewed timestamps can escape these checks.
+The timestamp exemption is a
 privacy-filtering heuristic, not a claim about an unknown field's meaning or units.
 Correlation checks require co-observed record positions; no temporal joins are
 inferred for undocumented messages. Encodings without that evidence remain opaque.

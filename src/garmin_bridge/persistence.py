@@ -123,7 +123,7 @@ def require(condition):
 
 def validate_summary_provenance(summary, metadata_digest=None):
     """Apply the same source guarantees to current and historical revisions."""
-    from .normalize import LOCAL_FLAGS, input_digest, local_metadata, sha256
+    from .normalize import LOCAL_FLAGS, input_digest_matches, local_metadata, sha256
     from .storage import canonical
 
     require(c.ACTIVITY(summary))
@@ -132,8 +132,8 @@ def validate_summary_provenance(summary, metadata_digest=None):
         if metadata_digest is not None:
             require(metadata_digest == sha256(canonical(meta)))
         require(
-            summary["source_digest"]
-            == input_digest(
+            input_digest_matches(
+                summary["source_digest"],
                 meta,
                 summary["fit_sha256"],
                 local_import=True,
@@ -203,7 +203,7 @@ def validate_job(value):
 
 def validate_pair(state, job):
     """A portable snapshot must not claim completed items whose results are absent."""
-    from .normalize import input_digest, sha256
+    from .normalize import input_digest_matches, sha256
     from .storage import canonical
 
     validate_state(state, portable=True)
@@ -226,8 +226,8 @@ def validate_pair(state, job):
             require(item["metadata"] is not None)
             require(entry["metadata_digest"] == sha256(canonical(item["metadata"])))
             require(
-                entry["summary"]["source_digest"]
-                == input_digest(
+                input_digest_matches(
+                    entry["summary"]["source_digest"],
                     item["metadata"],
                     entry["summary"]["fit_sha256"],
                     include_identity=identity_enabled(entry["summary"]),

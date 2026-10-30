@@ -201,7 +201,17 @@ class Runner:
         for source_id, item in self.job["items"].items():
             if item["state"] == "completed" or item["reason"] == "outside_recheck_window":
                 entry = self.state["activities"].get(source_id)
-                if entry is None or not artifacts_intact(store, entry):
+                if (
+                    entry is None
+                    or not artifacts_intact(store, entry)
+                    or item["metadata"] is not None
+                    and entry["summary"]["source_digest"]
+                    != parser.input_digest(
+                        item["metadata"],
+                        entry["summary"]["fit_sha256"],
+                        include_identity=include_identity,
+                    )
+                ):
                     item.update(state="discovered", reason=None, outcome=None)
 
     def checkpoint(self):
@@ -302,6 +312,10 @@ class Runner:
             and previous.get("metadata_digest") == parser.sha256(canonical(meta))
             and previous["summary"]["normalizer_version"] == parser.NORMALIZER_VERSION
             and previous["summary"]["schema_version"] == SCHEMA_VERSION
+            and previous["summary"]["source_digest"]
+            == parser.input_digest(
+                meta, previous["summary"]["fit_sha256"], include_identity=self.include_identity
+            )
             and (
                 previous["summary"]["provenance"]["unique_identifiers_retained"]
                 == "explicit_opt_in"

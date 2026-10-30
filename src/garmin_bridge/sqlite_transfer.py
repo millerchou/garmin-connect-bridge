@@ -56,7 +56,13 @@ def inspect_store(store, *, full_validation=True):
             require(document_kind(name) is not None)
             content = store.read_bytes(name)
             value = decode(content)
-            if full_validation or not name.endswith("/streams.json"):
+            if (
+                full_validation
+                or not name.endswith("/streams.json")
+                # Few-distinct checks need every raw row: spot sampling a valid
+                # varying counter would make it look like a constant identity.
+                or value.get("fit_fields_version") == "1.1"
+            ):
                 validate_document(name, value)
             else:
                 # Sample records/events; keep lap/message context for zone references.

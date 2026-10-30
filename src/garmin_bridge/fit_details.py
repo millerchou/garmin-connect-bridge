@@ -237,7 +237,12 @@ def valid_message(value, include_identity=False, allowed=None):
                 return False
             item = quantity["value"]
             check = c.numeric
-            if spec.kind in {"utc", "local"}:
+            if spec.unit in {"FIT:event", "FIT:event_type"}:
+
+                def check(x):
+                    return type(x) is int and 0 <= x < 255
+
+            elif spec.kind in {"utc", "local"}:
 
                 def check(x):
                     return c.iso_time(x, spec.kind == "utc") and (

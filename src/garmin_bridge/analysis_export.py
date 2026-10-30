@@ -12,8 +12,8 @@ import tempfile
 from . import __version__, contract as c
 from .errors import BridgeError
 from .fit_details import specs_for, valid_message
-from .fit_fields import AUXILIARY_MESSAGES
-from .fit_unknown import valid_raw_message, valid_unknown
+from .fit_fields import AUXILIARY_MESSAGES, FIELDS, MESSAGE_NUMBERS
+from .fit_unknown import RawIdentityCheck, valid_raw_message, valid_unknown
 from .jobs import gaps, load_job
 from .persistence import artifact_files, identity_enabled, require
 from .sqlite_transfer import digest_file
@@ -31,7 +31,8 @@ NAME_BOUNDARY = re.compile(
 PRIVATE_NAME = re.compile(
     r"(?:^|_)(?:position_lat|position_long|lat|lon|lng|long|latitude|longitude|nec|swc|"
     r"coordinates?|location|serial(?:_number)?|user_profile|friendly_name|"
-    r"device_id|device_identifier|ant_device_number|ant_transmission_type|"
+    r"device_id|device_identifier|device_number|local_id|global_id|"
+    r"ant_device_number|ant_transmission_type|"
     r"descriptor|product_name|user_id|mac_address|device_address)(?:_|$)",
     re.IGNORECASE,
 )
@@ -401,21 +402,55 @@ def validate(db, expected, metadata):
     )
     for coverage, flags in db.execute("SELECT coverage_json,quality_flags_json FROM activities"):
         require(c.COVERAGE(decode(coverage.encode())) and c.QUALITY(decode(flags.encode())))
-    for message, detail in db.execute("SELECT message,detail_json FROM messages"):
+    for ident in expected:
+        validate_activity_details(db, ident)
+
+
+def validate_activity_details(db, ident):
+    # Keep cross-row evidence scoped to one activity and release it before the
+    # next. Combining activities can disguise a constant ID as a varying counter.
+    raw_check = RawIdentityCheck()
+    for message, detail in db.execute(
+        "SELECT message,detail_json FROM messages WHERE activity_id=?", (ident,)
+    ):
         value = decode(detail.encode())
         validate_detail_keys(value)
         require(valid_message(value, False, AUXILIARY_MESSAGES | {"session"}))
         require(message == value["message"])
+        raw_check.observe_detail(value)
+        raw_check.observe_raw(MESSAGE_NUMBERS[message], value.get("unknown", {}), "unknown_")
 
     for table, message in (("records", "record"), ("laps", "lap")):
-        for (payload,) in db.execute(f'SELECT unknown_json FROM "{table}"'):
+        for (payload,) in db.execute(
+            f'SELECT unknown_json FROM "{table}" WHERE activity_id=?', (ident,)
+        ):
             value = decode(payload.encode())
             validate_detail_keys(value)
             require(valid_unknown(value, message))
-    for number, payload in db.execute("SELECT mesg_num,fields_json FROM raw_messages"):
+            raw_check.observe_raw(MESSAGE_NUMBERS[message], value, "unknown_")
+    for (stamp,) in db.execute("SELECT timestamp FROM records WHERE activity_id=?", (ident,)):
+        require(stamp is None or c.iso_time(stamp, True))
+        raw_check.observe_timestamp(stamp)
+    for table, message in (("laps", "lap"), ("events", "event")):
+        columns = [f'"fit_{name}"' for name, spec in FIELDS[message].items() if spec.kind == "utc"]
+        for stamps in db.execute(
+            f'SELECT {",".join(columns)} FROM "{table}" WHERE activity_id=?', (ident,)
+        ):
+            for stamp in stamps:
+                require(stamp is None or c.iso_time(stamp, True))
+                raw_check.observe_timestamp(stamp)
+    for event, kind in db.execute(
+        "SELECT fit_event,fit_event_type FROM laps WHERE activity_id=?", (ident,)
+    ):
+        require(all(x is None or type(x) is int and 0 <= x < 255 for x in (event, kind)))
+    for number, payload in db.execute(
+        "SELECT mesg_num,fields_json FROM raw_messages WHERE activity_id=?", (ident,)
+    ):
         value = decode(payload.encode())
         validate_detail_keys(value)
         require(valid_raw_message({"mesg_num": number, "fields": value}))
+        raw_check.observe_raw(number, value)
+    require(not raw_check.blocked_fields())
 
 
 def check_destination(parent, name):
